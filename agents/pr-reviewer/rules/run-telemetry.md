@@ -9,8 +9,8 @@ This rule gives every run a per-step breakdown, and exports it as a trace in the
 
 | Step | Recorded by | When |
 | --- | --- | --- |
-| `prepare` | `prepare-review.mjs` | Starts the run; backdated to the script's own start, with each internal phase's milliseconds as attributes. |
-| `finalize` | `finalize.mjs` | Adds the outcome (verdict, candidates, confirmed, posted inline) to the run; **finishes and exports the run under `--dry-run`**. |
+| `prepare` | `prepare-review.mjs` | Starts the run; backdated to the script's own start. Each internal phase (`fetch`, `resolve`, `workspace`, `classify-shape`, `impact-graph`, `packet`, `standards`, `triage-routing`) is a child span with its own start and end. |
+| `finalize` | `finalize.mjs` | Adds the outcome (verdict, candidates, confirmed, posted inline) to the run; **finishes and exports the run under `--dry-run`** when it renders. A finalize that fails to render is an ERROR step and leaves the run open, so the re-run that succeeds is the one exported. |
 | `post` | `execute-write-plan.mjs` | A real run's last step; finishes and exports the run. |
 
 The ledger is `telemetry.jsonl` next to `context.json` — `context.telemetry.runDir`.
@@ -65,6 +65,15 @@ INTENT_FROM="/the/path/passed/as/--intent-from/intent.json"
 node "$TELEMETRY" worker intent import --from "$(dirname "$INTENT_FROM")" --done "$INTENT_FROM" --run-dir "$RUN_DIR"; cat "$INTENT_FROM"
 ```
 
+**Stopping early.**
+If you stop before a finalize succeeds, finish the run on your last command so the failure is exported rather than left in the ledger:
+
+```bash
+node "$TELEMETRY" finish --status error --message "<why the run stopped>" --run-dir "$RUN_DIR"
+```
+
+A finalize re-run after one that already exported is not added to the trace; the summary line says so.
+
 Under `--fanout`, the orchestrator marks each unit around its message: `worker <unit> start` for every unit before the message, `worker <unit> end` after it returns — one command each side, never one per unit.
 
 ## Exporting to Dash0
@@ -86,8 +95,9 @@ It follows the [OpenTelemetry GenAI conventions](https://opentelemetry.io/docs/s
 
 | Span | Attributes |
 | --- | --- |
-| `invoke_agent pr-reviewer` (root) | `gen_ai.operation.name=invoke_agent`, `gen_ai.agent.id=<run id>`, the outcome under `pr_review.*` |
-| `pr_review.step <name>` | `pr_review.step.name`, `pr_review.step.kind` (`script` · `model` · `dispatch`), `pr_review.step.marked` |
+| `invoke_agent pr-reviewer` (root) | `gen_ai.operation.name=invoke_agent`, `gen_ai.agent.id=<run id>`, `gen_ai.conversation.name=pr-reviewer <owner>/<repo>#<n>` (only when the run is not joined to a harness session), the outcome under `pr_review.*` |
+| `pr_review.step <name>` | `pr_review.step.name`, `pr_review.step.kind` (`script` · `model` · `dispatch`), `pr_review.step.marked`; ERROR with `error.type=step_failed` when the step failed |
+| `pr_review.phase <name>` | child of a script step: `pr_review.step.name`, `pr_review.phase.name` |
 | `pr_review.worker <unit>` | `pr_review.worker.unit` |
 | every span | `gen_ai.agent.name`, `gen_ai.conversation.id`, `dash0.gen_ai.vcs.*` (repository, owner, PR URL, head ref and revision), `user.name` |
 

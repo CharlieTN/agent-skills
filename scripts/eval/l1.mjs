@@ -9925,7 +9925,18 @@ const isPollBlock = (block) =>
   s.check("G84o prepare-review.mjs starts the run and records `prepare`; --no-telemetry skips it",
     /beginRun\(runDir,/.test(pr) && /name: "prepare", ns: startNs/.test(pr) && /"--no-telemetry"\) opts\.telemetry = false/.test(pr));
   s.check("G84o finalize.mjs records `finalize` and the outcome, and finishes the run under --dry-run",
-    /name: "finalize", ns: PROCESS_START_NS/.test(fin) && /if \(how\.dryRun \|\| how\.failed\)/.test(fin) && /finishRun\(runDir/.test(fin));
+    /name: "finalize", ns: PROCESS_START_NS/.test(fin) && /\} else if \(how\.dryRun\) \{\n\s+const out = await finishRun\(runDir/.test(fin));
+  // A failed render marks the finalize STEP failed and leaves the run open: A/B arms re-ran a failed
+  // finalize, and finishing on the failure exported a trace that skipped the successful re-run.
+  s.check("G84o a failed finalize is an ERROR step that does not finish the run",
+    /\.\.\.\(how\.failed \? \{ status: "error"/.test(fin) && !/if \(how\.dryRun \|\| how\.failed\)/.test(fin)
+      && /a failed step is an ERROR step span, and the run it recovered from still finishes OK/.test(out));
+  s.check("G84o prepare's internal phases are child spans with their own start and end, and the root carries a session title",
+    /const sub = timing\.segments\(\)/.test(pr) && /timing\.start\("resolve"\)/.test(pr) && /timing\.start\("packet"\)/.test(pr)
+      && /timing\.start\("standards"\)/.test(pr)
+      && /a script's internal phases are child spans of its step/.test(out)
+      && /the root carries a readable session title for AI Coding Insights/.test(out)
+      && /a run joined to a harness session never renames that session/.test(out));
   s.check("G84o execute-write-plan.mjs records `post` and finishes a real run",
     /name: "post", ns: PROCESS_START_NS/.test(ewp) && /await finishRun\(runDir/.test(ewp));
   const rtDoc = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/rules/run-telemetry.md"), "utf8");

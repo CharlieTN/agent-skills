@@ -83,6 +83,8 @@ export class Timing {
     this._openPhase = null;
     /** @type {number|null} */
     this._openAt = null;
+    /** @type {Array<{ name: string, startMs: number, endMs: number }>} */
+    this._segments = [];
   }
 
   /** Start timing a named phase. Closes any phase left open by the caller — a forgotten `.end()`
@@ -98,10 +100,19 @@ export class Timing {
    *  total time). */
   end() {
     if (!this._openPhase || this._openAt === null) return;
-    const ms = Date.now() - this._openAt;
+    const now = Date.now();
+    const ms = now - this._openAt;
     this._phases[this._openPhase] = (this._phases[this._openPhase] || 0) + ms;
+    this._segments.push({ name: this._openPhase, startMs: this._openAt, endMs: now });
     this._openPhase = null;
     this._openAt = null;
+  }
+
+  /** Every closed phase with its own start and end, in order — what a step's child spans are
+   *  built from. @returns {Array<{ name: string, startMs: number, endMs: number }>} */
+  segments() {
+    if (this._openPhase) this.end();
+    return this._segments.map((g) => ({ ...g }));
   }
 
   /** The epoch ms this timer was created — a process's own start, for its step span. */
@@ -155,7 +166,7 @@ export const ALLOWED_SPAN_KEY = (/** @type {string} */ k) =>
   /^pr_review\.[a-z0-9_.]+$/.test(k)
   || /^dash0\.gen_ai\.vcs\.(repository\.url\.full|repository\.name|owner\.name|provider\.name|ref\.head\.name|ref\.head\.revision|ref\.head\.type|pull_request\.url)$/.test(k)
   || [
-    "gen_ai.operation.name", "gen_ai.agent.name", "gen_ai.agent.id", "gen_ai.conversation.id",
+    "gen_ai.operation.name", "gen_ai.agent.name", "gen_ai.agent.id", "gen_ai.conversation.id", "gen_ai.conversation.name",
     "gen_ai.harness.name", "gen_ai.provider.name", "gen_ai.request.model",
     "dash0.team.name", "user.name", "dash0.gen_ai.user.identity.source", "error.type",
   ].includes(k);
@@ -166,6 +177,13 @@ const HIST_BOUNDS = {
 };
 
 const nowNs = () => BigInt(Date.now()) * 1_000_000n;
+
+/** The session title for a run that is its own session: what it reviewed, readable in a list.
+ *  @param {RunFacts} f @returns {string|null} */
+export function conversationName(f) {
+  if (!f.repo) return null;
+  return `${AGENT_NAME} ${f.repo}${f.number ? `#${f.number}` : ""}`;
+}
 
 /** OTel GenAI `gen_ai.provider.name` from a model id — the Dash0 agent plugin's own mapping.
  *  @param {string|null|undefined} model @returns {string|null} */
@@ -303,8 +321,9 @@ export function beginRun(runDir, facts, opts = {}) {
 /* ----------------------------------- building spans ----------------------------------- */
 
 /**
+ * @typedef {{ name: string, startNs: bigint, endNs: bigint }} SubPhase
  * @typedef {{ name: string, kind: string, marked: boolean, startNs: bigint, endNs: bigint,
- *   attrs: Record<string, any>, status: 0|2, message?: string }} StepSpan
+ *   attrs: Record<string, any>, status: 0|2, message?: string, sub?: SubPhase[] }} StepSpan
  * @typedef {{ unit: string, startNs: bigint, endNs: bigint, attrs: Record<string, any> }} WorkerSpan
  * @typedef {{ runId: string, facts: RunFacts, startNs: bigint, endNs: bigint, steps: StepSpan[],
  *   workers: WorkerSpan[], runAttrs: Record<string, any>, status: 0|2, message?: string,
@@ -345,7 +364,11 @@ export function buildRun(records, now = nowNs()) {
       const name = String(r.name);
       open = { name, kind: STEPS[/** @type {keyof typeof STEPS} */ (name)] || "model", marked: true, startNs: ns, endNs: ns, attrs: { ...(r.attrs || {}) }, status: 0 };
     } else if (r.t === "step" && r.phase === "end") {
-      if (open) Object.assign(open.attrs, r.attrs || {});
+      if (open) {
+        Object.assign(open.attrs, r.attrs || {});
+        if (Array.isArray(r.sub)) open.sub = subPhases(r.sub);
+        if (r.status === "error") { open.status = 2; if (r.message) open.message = String(r.message).slice(0, 300); }
+      }
       close(ns);
     } else if (r.t === "attr") {
       if (r.target === "step" && open) Object.assign(open.attrs, r.attrs || {});
@@ -392,6 +415,22 @@ export function buildRun(records, now = nowNs()) {
     ...(failed && finish?.r.message ? { message: String(finish.r.message).slice(0, 300) } : {}),
     finished: Boolean(finish),
   };
+}
+
+/** A script's internal phases → child spans, clamped to sane values; a malformed entry is dropped.
+ *  @param {any[]} list @returns {SubPhase[]} */
+function subPhases(list) {
+  /** @type {SubPhase[]} */
+  const out = [];
+  for (const g of list) {
+    try {
+      const name = String(g?.name || "");
+      const startNs = BigInt(g.start_ns);
+      const endNs = BigInt(g.end_ns);
+      if (STEP_NAME_RE.test(name) && endNs >= startNs) out.push({ name, startNs, endNs });
+    } catch { /* not a phase */ }
+  }
+  return out;
 }
 
 /**
@@ -472,6 +511,9 @@ export function toExporter(run, env) {
       ...identity,
       "gen_ai.operation.name": "invoke_agent",
       "gen_ai.agent.id": run.runId,
+      // The session title AI Coding Insights lists. Only for a run that IS its own session — a run
+      // joined to a harness session (PR_REVIEWER_CONVERSATION_ID) must not rename that session.
+      "gen_ai.conversation.name": f.conversation_id ? null : conversationName(f),
       ...ns({
         mode: f.mode, tier: f.tier, thoroughness: f.thoroughness, topology: f.topology,
         "pr.number": f.number, ...run.runAttrs,
@@ -481,16 +523,33 @@ export function toExporter(run, env) {
     status: run.status === 2 ? { code: 2, message: run.message || "review failed" } : { code: 0 },
   });
   run.steps.forEach((s, i) => {
+    const stepId = spanIdFor(run.runId, `step:${i}:${s.name}`);
     ex.spans.push({
       traceId: ex.traceId,
-      spanId: spanIdFor(run.runId, `step:${i}:${s.name}`),
+      spanId: stepId,
       parentSpanId: rootId,
       name: `pr_review.step ${s.name}`,
       kind: 1,
       startTimeUnixNano: String(s.startNs),
       endTimeUnixNano: String(s.endNs),
-      attributes: attrs({ ...identity, "pr_review.step.name": s.name, "pr_review.step.kind": s.kind, "pr_review.step.marked": s.marked, ...ns(s.attrs) }),
-      status: { code: 0 },
+      attributes: attrs({
+        ...identity, "pr_review.step.name": s.name, "pr_review.step.kind": s.kind, "pr_review.step.marked": s.marked,
+        ...ns(s.attrs), ...(s.status === 2 ? { "error.type": "step_failed" } : {}),
+      }),
+      status: s.status === 2 ? { code: 2, message: s.message || `${s.name} failed` } : { code: 0 },
+    });
+    (s.sub || []).forEach((g, j) => {
+      ex.spans.push({
+        traceId: ex.traceId,
+        spanId: spanIdFor(run.runId, `step:${i}:${s.name}:phase:${j}:${g.name}`),
+        parentSpanId: stepId,
+        name: `pr_review.phase ${g.name}`,
+        kind: 1,
+        startTimeUnixNano: String(g.startNs),
+        endTimeUnixNano: String(g.endNs),
+        attributes: attrs({ ...identity, "pr_review.step.name": s.name, "pr_review.phase.name": g.name }),
+        status: { code: 0 },
+      });
     });
     ex.histogram("pr_review.step.duration", Number(s.endNs - s.startNs) / 1e9,
       { "pr_review.step.name": s.name, "pr_review.step.kind": s.kind, "gen_ai.agent.name": AGENT_NAME }, "s");
@@ -534,6 +593,8 @@ export function summarize(run) {
         start_offset_s: round(Number(s.startNs - run.startNs) / 1e9),
         duration_s: round(d),
         share: total > 0 ? Math.round((d / total) * 100) : 0,
+        ...(s.status === 2 ? { failed: true } : {}),
+        ...(s.sub && s.sub.length ? { phases: s.sub.map((g) => ({ name: g.name, duration_s: round(Number(g.endNs - g.startNs) / 1e9) })) } : {}),
       };
     }),
     workers: run.workers.map((w) => ({
@@ -546,7 +607,10 @@ export function summarize(run) {
 
 /** @param {ReturnType<typeof summarize>} s @returns {string} */
 export function renderSummary(s) {
-  const rows = s.steps.map((x) => `  ${x.name.padEnd(16)} ${x.kind.padEnd(8)} ${String(x.duration_s).padStart(7)}s ${String(x.share).padStart(4)}%`);
+  const rows = s.steps.flatMap((x) => [
+    `  ${x.name.padEnd(16)} ${x.kind.padEnd(8)} ${String(x.duration_s).padStart(7)}s ${String(x.share).padStart(4)}%${x.failed ? "  FAILED" : ""}`,
+    ...(x.phases || []).map((g) => `    · ${g.name.padEnd(13)} ${"".padEnd(8)} ${String(g.duration_s).padStart(7)}s`),
+  ]);
   const wrows = s.workers.map((w) => `  worker ${w.unit.padEnd(9)} ${"sub-agent".padEnd(8)} ${String(w.duration_s).padStart(7)}s  (from +${w.start_offset_s}s)`);
   return [`review ${s.run_id} · ${s.total_s}s · trace ${s.trace_id}`, ...rows, ...wrows].join("\n");
 }
@@ -739,7 +803,7 @@ async function main(argv) {
     } else if (cmd === "finish") {
       const out = await finishRun(runDir, { status: opts.status, message: opts.message, attrs: attrBag, force: opts.force === "true" });
       if ("steps" in out) process.stderr.write(`${renderSummary(/** @type {any} */ (out))}\n`);
-      process.stderr.write(`review-telemetry: ${out.exported ? "exported" : `not exported (${out.reason || out.skipped || "?"})`}\n`);
+      process.stderr.write(`review-telemetry: ${"skipped" in out && out.skipped ? "already exported earlier — nothing sent" : out.exported ? "exported" : `not exported (${out.reason || "?"})`}\n`);
     } else if (cmd === "summary") {
       const run = buildRun(readLedger(runDir));
       if (run) console.log(renderSummary(summarize(run)));
@@ -776,7 +840,11 @@ async function selfTest() {
   const ledger = [
     at(0, { t: "run", run_id: "r1", facts }),
     at(0, { t: "step", phase: "start", name: "prepare" }),
-    at(10, { t: "step", phase: "end", attrs: { "phase.impact_ms": 900 } }),
+    at(10, { t: "step", phase: "end", attrs: { "phase.impact_ms": 900 }, sub: [
+      { name: "fetch", start_ns: String(t0), end_ns: String(t0 + 2n * S) },
+      { name: "workspace", start_ns: String(t0 + 2n * S), end_ns: String(t0 + 8n * S) },
+      { name: "Bad Name", start_ns: "1", end_ns: "2" },
+    ] }),
     at(12, { t: "worker", unit: "intent", phase: "start" }),
     at(20, { t: "step", phase: "start", name: "finders" }),
     at(80, { t: "step", phase: "start", name: "verify", attrs: { candidates: 0 } }),
@@ -817,8 +885,34 @@ async function selfTest() {
       && get(s, "dash0.gen_ai.vcs.repository.name") === "sync-tray" && get(s, "dash0.gen_ai.vcs.owner.name") === "mthines"
       && get(s, "dash0.gen_ai.vcs.pull_request.url") === "https://github.com/mthines/sync-tray/pull/72"
       && get(s, "dash0.gen_ai.vcs.ref.head.revision") === "bfd6662"));
-  ok("every child parents the root, in one deterministic trace",
-    spans.slice(1).every((/** @type {any} */ s) => s.parentSpanId === root.spanId && s.traceId === root.traceId) && root.traceId === traceIdFor("r1"));
+  const phaseSpans = spans.filter((/** @type {any} */ s) => s.name.startsWith("pr_review.phase "));
+  const prepSpan = spans.find((/** @type {any} */ s) => s.name === "pr_review.step prepare");
+  ok("every step and worker parents the root, in one deterministic trace",
+    spans.slice(1).filter((/** @type {any} */ s) => !phaseSpans.includes(s)).every((/** @type {any} */ s) => s.parentSpanId === root.spanId && s.traceId === root.traceId)
+      && root.traceId === traceIdFor("r1"));
+  ok("a script's internal phases are child spans of its step, with their own start and end (a malformed one is dropped)",
+    phaseSpans.length === 2 && phaseSpans.every((/** @type {any} */ s) => s.parentSpanId === prepSpan?.spanId)
+      && phaseSpans.map((/** @type {any} */ s) => get(s, "pr_review.phase.name")).join(",") === "fetch,workspace"
+      && Number(BigInt(phaseSpans[1].endTimeUnixNano) - BigInt(phaseSpans[1].startTimeUnixNano)) / 1e9 === 6);
+  ok("the root carries a readable session title for AI Coding Insights",
+    get(root, "gen_ai.conversation.name") === "pr-reviewer mthines/sync-tray#72"
+      && spans.slice(1).every((/** @type {any} */ s) => get(s, "gen_ai.conversation.name") === undefined));
+  const joinedRoot = /** @type {any} */ (toExporter({ ...run, facts: { ...facts, conversation_id: "claude-session-1" } }, env).tracePayload()).resourceSpans[0].scopeSpans[0].spans[0];
+  ok("a run joined to a harness session never renames that session", get(joinedRoot, "gen_ai.conversation.name") === undefined);
+  const sumPrep = summarize(run).steps[0];
+  ok("the summary lists a step's internal phases", JSON.stringify((sumPrep.phases || []).map((g) => g.name)) === JSON.stringify(["fetch", "workspace"]));
+  const failedStep = /** @type {BuiltRun} */ (buildRun(/** @type {any} */ ([
+    at(0, { t: "run", run_id: "r3", facts }),
+    at(1, { t: "step", phase: "start", name: "finalize" }),
+    at(2, { t: "step", phase: "end", status: "error", message: "render failed" }),
+    at(3, { t: "step", phase: "start", name: "finalize" }),
+    at(4, { t: "step", phase: "end" }),
+    at(4, { t: "finish", status: "ok" }),
+  ])));
+  const fsSpans = /** @type {any} */ (toExporter(failedStep, env).tracePayload()).resourceSpans[0].scopeSpans[0].spans;
+  ok("a failed step is an ERROR step span, and the run it recovered from still finishes OK",
+    fsSpans[0].status.code === 0 && fsSpans.filter((/** @type {any} */ s) => s.name === "pr_review.step finalize").map((/** @type {any} */ s) => s.status.code).join(",") === "2,0"
+      && get(fsSpans.find((/** @type {any} */ s) => s.status.code === 2), "error.type") === "step_failed");
   const badKeys = spans.flatMap((/** @type {any} */ s) => s.attributes.map((/** @type {any} */ a) => a.key)).filter((/** @type {string} */ k) => !ALLOWED_SPAN_KEY(k));
   ok("every attribute key is in the declared contract", badKeys.length === 0, [...new Set(badKeys)].join(","));
   const verifySpan = spans.find((/** @type {any} */ s) => s.name === "pr_review.step verify");

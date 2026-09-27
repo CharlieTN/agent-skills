@@ -1945,7 +1945,7 @@ async function recordFinalizeTelemetry(contextPath, result, judgments, how) {
     if (!readLedger(runDir).some((r) => r.t === "run")) return null;
     const candidates = Array.isArray(judgments?.candidates) ? judgments.candidates : [];
     appendRecord(runDir, { t: "step", phase: "start", name: "finalize", ns: PROCESS_START_NS });
-    appendRecord(runDir, { t: "step", phase: "end" });
+    appendRecord(runDir, { t: "step", phase: "end", ...(how.failed ? { status: "error", message: "finalize.mjs could not render the report" } : {}) });
     appendRecord(runDir, {
       t: "attr", target: "run",
       attrs: {
@@ -1958,9 +1958,17 @@ async function recordFinalizeTelemetry(contextPath, result, judgments, how) {
         dry_run: how.dryRun,
       },
     });
-    if (how.dryRun || how.failed) {
-      const out = await finishRun(runDir, how.failed ? { status: "error", message: "finalize.mjs could not render the report" } : {});
-      console.log(`finalize: run telemetry ${out.exported ? "exported" : `written (${("reason" in out && out.reason) || ("skipped" in out && out.skipped) || "not exported"})`} → ${join(runDir, "telemetry-summary.json")}`);
+    // A failed render is a failed STEP, not a finished run: every A/B arm that hit one fixed its
+    // judgments and re-ran finalize, and finishing here exported a trace that ended on the failure
+    // and then skipped the successful re-run as "already exported". The run finishes on the
+    // finalize that succeeds (dry run), on `post` (real run), or on an explicit `finish`.
+    if (how.failed) {
+      console.log(`finalize: run telemetry recorded the failed finalize; the run is exported by the finalize that succeeds (or \`review-telemetry.mjs finish --status error\`) → ${runDir}`);
+    } else if (how.dryRun) {
+      const out = await finishRun(runDir, {});
+      const said = "skipped" in out && out.skipped ? "already exported by an earlier finalize — this re-run is not in the trace"
+        : out.exported ? "exported" : `written, not exported (${("reason" in out && out.reason) || "?"})`;
+      console.log(`finalize: run telemetry ${said} → ${join(runDir, "telemetry-summary.json")}`);
     }
     return runDir;
   } catch {

@@ -1022,6 +1022,9 @@ async function prepare(opts) {
   /** @type {any} */ let filesR = filesR0;
 
   timing.end(); // fetch
+  // Head/base binding, the --review-sha compare fetch, and identity — timed, so the trace shows it
+  // rather than leaving an unexplained gap between `fetch` and `workspace`.
+  timing.start("resolve");
 
   if (!metaR.ok) {
     throw new Error(`PR metadata unreadable for ${repo}#${number}: ${metaR.error}`);
@@ -1210,6 +1213,7 @@ async function prepare(opts) {
     );
   }
   timing.end(); // impact-graph
+  timing.start("packet");
 
   // A/B iteration 4 (speed): the review packet — the PR description, a priority-ordered file
   // index, and every hunk widened against the head file with head line numbers — so a finder or
@@ -1240,6 +1244,7 @@ async function prepare(opts) {
   // A/B iteration 4 (speed): Step 1.7b's two halves as functions (discover-standards.mjs) — the
   // TRIVIAL_SKIP conditions and Source-1 standards discovery with normative-line extraction. The
   // full bullet list is a sidecar; the context carries the summary Step 1.7b announces.
+  timing.start("standards");
   let trivial = null;
   try {
     trivial = trivialSkip({ files, highStakesFiles: (shape && shape.high_stakes_files) || [] });
@@ -1627,7 +1632,10 @@ async function prepare(opts) {
       const phaseAttrs = {};
       for (const [name, ms] of Object.entries(context.timing?.phases || {})) phaseAttrs[`phase.${name.replace(/[^a-z0-9]+/gi, "_").toLowerCase()}_ms`] = ms;
       appendRecord(runDir, { t: "step", phase: "start", name: "prepare", ns: startNs });
-      appendRecord(runDir, { t: "step", phase: "end", attrs: { ...phaseAttrs, files: files.length, delta_lines: context.deltaLines } });
+      // `sub` carries each internal phase with its own start and end, so the trace shows them as
+      // child spans of `prepare` — a 14 s step is only actionable once its 6 s clone is visible.
+      const sub = timing.segments().map((g) => ({ name: g.name, start_ns: String(BigInt(g.startMs) * 1_000_000n), end_ns: String(BigInt(g.endMs) * 1_000_000n) }));
+      appendRecord(runDir, { t: "step", phase: "end", attrs: { ...phaseAttrs, files: files.length, delta_lines: context.deltaLines }, sub });
       context.telemetry = { runDir, ledger: ledgerPath(runDir) };
     } catch (e) {
       anomalies.push(`run telemetry not started: ${String(e && e.message || e).slice(0, 160)}`);
