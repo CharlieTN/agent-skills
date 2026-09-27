@@ -38,7 +38,9 @@
 # files instead; this script only has to make the files exist.
 #
 # Requires: networkLevel >= trusted_only (codeload.github.com, github.com).
-# Optional envVars: PIN, REPO, PR_REVIEWER_LOGIN.
+# Optional envVars: PIN, REPO, PR_REVIEWER_LOGIN, and for run telemetry
+# PR_REVIEWER_OTLP_ENDPOINT, PR_REVIEWER_OTLP_HEADERS, PR_REVIEWER_TELEMETRY
+# (§ 6 persists those three into env.sh — see rules/run-telemetry.md).
 
 set -uo pipefail
 
@@ -194,8 +196,19 @@ cp "$ROOT/RUN-CONSTRAINTS.md" "$WS/AGENTS.md"
 #    So: write the file unconditionally, append to the env channel only when it
 #    is actually present, and SAY which channels were used, because a run that
 #    reads the wrong one is a run that cannot find the pipeline.
+#
+#    Run telemetry (rules/run-telemetry.md): an automation's envVars reach THIS
+#    script and never the run, so the export settings are written into the same
+#    file, single-quoted, and only when set. review-telemetry.mjs reads them from
+#    it whenever the process has none, so no command has to source it first. The
+#    headers carry a token: the file goes to mode 600 and the value is never
+#    printed.
 # ---------------------------------------------------------------------------
+# Single-quote a value for a POSIX shell: every ' becomes '\''.
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
 ENV_FILE="$ROOT/env.sh"
+TELEMETRY_KEYS="PR_REVIEWER_TELEMETRY PR_REVIEWER_OTLP_ENDPOINT PR_REVIEWER_OTLP_HEADERS"
 {
   echo "export PR_REVIEWER_ROOT=$ROOT"
   echo "export PR_REVIEWER_BUNDLE=$BUNDLE"
@@ -204,7 +217,18 @@ ENV_FILE="$ROOT/env.sh"
   echo "export AGENT_SUPPORT=$ROOT"
   echo "export PR_REVIEWER_PIN=$PIN"
   echo "export PR_REVIEWER_LOGIN=${PR_REVIEWER_LOGIN:-}"
+  for k in $TELEMETRY_KEYS; do
+    if [ -n "${!k:-}" ]; then echo "export $k=$(shq "${!k}")"; fi
+  done
 } > "$ENV_FILE"
+if [ -n "${PR_REVIEWER_OTLP_HEADERS:-}" ]; then chmod 600 "$ENV_FILE"; fi
+if [ "${PR_REVIEWER_TELEMETRY:-}" = "off" ]; then
+  echo "telemetry: off (PR_REVIEWER_TELEMETRY=off)"
+elif [ -n "${PR_REVIEWER_OTLP_ENDPOINT:-}" ]; then
+  echo "telemetry: export to ${PR_REVIEWER_OTLP_ENDPOINT}, headers $([ -n "${PR_REVIEWER_OTLP_HEADERS:-}" ] && echo "set (not printed)" || echo "none")"
+else
+  echo "telemetry: not exported (no PR_REVIEWER_OTLP_ENDPOINT envVar) — each run still writes its step summary"
+fi
 
 if [ -n "${DASH0_AGENT_ENV:-}" ]; then
   cat "$ENV_FILE" >> "$DASH0_AGENT_ENV" 2>/dev/null \
@@ -231,6 +255,7 @@ check "prepare script"   "$ROOT/pr-reviewer/scripts/prepare-review.mjs"
 check "renderer"         "$ROOT/pr-reviewer/scripts/render-report.mjs"
 check "finalize script"  "$ROOT/pr-reviewer/scripts/finalize.mjs"
 check "write-plan executor" "$ROOT/pr-reviewer/scripts/execute-write-plan.mjs"
+check "run telemetry"    "$ROOT/pr-reviewer/scripts/review-telemetry.mjs"
 check "constraints"      "$ROOT/RUN-CONSTRAINTS.md"
 
 LENSES=0

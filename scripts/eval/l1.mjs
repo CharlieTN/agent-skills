@@ -9968,6 +9968,86 @@ const isPollBlock = (block) =>
       && /jq -e '\.exported == true'/.test(smokeTxt) && smokeTxt.includes("smoke=true"));
 }
 
+// ── G84p: run telemetry on an Agent0 Automation ──
+// Three gaps kept a real automation run from exporting: its envVars reach only the setup script,
+// and the installer persisted none of the export settings into env.sh; the harness detector knew
+// only the file the repo-level installer writes, not the reviewer-only installer's env.sh; and the
+// bundle did not inline run-telemetry.md, so a run that skips deferred rules marked no steps.
+// Each check EXECUTES the shipped code: the installer's env.sh block in a scratch root, the
+// telemetry parser against the file that block wrote, and the bundle compiler.
+{
+  const SETUP = join(REPO_ROOT, "agents/pr-reviewer/scripts/agent0-setup.sh");
+  const RT = join(REPO_ROOT, "agents/pr-reviewer/scripts/review-telemetry.mjs");
+  const setupTxt = readFileSync(SETUP, "utf8");
+  const from = setupTxt.indexOf("shq() {");
+  const to = setupTxt.indexOf('if [ -n "${DASH0_AGENT_ENV:-}" ]');
+  const tricky = "Authorization=Bearer a'b $x `y`,Dash0-Dataset=default";
+  const dir = mkdtempSync(join(tmpdir(), "l1-envsh-"));
+  let envSh = "";
+  let mode = "";
+  let sourced = "";
+  let parsed = {};
+  let installerOut = "";
+  let bareHasOtlp = true;
+  try {
+    writeFileSync(join(dir, "block.sh"), from > 0 && to > from ? setupTxt.slice(from, to) : "exit 3\n");
+    const base = { PATH: process.env.PATH || "", ROOT: dir, BUNDLE: join(dir, "b.md"), PIN: "abc1234", PR_REVIEWER_LOGIN: "bot" };
+    const r = spawnSync("bash", ["-u", join(dir, "block.sh")], {
+      encoding: "utf8", env: { ...base, PR_REVIEWER_OTLP_ENDPOINT: "https://ingress.example.com", PR_REVIEWER_OTLP_HEADERS: tricky },
+    });
+    installerOut = `${r.stdout || ""}${r.stderr || ""}`;
+    if (r.status === 0) {
+      envSh = readFileSync(join(dir, "env.sh"), "utf8");
+      mode = (spawnSync("stat", ["-c", "%a", join(dir, "env.sh")], { encoding: "utf8" }).stdout || "").trim();
+      sourced = spawnSync("bash", ["-c", `. "${join(dir, "env.sh")}"; printf '%s' "$PR_REVIEWER_OTLP_HEADERS"`], { encoding: "utf8" }).stdout || "";
+      const p = spawnSync(process.execPath, ["--input-type=module", "-e",
+        `import { parseEnvFile, PERSISTED_EXPORT_KEYS } from ${JSON.stringify(pathToFileURL(RT).href)};
+         import { readFileSync } from "node:fs";
+         process.stdout.write(JSON.stringify(parseEnvFile(readFileSync(${JSON.stringify(join(dir, "env.sh"))}, "utf8"), PERSISTED_EXPORT_KEYS)));`],
+      { encoding: "utf8" });
+      parsed = JSON.parse(p.stdout || "{}");
+    }
+    const bareDir = join(dir, "bare");
+    mkdirSync(bareDir);
+    spawnSync("bash", ["-u", join(dir, "block.sh")], { encoding: "utf8", env: { ...base, ROOT: bareDir } });
+    bareHasOtlp = existsSync(join(bareDir, "env.sh")) ? /OTLP|PR_REVIEWER_TELEMETRY/.test(readFileSync(join(bareDir, "env.sh"), "utf8")) : true;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  s.check("G84p the installer persists the export settings into env.sh so bash sourcing and review-telemetry.mjs read the same values",
+    sourced === tricky && parsed.PR_REVIEWER_OTLP_HEADERS === tricky && parsed.PR_REVIEWER_OTLP_ENDPOINT === "https://ingress.example.com",
+    `sourced=${JSON.stringify(sourced)} parsed=${JSON.stringify(parsed)} out=${installerOut.slice(0, 200)}`);
+  s.check("G84p env.sh is mode 600 when it carries headers, the installer never prints them, and unset settings write no line",
+    mode === "600" && !installerOut.includes("Bearer") && bareHasOtlp === false && /PR_REVIEWER_OTLP_HEADERS=/.test(envSh),
+    `mode=${mode} printedToken=${installerOut.includes("Bearer")} bareHasOtlp=${bareHasOtlp}`);
+
+  const rtRun = spawnSync(process.execPath, [RT, "--self-test"], { encoding: "utf8" });
+  const out = rtRun.stdout || "";
+  s.check("G84p review-telemetry.mjs reads the settings from env.sh when the process has none, and a `finish` exports from it alone",
+    rtRun.status === 0 && /withPersistedExport: an empty process takes the endpoint and headers from env\.sh/.test(out)
+      && /withPersistedExport: the process wins, and a file's headers never go to the process's endpoint/.test(out)
+      && /CLI: finish with no export variables in the process exports from env\.sh/.test(out)
+      && /finishRun\(runDir, opts = \{\}, env = withPersistedExport\(process\.env\)\)/.test(readFileSync(RT, "utf8")),
+    out.split("\n").filter((l) => l.includes("✗")).join(" | "));
+  s.check("G84p the reviewer-only Agent0 install (pr-reviewer/env.sh) names the harness agent0",
+    /detectHarness: the reviewer-only Agent0 install \(pr-reviewer\/env\.sh\) is agent0/.test(out));
+
+  const bdir = mkdtempSync(join(tmpdir(), "l1-bundle-"));
+  let bundle = "";
+  try {
+    const b = spawnSync(process.execPath, [join(REPO_ROOT, "agents/pr-reviewer/scripts/build-agent0-bundle.mjs"),
+      "--src", join(REPO_ROOT, "agents"), "--out", join(bdir, "b.md"), "--quiet"], { encoding: "utf8" });
+    if (b.status === 0) bundle = readFileSync(join(bdir, "b.md"), "utf8");
+  } finally {
+    rmSync(bdir, { recursive: true, force: true });
+  }
+  s.check("G84p the Agent0 bundle inlines run-telemetry.md, so a run that skips deferred rules still has the step markers",
+    bundle.includes("# Inlined rule — `pr-reviewer/rules/run-telemetry.md`") && bundle.includes("**Never spend a tool call on a marker.**"));
+  const rtDoc = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/rules/run-telemetry.md"), "utf8");
+  s.check("G84p run-telemetry.md tells an automation where to set the variables and why they reach the run through env.sh",
+    /### On an Agent0 Automation/.test(rtDoc) && rtDoc.includes("sandbox.envVars") && rtDoc.includes("/tmp/workspace/pr-reviewer/env.sh"));
+}
+
 // ── G82: pr-reviewer.md size ratchet + the L2-read sections stay byte-identical to base (D15,
 // AC-3/AC-5/AC-6, plan feat/pr-reviewer-shrink-fanout-ab) ──
 //

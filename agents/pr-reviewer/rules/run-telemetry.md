@@ -111,6 +111,21 @@ PR_REVIEWER_OTLP_ENDPOINT=https://ingress.eu-west-1.aws.dash0.com
 PR_REVIEWER_OTLP_HEADERS=Authorization=Bearer <token>,Dash0-Dataset=default
 ```
 
+### On an Agent0 Automation
+
+Set the same variables as the automation's `sandbox.envVars`.
+They reach the setup script and never the run, so [`agent0-setup.sh`](../scripts/agent0-setup.sh) writes `PR_REVIEWER_OTLP_ENDPOINT`, `PR_REVIEWER_OTLP_HEADERS` and `PR_REVIEWER_TELEMETRY` into `/tmp/workspace/pr-reviewer/env.sh`, single-quoted, and only when set.
+When the headers are written the file becomes mode 600, and the installer never prints their value.
+`review-telemetry.mjs` reads the three from `env.sh` whenever the process has none of them, so `finalize.mjs`, `execute-write-plan.mjs` and `finish` export even when the command did not source the file.
+The process always wins, and an endpoint and its headers are taken together, never one from each.
+
+1. The setup script's text is the install cache key, so edit it (its `REF` line) after changing the variables, or the old `env.sh` stays.
+2. `envVars` are stored in plain text in the automation's definition, readable by anyone who can read the automation.
+   Use an ingest-only token limited to one dataset.
+3. The host must reach the endpoint: a `trusted_only` sandbox reaches only allowlisted hosts.
+
+The harness is named `agent0` when either `/tmp/workspace/agent-skills/env.sh` or `/tmp/workspace/pr-reviewer/env.sh` exists; an automation that installs only the reviewer writes the second.
+
 ### The trace
 
 It follows the [OpenTelemetry GenAI conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) as Dash0 reads them for coding agents ([span attributes](https://dash0.com/docs/dash0/darkplane/insights/span-attributes)), and the attribute contract of the [Dash0 agent plugin](https://github.com/dash0hq/dash0-agent-plugin):

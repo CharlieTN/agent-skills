@@ -92,7 +92,9 @@ for.
 
 It exports `PR_REVIEWER_ROOT`, `PR_REVIEWER_BUNDLE`, `PR_REVIEWER_CONSTRAINTS`,
 `PR_REVIEWER_PREPARE`, `AGENT_SUPPORT`, `PR_REVIEWER_PIN` and
-`PR_REVIEWER_LOGIN`. Read the paths from those variables rather than
+`PR_REVIEWER_LOGIN`, plus the run-telemetry export settings when the automation
+sets them ([`run-telemetry.md § On an Agent0 Automation`](./run-telemetry.md#on-an-agent0-automation)).
+Read the paths from those variables rather than
 re-deriving them: `resolve()`'s three call sites in the agent body exist because
 shell state does not persist between tool calls, and an exported variable does.
 
