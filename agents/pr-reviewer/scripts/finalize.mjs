@@ -547,8 +547,11 @@ export function finalizeReview({ context, judgments, profile = "balanced", flatO
   // and can never reintroduce the glyph.
   const capApplied = context?.routing?.capApplied === true;
   const noDispatchTopology = context?.budget?.topology;
+  // Round 10: under `hybrid` the reviewer never dispatches — the caller sends the intent worker —
+  // so a delivered worker (context.intentIsolated, read from the run ledger) means nothing was lost,
+  // and the line would claim an in-context intent finder that never ran.
   const noDispatchAt = context?.dispatchUnavailable === true
-    && (noDispatchTopology === "parallel" || noDispatchTopology === "hybrid")
+    && (noDispatchTopology === "parallel" || (noDispatchTopology === "hybrid" && context?.intentIsolated !== true))
     && typeof context?.budget?.effectiveThoroughness === "number"
     ? context.budget.effectiveThoroughness : undefined;
   const autoRunAnomaly = buildAutoRunAnomaly({
@@ -1084,6 +1087,17 @@ async function selfTest() {
     check("on the default hybrid topology the no-dispatch line names the intent finder it could not isolate",
       typeof noDispatchHybrid === "string" && noDispatchHybrid.includes("the intent finder ran in-context")
         && noDispatchHybrid.includes("at effective thoroughness 0.8") && !noDispatchHybrid.includes("parallel topology"));
+    // Round 10: a delivered hybrid intent worker (the ledger folded it in) means nothing was lost.
+    {
+      const j0 = { candidates: [], gates: { gate1: { status: "PASS", details: "x" }, gate4: { precandidate_dispositions: [], ai_stub_findings: [] }, gate5: { status: "PASS", details: "x" } },
+        threads: [], memory: { relevance_rules: [], lessons_used: [] }, summary: "" };
+      const hctx = { mode: "full", headSha: "abc1234def", routing: { tier: "deep" }, workspace: { depthCapability: "checkout" },
+        budget: { topology: "hybrid", effectiveThoroughness: 0.8 }, dispatchUnavailable: true, anomalies: [] };
+      const lost = String(finalizeReview({ context: hctx, judgments: j0 }).payload.RUN_ANOMALY || "");
+      const kept = String(finalizeReview({ context: { ...hctx, intentIsolated: true }, judgments: j0 }).payload.RUN_ANOMALY || "");
+      check("a delivered hybrid intent worker suppresses the no-dispatch line; a missing one keeps it",
+        lost.includes("the intent finder ran in-context") && !kept.includes("the intent finder ran in-context"), `${lost} | ${kept}`);
+    }
     // A/B iteration 2: a supplied RUN_ANOMALY used to REPLACE the computed one.
     const merged = mergeRunAnomaly("reviewer identity unknown", "1 prepare-time anomaly (x)");
     check("mergeRunAnomaly keeps a supplied anomaly AND the computed one",
@@ -2032,6 +2046,11 @@ async function main() {
   // in-context (rules/dispatch-topology.md § No-dispatch fallback). finalizeReview() renders the
   // prescribed RUN_ANOMALY part from the budget itself.
   if (opts["no-dispatch"]) context.dispatchUnavailable = true;
+  // The hybrid intent worker delivered when the run ledger folded it in (review-telemetry.mjs
+  // `worker intent import`) — the one record of it a later script can read.
+  try {
+    if (readLedger(dirname(/** @type {string} */ (opts.context))).some((r) => r.t === "worker" && r.unit === "intent" && r.phase === "end")) context.intentIsolated = true;
+  } catch { /* no ledger: nothing to read */ }
   const judgments = JSON.parse(readFileSync(/** @type {string} */(opts.judgments), "utf8"));
   const outDir = /** @type {string} */(opts["out-dir"]);
 

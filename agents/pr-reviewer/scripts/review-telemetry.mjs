@@ -135,6 +135,7 @@ export const SCOPE_NAME = "agent-skills/pr-reviewer";
 /** The step vocabulary and each step's kind. A name outside it is accepted (kind `model`) as long
  *  as it matches STEP_NAME_RE; the vocabulary keeps two runs' breakdowns comparable. */
 export const STEPS = Object.freeze({
+  load: "model",
   prepare: "script",
   memory: "model",
   gates: "model",
@@ -174,6 +175,7 @@ export const ALLOWED_SPAN_KEY = (/** @type {string} */ k) =>
 const HIST_BOUNDS = {
   "pr_review.step.duration": [5, 15, 30, 60, 120, 300, 600, 1200],
   "pr_review.run.duration": [60, 180, 300, 600, 900, 1200, 1800, 3600],
+  "pr_review.step.tool_calls": [1, 2, 4, 8, 16, 32, 64],
 };
 
 const nowNs = () => BigInt(Date.now()) * 1_000_000n;
@@ -341,7 +343,12 @@ export function buildRun(records, now = nowNs()) {
   const facts = {};
   for (const { r } of sorted) if (r.t === "run" || r.t === "facts") Object.assign(facts, r.facts || {});
   const finish = [...sorted].reverse().find((x) => x.r.t === "finish");
-  const startNs = runRec.ns;
+  // A `dispatch` record (the caller's dispatch time, folded in by `worker import`) starts the run
+  // earlier than `prepare` does: the model reads the agent definition and its rules before it runs
+  // any script, and in round 10 on sync-tray#72 that was 94 s no trace showed.
+  const dispatch = sorted.filter((x) => x.r.t === "dispatch" && x.ns < runRec.ns).map((x) => x.ns)
+    .reduce((/** @type {bigint|null} */ a, b) => (a === null || b < a ? b : a), null);
+  const startNs = dispatch ?? runRec.ns;
   const endNs = finish ? finish.ns : now;
 
   /** @type {StepSpan[]} */
@@ -396,11 +403,23 @@ export function buildRun(records, now = nowNs()) {
   const filled = [];
   let cursor = startNs;
   for (const s of steps) {
-    if (s.startNs - cursor > GAP_MIN_NS) filled.push({ name: "unmarked", kind: "model", marked: false, startNs: cursor, endNs: s.startNs, attrs: {}, status: 0 });
+    // The first gap of a dispatched run is the agent reading its own definition: name it `load`.
+    const gapName = dispatch !== null && cursor === startNs ? "load" : "unmarked";
+    if (s.startNs - cursor > GAP_MIN_NS) filled.push({ name: gapName, kind: "model", marked: false, startNs: cursor, endNs: s.startNs, attrs: {}, status: 0 });
     filled.push(s);
     if (s.endNs > cursor) cursor = s.endNs;
   }
-  if (endNs - cursor > GAP_MIN_NS) filled.push({ name: "unmarked", kind: "model", marked: false, startNs: cursor, endNs, attrs: {}, status: 0 });
+  if (endNs - cursor > GAP_MIN_NS) filled.push({ name: dispatch !== null && cursor === startNs ? "load" : "unmarked", kind: "model", marked: false, startNs: cursor, endNs, attrs: {}, status: 0 });
+
+  // Per-step tool calls from the model's own running count (`--attr tool_calls_so_far=N` on each
+  // marker): a step's calls are the next marked count minus its own. Model-reported, so approximate.
+  // Round 10 showed why it matters: `verify` was 2 calls in 205 s — generation-bound, not turn-bound.
+  const counted = filled.filter((x) => typeof x.attrs.tool_calls_so_far === "number");
+  counted.forEach((x, k) => {
+    const next = counted[k + 1];
+    if (next && next.attrs.tool_calls_so_far >= x.attrs.tool_calls_so_far) x.attrs.tool_calls = next.attrs.tool_calls_so_far - x.attrs.tool_calls_so_far;
+  });
+  if (counted.length) runAttrs.tool_calls_reported = Math.max(...counted.map((x) => x.attrs.tool_calls_so_far));
 
   const failed = finish?.r.status === "error";
   return {
@@ -553,6 +572,10 @@ export function toExporter(run, env) {
     });
     ex.histogram("pr_review.step.duration", Number(s.endNs - s.startNs) / 1e9,
       { "pr_review.step.name": s.name, "pr_review.step.kind": s.kind, "gen_ai.agent.name": AGENT_NAME }, "s");
+    if (typeof s.attrs.tool_calls === "number") {
+      ex.histogram("pr_review.step.tool_calls", s.attrs.tool_calls,
+        { "pr_review.step.name": s.name, "pr_review.step.kind": s.kind, "gen_ai.agent.name": AGENT_NAME }, "{tool_call}");
+    }
   });
   run.workers.forEach((w, i) => {
     ex.spans.push({
@@ -594,6 +617,7 @@ export function summarize(run) {
         duration_s: round(d),
         share: total > 0 ? Math.round((d / total) * 100) : 0,
         ...(s.status === 2 ? { failed: true } : {}),
+        ...(typeof s.attrs.tool_calls === "number" ? { tool_calls: s.attrs.tool_calls } : {}),
         ...(s.sub && s.sub.length ? { phases: s.sub.map((g) => ({ name: g.name, duration_s: round(Number(g.endNs - g.startNs) / 1e9) })) } : {}),
       };
     }),
@@ -608,7 +632,7 @@ export function summarize(run) {
 /** @param {ReturnType<typeof summarize>} s @returns {string} */
 export function renderSummary(s) {
   const rows = s.steps.flatMap((x) => [
-    `  ${x.name.padEnd(16)} ${x.kind.padEnd(8)} ${String(x.duration_s).padStart(7)}s ${String(x.share).padStart(4)}%${x.failed ? "  FAILED" : ""}`,
+    `  ${x.name.padEnd(16)} ${x.kind.padEnd(8)} ${String(x.duration_s).padStart(7)}s ${String(x.share).padStart(4)}%${"tool_calls" in x ? `  ${x.tool_calls} calls` : ""}${x.failed ? "  FAILED" : ""}`,
     ...(x.phases || []).map((g) => `    · ${g.name.padEnd(13)} ${"".padEnd(8)} ${String(g.duration_s).padStart(7)}s`),
   ]);
   const wrows = s.workers.map((w) => `  worker ${w.unit.padEnd(9)} ${"sub-agent".padEnd(8)} ${String(w.duration_s).padStart(7)}s  (from +${w.start_offset_s}s)`);
@@ -673,6 +697,32 @@ export function hostFacts(env = process.env) {
   const conv = detectConversationId(env);
   if (conv) out.conversation_id = conv;
   return out;
+}
+
+/**
+ * When the caller dispatched this run, read from the worker's scratch directory: a
+ * `dispatched_at` file (epoch milliseconds) first, else the `-<unix seconds>` suffix the
+ * `/pr-review` path convention (`intent-<PR>-<unix seconds>`) puts on the directory name. Accepted
+ * only when it is before the worker's first own record and at most an hour before it, so a stale
+ * or unrelated number is ignored rather than stretching the trace. Exported for the self-test.
+ * @param {string} dir @param {bigint} firstSeen @returns {bigint|null}
+ */
+export function dispatchTime(dir, firstSeen) {
+  /** @type {bigint|null} */
+  let at = null;
+  try {
+    const f = join(dir, "dispatched_at");
+    if (existsSync(f)) {
+      const ms = Number(String(readFileSync(f, "utf8")).trim());
+      if (Number.isFinite(ms) && ms > 0) at = BigInt(Math.round(ms)) * 1_000_000n;
+    }
+    if (at === null) {
+      const m = /-(\d{10})\/?$/.exec(dir);
+      if (m) at = BigInt(m[1]) * 1_000_000_000n;
+    }
+  } catch { return null; }
+  if (at === null || at > firstSeen || firstSeen - at > 3_600_000_000_000n) return null;
+  return at;
 }
 
 /** @param {string[]} args @returns {string} */
@@ -791,12 +841,22 @@ async function main(argv) {
           }
         }
         if (!theirs.length) { warn(`worker ${unit} import: no ledger or context.json in ${JSON.stringify(from)}`); return; }
-        const first = theirs.reduce((a, b) => (b < a ? b : a));
+        const firstSeen = theirs.reduce((a, b) => (b < a ? b : a));
         const last = theirs.reduce((a, b) => (b > a ? b : a));
         const donePath = opts.done || "";
         const doneAt = donePath && existsSync(donePath) ? BigInt(Math.round(statSync(donePath).mtimeMs)) * 1_000_000n : last;
+        // The caller's dispatch time, when it left one: the worker (and the reviewer, sent in the
+        // same message) started then, not when the worker's own script began.
+        const dispatched = dispatchTime(from, firstSeen);
+        const first = dispatched ?? firstSeen;
+        if (dispatched !== null) appendRecord(runDir, { t: "dispatch", ns: dispatched });
+        const end = doneAt > last ? doneAt : last;
         appendRecord(runDir, { t: "worker", unit, phase: "start", ns: first, attrs: attrBag });
-        appendRecord(runDir, { t: "worker", unit, phase: "end", ns: doneAt > last ? doneAt : last });
+        appendRecord(runDir, { t: "worker", unit, phase: "end", ns: end });
+        const runStart = BigInt(readLedger(runDir).find((r) => r.t === "run")?.ns || end);
+        const secs = (/** @type {bigint} */ x) => Math.round(Number(x) / 1e8) / 10;
+        process.stderr.write(`review-telemetry: worker ${unit} folded in — ${secs(end - first)}s long, done ${secs(end - runStart)}s after prepare began`
+          + `${dispatched !== null ? " (run now starts at the dispatch)" : ""}\n`);
         return;
       }
       appendRecord(runDir, { t: "worker", unit, phase, attrs: attrBag });
@@ -910,6 +970,19 @@ async function selfTest() {
     at(4, { t: "finish", status: "ok" }),
   ])));
   const fsSpans = /** @type {any} */ (toExporter(failedStep, env).tracePayload()).resourceSpans[0].scopeSpans[0].spans;
+  const counted = /** @type {BuiltRun} */ (buildRun(/** @type {any} */ ([
+    at(0, { t: "run", run_id: "r4", facts }),
+    at(1, { t: "step", phase: "start", name: "finders", attrs: { tool_calls_so_far: 20 } }),
+    at(50, { t: "step", phase: "start", name: "verify", attrs: { tool_calls_so_far: 31 } }),
+    at(90, { t: "step", phase: "start", name: "validate", attrs: { tool_calls_so_far: 33 } }),
+    at(95, { t: "finish", status: "ok" }),
+  ])));
+  const cex = toExporter(counted, env);
+  const callHist = /** @type {any} */ (cex.metricPayload()).resourceMetrics[0].scopeMetrics[0].metrics.filter((/** @type {any} */ m) => m.name === "pr_review.step.tool_calls");
+  ok("per-step tool calls come from consecutive model-reported counts, with a histogram per step",
+    counted.steps.find((x) => x.name === "finders")?.attrs.tool_calls === 11 && counted.steps.find((x) => x.name === "verify")?.attrs.tool_calls === 2
+      && counted.steps.find((x) => x.name === "validate")?.attrs.tool_calls === undefined && counted.runAttrs.tool_calls_reported === 33
+      && callHist.length === 2 && summarize(counted).steps.find((x) => x.name === "verify")?.tool_calls === 2);
   ok("a failed step is an ERROR step span, and the run it recovered from still finishes OK",
     fsSpans[0].status.code === 0 && fsSpans.filter((/** @type {any} */ s) => s.name === "pr_review.step finalize").map((/** @type {any} */ s) => s.status.code).join(",") === "2,0"
       && get(fsSpans.find((/** @type {any} */ s) => s.status.code === 2), "error.type") === "step_failed");
@@ -1019,6 +1092,28 @@ async function selfTest() {
     const imported = readLedger(impDir).filter((r) => r.t === "worker");
     ok("CLI: worker import reads a --no-telemetry worker's span from its context.json and output file",
       imported.length === 2 && BigInt(imported[0].ns) === BigInt(doneAt - 9000) * 1_000_000n && BigInt(imported[1].ns) > BigInt(doneAt) * 1_000_000n);
+
+    // Dispatch time: a worker directory with a `dispatched_at` stamp starts the worker AND the run
+    // at the dispatch, and the run's first gap is `load` — the agent reading its definition.
+    const dispDir = join(dir, "intent-72-1790000000");
+    mkdirSync(dispDir, { recursive: true });
+    const workerStart = doneAt - 9000;
+    writeFileSync(join(dispDir, "context.json"), JSON.stringify({ generatedAt: new Date(doneAt).toISOString(), elapsedMs: 9000 }));
+    writeFileSync(join(dispDir, "intent.json"), "[]");
+    writeFileSync(join(dispDir, "dispatched_at"), String(workerStart - 40_000));
+    const dRun = join(dir, "disp");
+    beginRun(dRun, facts);
+    const imp2 = spawnSync(process.execPath, [self, "worker", "intent", "import", "--from", dispDir, "--done", join(dispDir, "intent.json"), "--run-dir", dRun], { encoding: "utf8" });
+    ok("worker import says what it folded in, on stderr", /worker intent folded in — [\d.]+s long/.test(imp2.stderr) && /starts at the dispatch/.test(imp2.stderr), imp2.stderr);
+    const dBuilt = /** @type {BuiltRun} */ (buildRun(readLedger(dRun)));
+    ok("a dispatch stamp starts the run and the worker at the dispatch, and the first gap is `load`",
+      dBuilt.startNs === BigInt(workerStart - 40_000) * 1_000_000n && dBuilt.workers[0].startNs === dBuilt.startNs
+        && dBuilt.steps[0].name === "load" && dBuilt.steps[0].marked === false);
+    ok("dispatchTime reads the /pr-review directory suffix, and ignores a stamp after or long before the worker",
+      dispatchTime("/x/intent-72-1790000100", 1_790_000_200n * S) === 1_790_000_100n * S
+        && dispatchTime("/x/intent-72-1790000300", 1_790_000_200n * S) === null
+        && dispatchTime("/x/intent-72-1780000000", 1_790_000_200n * S) === null
+        && dispatchTime("/x/intent", 1_790_000_200n * S) === null);
   } finally {
     server.close();
     rmSync(dir, { recursive: true, force: true });

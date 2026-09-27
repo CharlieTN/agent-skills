@@ -123,6 +123,10 @@ In A/B rounds 7–8 on sync-tray#72 the isolated intent finder flagged the highe
 defect in 3 of 3 runs, where the default setting in one context had missed it in 4 of 4.
 
 1. Pick a scratch path: `<scratchRoot()>/intent-<PR number>-<unix seconds>/intent.json`.
+   Create its directory and stamp the dispatch time in it on a command you already run before
+   dispatching: `mkdir -p <dir> && date +%s%3N > <dir>/dispatched_at`. The reviewer's run telemetry
+   starts the run there, so the time the agent spends reading its definition is in the trace
+   ([`run-telemetry.md`](../../../agents/pr-reviewer/rules/run-telemetry.md)).
 2. In **one message**, dispatch both:
    - `pr-reviewer` with `<PR_REF> <pass-through flags> --intent-from <that path>`;
    - a general-purpose worker (the harness's general sub-agent type) with the [worker preamble](#worker-preamble--every-dispatch-in-steps-c-e-and-f),

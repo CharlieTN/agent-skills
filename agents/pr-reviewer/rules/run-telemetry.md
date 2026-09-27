@@ -12,14 +12,18 @@ This rule gives every run a per-step breakdown, and exports it as a trace in the
 | `prepare` | `prepare-review.mjs` | Starts the run; backdated to the script's own start. Each internal phase (`fetch`, `resolve`, `workspace`, `classify-shape`, `impact-graph`, `packet`, `standards`, `triage-routing`) is a child span with its own start and end. |
 | `finalize` | `finalize.mjs` | Adds the outcome (verdict, candidates, confirmed, posted inline) to the run; **finishes and exports the run under `--dry-run`** when it renders. A finalize that fails to render is an ERROR step and leaves the run open, so the re-run that succeeds is the one exported. |
 | `post` | `execute-write-plan.mjs` | A real run's last step; finishes and exports the run. |
+| `load` | `worker intent import` | Hybrid runs only: the caller's dispatch stamp starts the run, so the time the agent spends reading its definition and rules before `prepare` is a `load` step instead of missing from the trace. |
 
 The ledger is `telemetry.jsonl` next to `context.json` — `context.telemetry.runDir`.
-Bind it once, right after `prepare-review.mjs` wrote the context:
+Read it once, right after `prepare-review.mjs` wrote the context:
 
 ```bash
 RUN_DIR="$(jq -r '.telemetry.runDir' ctx.json)"
 TELEMETRY="$AGENT_SUPPORT/pr-reviewer/scripts/review-telemetry.mjs"
 ```
+
+Most harnesses start a fresh shell for every tool call, so these variables do not survive to the next command.
+Write the two literal paths into every marker instead of relying on them; the examples below use the variables only for brevity.
 
 `prepare-review.mjs --no-telemetry` starts no run; the hybrid intent worker uses it, because its preparation is part of the reviewer's run, not a run of its own.
 
@@ -39,7 +43,10 @@ A gap nobody marked is exported as `unmarked`, so the steps always add up to the
 | `consolidate` | Step 2.5 |
 | `verify` | Step 2.6b |
 | `judgments` | writing `judgments.json` |
+| `validate` | the `validate-judgments.mjs` command — it closes `judgments`, so that step gets a tool-call count too |
 | `state` | Step 4c / 4d memory writes |
+
+A step that does not run this time — `memory` and `state` when memory is skipped, `intent-wait` outside `hybrid` — gets no marker.
 
 **Never spend a tool call on a marker.**
 A turn costs 13–16 seconds; ten markers issued on their own would add two minutes to the run they measure.
@@ -54,11 +61,26 @@ node "$TELEMETRY" step verify --run-dir "$RUN_DIR"; rg -n "pendingCount" "$WORKD
 node "$TELEMETRY" step verify --run-dir "$RUN_DIR"
 ```
 
+**When a step starts with a Read or Write tool call**, which cannot carry a marker, put the marker on that step's first shell command instead.
+A few seconds booked to the previous step costs less than a turn, and it never justifies writing a file through a heredoc instead of the Write tool.
+
+**Pass your running tool-call count on every marker**, as `--attr tool_calls_so_far=<N>`: the number of tool calls you have made in this run so far.
+The trace turns consecutive counts into `pr_review.step.tool_calls` per step.
+It separates a step that is slow because it takes many turns from one that is slow because each turn generates a lot: in round 10 on sync-tray#72, `finders` was 11 calls in 212 s and `verify` was 2 calls in 205 s.
+The count is yours, so it is approximate; the trace labels it as reported.
+
+```bash
+node /abs/review-telemetry.mjs step verify --attr tool_calls_so_far=34 --attr candidates=20 --run-dir /abs/run; rg -n "pendingCount" /abs/workdir
+```
+
 Attach a count to the open step with `--attr`, for example `--attr candidates=14` on `verify`.
 Keys are prefixed `pr_review.` automatically, so a marker can never overwrite a `gen_ai.*` or VCS attribute.
 
 **Sub-agents.**
-In the hybrid default, fold the intent worker in when you read its file, on the same command:
+In the hybrid default, fold the intent worker in when you read its file, on the same command.
+It prints one stderr line saying what it folded in.
+When the caller left a dispatch stamp in the worker's directory (`dispatched_at`, or the `-<unix seconds>` suffix `/pr-review` puts on it), the run and the worker both start at the dispatch.
+A delivered worker also tells `finalize.mjs` that the intent finder was isolated, so `--no-dispatch` does not report it as having run in-context:
 
 ```bash
 INTENT_FROM="/the/path/passed/as/--intent-from/intent.json"

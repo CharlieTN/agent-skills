@@ -9922,6 +9922,7 @@ const isPollBlock = (block) =>
   const pr = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/scripts/prepare-review.mjs"), "utf8");
   const fin = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/scripts/finalize.mjs"), "utf8");
   const ewp = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/scripts/execute-write-plan.mjs"), "utf8");
+  const rtDocEarly = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/rules/run-telemetry.md"), "utf8");
   s.check("G84o prepare-review.mjs starts the run and records `prepare`; --no-telemetry skips it",
     /beginRun\(runDir,/.test(pr) && /name: "prepare", ns: startNs/.test(pr) && /"--no-telemetry"\) opts\.telemetry = false/.test(pr));
   s.check("G84o finalize.mjs records `finalize` and the outcome, and finishes the run under --dry-run",
@@ -9937,6 +9938,19 @@ const isPollBlock = (block) =>
       && /a script's internal phases are child spans of its step/.test(out)
       && /the root carries a readable session title for AI Coding Insights/.test(out)
       && /a run joined to a harness session never renames that session/.test(out));
+  // Round 10 (a real review exported to Dash0): the 94 s before `prepare` was missing from the
+  // trace, `verify` was 2 tool calls in 205 s (generation-bound, invisible without per-step calls),
+  // and a delivered hybrid intent worker was reported as having run in-context.
+  const skillTxt = readFileSync(join(REPO_ROOT, "skills/quality/pr-review/SKILL.md"), "utf8");
+  s.check("G84o a hybrid run starts at the caller's dispatch stamp, with the definition read as a `load` step",
+    /a dispatch stamp starts the run and the worker at the dispatch, and the first gap is `load`/.test(out)
+      && /dispatchTime reads the \/pr-review directory suffix/.test(out)
+      && /date \+%s%3N > <dir>\/dispatched_at/.test(skillTxt));
+  s.check("G84o per-step tool calls come from the model's running count, and run-telemetry.md asks for it on every marker",
+    /per-step tool calls come from consecutive model-reported counts/.test(out)
+      && /\*\*Pass your running tool-call count on every marker\*\*/.test(rtDocEarly));
+  s.check("G84o a delivered hybrid intent worker is never reported as having run in-context",
+    /noDispatchTopology === "hybrid" && context\?\.intentIsolated !== true/.test(fin) && /context\.intentIsolated = true/.test(fin));
   s.check("G84o execute-write-plan.mjs records `post` and finishes a real run",
     /name: "post", ns: PROCESS_START_NS/.test(ewp) && /await finishRun\(runDir/.test(ewp));
   const rtDoc = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/rules/run-telemetry.md"), "utf8");
