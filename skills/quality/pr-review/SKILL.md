@@ -116,6 +116,35 @@ Dispatch **once**. This command does not loop: a second pass over an unchanged h
 same code and re-posts the same report, and iterating a review against fixes is what
 [`review-loop`](../review-loop/SKILL.md) exists for.
 
+**Send the intent worker in the same message (the `hybrid` default).**
+The dispatched agent holds no dispatch tool of its own, so the one sub-agent its budget isolates —
+the intent finder — is dispatched from here, alongside it.
+In A/B rounds 7–8 on sync-tray#72 the isolated intent finder flagged the highest-severity agreed
+defect in 3 of 3 runs, where the default setting in one context had missed it in 4 of 4.
+
+1. Pick a scratch path: `<scratchRoot()>/intent-<PR number>-<unix seconds>/intent.json`.
+2. In **one message**, dispatch both:
+   - `pr-reviewer` with `<PR_REF> <pass-through flags> --intent-from <that path>`;
+   - a general-purpose worker (the harness's general sub-agent type) with the [worker preamble](#worker-preamble--every-dispatch-in-steps-c-e-and-f),
+     told to run `prepare-review.mjs --pr <PR_REF> --out <scratch dir>/context.json` (add
+     `--review-sha <sha> --isolated` when the pass-through flags carry `--review-sha`), read
+     `finders.md` and the review packet it wrote, act as the `intent` finder only, and write its
+     candidates to that path as a JSON array.
+3. Skip the worker, and dispatch `pr-reviewer` alone, when the pass-through flags carry
+   `--thoroughness` below 0.4 — that budget is `in-context` and isolates nothing.
+
+The agent waits for the file before its Step 2.5 and runs intent itself if the worker failed
+([`dispatch-topology.md` § The three topologies](../../../agents/pr-reviewer/rules/dispatch-topology.md#the-three-topologies)).
+The two run concurrently, so the wall time is the reviewer's own.
+
+```text
+✅ RIGHT — one message, two dispatches
+Task(subagent_type="pr-reviewer", prompt="<PR_REF> --intent-from /tmp/…/intent.json")
+Task(subagent_type="general-purpose", prompt="<worker preamble> … act as the intent finder … write /tmp/…/intent.json")
+
+❌ WRONG — the worker in a second message: the reviewer's wait becomes the worker's full runtime
+```
+
 **This is the default and the fallback.** If `--fanout` was passed, run
 [`--fanout`](#--fanout--opt-in-parallel-orchestration) instead of this single dispatch — unless that
 section's own quick-tier or no-dispatch conditions send you back here.
@@ -303,8 +332,28 @@ Each finder sub-agent receives **only**:
   [`finder-dependency.md`](../../../agents/pr-reviewer/rules/finder-dependency.md));
 - `context.json`;
 - the review packet (`context.packet.path`, written by `prepare-review.mjs`), which each finder reads
-  before opening any workspace file;
+  before opening any workspace file — or, for a sharded worker, its own packet part (below);
 - the workspace path.
+
+**The per-file finders are sharded when the packet is large.** When `context.packet.parts` is
+non-empty (the packet is over 2,500 lines), `correctness`, `consumer-impact`, and `quality` each
+dispatch one worker per part — `correctness@1` … `correctness@3` — and worker `k` reads
+`context.packet.parts[k − 1].path` instead of the full packet.
+A part keeps the description and the whole file index and inlines only its own files; those files
+are the worker's scope, and it opens another file from the workspace only when a finding in its own
+files depends on it.
+`intent`, `standards`, and `dependency` judge the change as a whole and always read the full packet.
+Write shard output to `candidates/<finder>@<k>.json`; Step d concatenates every file in
+`candidates/`, so nothing downstream changes.
+Round 8 (sync-tray#72, the first real `--fanout` run) measured why: every worker read the whole
+6,600-line packet and took 8–14 minutes, so a parallel worker was no faster than a whole
+single-context review.
+Plan the units, shards included, with:
+
+```bash
+node agents/pr-reviewer/scripts/plan-dispatch.mjs --count --fanout \
+  --thoroughness <context.budget.effectiveThoroughness> --packet-lines <context.packet.lines>
+```
 
 Never the other finders' output, never a running count of candidates so far — `finders.md`'s own
 independence rule (a shared summary makes the next finder quieter). Each finder returns candidate
@@ -313,10 +362,11 @@ records in [`finders.md`](../../../agents/pr-reviewer/rules/finders.md#the-candi
 `bad_outcome`, `evidence`, `severity_hint`, `fix`, `verify_by` — no `prefix`, no `body`; those are
 the verifier's fields, added in Step e), written to `candidates/<finder>.json`.
 
-**`--effort high` runs `correctness` as diversify-then-vote** exactly per `finders.md`'s existing
-rule: N = 5 sub-agents (N = 3 by default) over the same hunks in permuted file order, each an
-independent dispatch counted against the same concurrency cap below, with agreement recorded as
-`votes` on the merged candidate.
+**`correctness` runs one pass per shard, never as diversify-then-vote**, at every thoroughness,
+`--effort high` included.
+Round 8's two correctness votes raised 24 and 25 candidates that dedupe barely merged, so the votes
+added verifier work rather than agreement, at ~10 minutes of one worker each
+([`dispatch-topology.md § Diversify then vote`](../../../agents/pr-reviewer/rules/dispatch-topology.md#diversify-then-vote-moved-here-from-the-agent-body--retired)).
 
 **Lenses ride the same parallel wave**, each self-gating on the tier `route-depth.mjs` already
 resolved — no separate wave. Holistic review, optimality, and measurability run together in **one
@@ -405,18 +455,27 @@ node agents/pr-reviewer/scripts/plan-dispatch.mjs \
   --verifier-batches "<scratchRoot()>/<run-id>/deduped.json"
 ```
 
-Each batch holds at most `VERIFY_BATCH_MAX` (8) candidates.
-**Never batch candidates that share a path** into one dispatch, since
+Each batch holds at most `VERIFY_BATCH_MAX` (8) candidates, and a run verifies at most
+`VERIFY_CAP` (40): `plan-dispatch.mjs` ranks the kept candidates by `severity_hint`, then by how many
+finders raised each one, and reports the rest as `overflow` with a ready-made `anomaly` string.
+Pass that string through `context.render.RUN_ANOMALY` at Step f, so the report says how many
+candidates went unverified; never verify the overflow in a second pass, and never drop it silently.
+Round 8 kept 118 candidates and planned 33 batches in 6 messages for a report that posts at most 20
+inline.
+**Never batch two candidates from one code region** into one dispatch — the same `path` and within
+`REGION_LINES` (40) lines of each other, the same symbol, or either with no line — since
 [`finding-verifier.md`](../../../agents/shared/rules/finding-verifier.md)'s adversarial framing
-depends on seeing one claim at a time.
+depends on seeing one claim about a piece of code at a time.
 A batched verifier judges each candidate as if it were the only one, in the order given, and writes
 `verdicts/<batch-id>.json` as `{ "candidates": [...] }` — one entry per candidate in its batch. **This is a hard rule, not a preference: one live arm-C run
 batched several same-path candidates into one verifier dispatch to save a wave, and it is a
 deviation from the pipeline this section documents — batching by path is exactly the shared-summary
 problem `finders.md`'s independence rule already forbids at the finder stage, moved one step
 downstream, and it makes the verifier quieter on each claim in the batch instead of adversarial on
-one.** Two candidates that share a path always land in different verifier dispatches, each batched with
-*unrelated-path* candidates only, never with each other; `plan-dispatch.mjs` guarantees it. Each verifier receives **only** the
+one.** Two candidates from one region always land in different verifier dispatches; two candidates
+far apart in one file may share one, because they share no code for the verifier to conflate — the
+old path-only rule cost round 8 a floor of 33 batches, one per candidate in its busiest file.
+`plan-dispatch.mjs` guarantees the region rule. Each verifier receives **only** the
 candidate record, the workspace, and `impact.json` — never the finder's reasoning, never the other
 candidates, per `finding-verifier.md`'s own exclusion table; a semantically merged candidate is
 verified as its representative alone, its `_semantic_merged` members withheld. Each returns the
@@ -560,13 +619,12 @@ call; only the finder's and the verifier's own judgment are stubbed.
 
 Batch every dispatch wave (finders + lenses in Step c, verifiers in Step e) in groups of
 **`PR_REVIEW_MAX_PARALLEL` — default 6** — concurrent sub-agent dispatches at a time, never more.
-This exists for the same reason `diversify-then-vote`'s N is a small fixed number rather than
-"as many as helpful": a PR review dispatching one sub-agent per finding on a large diff can burst
+This exists because a PR review dispatching one sub-agent per finding on a large diff can burst
 past a harness's or GitHub's own rate limits, and a burst that gets throttled mid-run is worse than
 a queued batch that finishes slightly later.
-Step c's wave on a `deep`-tier run is up to eight finder dispatches (three `correctness` votes) plus
-the lens bundle and the standards-conformance lens, so it already spans two messages; Step e's
-verifier batches queue the same way.
+Step c's wave on a `deep`-tier run is six finder dispatches plus the lens bundle and the
+standards-conformance lens — up to twelve finder dispatches when the packet is sharded into three
+parts — so it spans two or three messages; Step e's verifier batches queue the same way.
 Send the next message only after every dispatch in the current one has returned, dispatch each unit
 exactly once, and retry a unit only once when it returned no readable output file —
 [`dispatch-topology.md § Packing`](../../../agents/pr-reviewer/rules/dispatch-topology.md#packing--how-units-become-dispatches)
@@ -692,7 +750,7 @@ command for people already there.
 - **Read-only, always.** This command never edits a file, never commits, never pushes, and never resolves a thread. Applying is [`/implement-suggestion`](../../workflow/implement-suggestion/SKILL.md); applying-and-converging is [`review-loop`](../review-loop/SKILL.md).
 - **Never write to GitHub.** The agent posts its own sticky report and inline findings. This skill adds a terminal summary only — a second comment would duplicate a report that is rewritten in place precisely so a PR does not accumulate copies.
 - **Dispatch via the sub-agent dispatch tool, never `Skill()`.** `pr-reviewer` is an agent; `Skill("pr-reviewer", …)` errors with `Unknown skill`. The tool is named `Task` in some harnesses and `Agent` in others — use the one this session has.
-- **One dispatch per invocation. Do not loop.** Re-reviewing an unchanged head produces the same report at full cost.
+- **One review dispatch per invocation, plus the intent worker in the same message. Do not loop.** Re-reviewing an unchanged head produces the same report at full cost.
 - **Absent sub-agent dispatch is a skip, not a fallback — and it is a CAPABILITY test, not a name test.** Conclude it only when no available tool dispatches a sub-agent under any name; the absence of `Task` alone is not evidence. Then never review in this context and label it a `pr-reviewer` review, and never retry the dispatch.
 - **Never validate the pass-through flags.** Forward the tail verbatim; the agent owns that grammar and rejects what it does not know.
 - **Never re-adjudicate the verdict.** Report `PASS` / `WARN` / `FAIL` as returned, with the blocking findings named.

@@ -1,35 +1,37 @@
 #!/usr/bin/env node
 // @ts-check
 // plan-dispatch.mjs — how many sub-agents a review dispatches, and in what grouping (A/B round 2
-// item 6, plan feat/pr-reviewer-shrink-fanout-ab).
+// item 6, revised in A/B round 8, plan feat/pr-reviewer-shrink-fanout-ab).
 //
-// A/B round 2 measured wall-clock and tokens as dominated by SUB-AGENT COUNT: every dispatch pays
-// a ~110-160k-token base before it reads a line of the diff, and round 2's arms ran 22 (t=0.8)
-// and 33 (t=1.0) of them. Two groupings produced most of that count and neither changed what a
-// review finds:
+// Three topologies, chosen by resolveBudget() (route-depth.mjs):
 //
-//   1. one verifier dispatch PER CANDIDATE — packed here into batches of at most
-//      VERIFY_BATCH_MAX candidates, with no two candidates that share a `path` in one batch
-//      (skills/quality/pr-review/SKILL.md Step e's hard rule, unchanged);
-//   2. one dispatch per LENS — holistic, optimality and measurability now share one lens-bundle
-//      dispatch. standards-conformance stays its own dispatch (SKILL.md Step c: the lens and the
-//      standards finder are two separate dispatches, and the bundle is neither).
+//   in-context  no sub-agents (t < 0.4, or no dispatch capability).
+//   hybrid      the DEFAULT at t >= 0.4: the review runs in one context and only the intent finder
+//               is its own sub-agent (A/B rounds 7–8: isolated, it flagged the top defect 3 of 3
+//               times; the full fan-out found everything but projected to ~57 minutes).
+//   parallel    `/pr-review --fanout` only: every finder its own sub-agent, and the per-file finders
+//               (correctness, consumer-impact, quality) SHARDED across packet parts when the packet
+//               is over SHARD_LINES, so each worker reads only its part (review-packet.mjs).
 //
-// Two things are deliberately NOT packed: finders (A/B round 1: the arm that ran intent/standards/
-// quality in one context missed the best-corroborated bug), and correctness votes (diversify-then-
-// vote needs each vote in its own context, or the votes are one opinion counted N times).
+// Verification under `parallel` is packed into batches of at most VERIFY_BATCH_MAX. Two candidates
+// CONFLICT — may not share a batch — when they share a path AND sit within REGION_LINES of each
+// other or name the same symbol: the independence rule is about one region of code judged twice,
+// and round 8 showed a path-only key made one 33-candidate file force 33 batches. At most
+// VERIFY_CAP candidates are verified, highest severity and most corroborated first; the rest are
+// reported as an anomaly, never dropped silently.
 //
-// resolveBudget() (route-depth.mjs) decides WHICH units exist; this module decides HOW THEY ARE
-// GROUPED into dispatches and messages. rules/dispatch-topology.md owns the prose contract,
-// rules/depth-routing.md § Expected sub-agents per band carries the table `--table` prints, and
-// L1 G84g diffs the two.
+// Correctness votes are retired (route-depth.mjs CORRECTNESS_VOTES): round 8's two votes added 24
+// and 25 candidates rather than corroborating each other.
+//
+// rules/dispatch-topology.md owns the prose contract, rules/depth-routing.md § Expected sub-agents
+// per band carries the table `--table` prints, and L1 G84g diffs the two.
 //
 // Usage:
-//   node plan-dispatch.mjs --verifier-batches <candidates.json> [--batch-max <n>]
+//   node plan-dispatch.mjs --verifier-batches <candidates.json> [--batch-max <n>] [--cap <n>]
 //       <candidates.json>: a JSON array, or an object with `candidates` or `kept` (deduped.json).
-//       Prints { batchMax, maxParallel, batches: [{id, members, paths}], messages: [[id…]] }.
+//       Prints { batchMax, cap, regionLines, verified, batches, overflow, anomaly, messages }.
 //   node plan-dispatch.mjs --count --thoroughness <t> [--routed-tier <tier>] [--candidates <n>]
-//       [--depth-capability <cap>] [--dispatch-unavailable]
+//       [--depth-capability <cap>] [--dispatch-unavailable] [--fanout] [--packet-lines <n>]
 //       Prints the dispatch plan for that budget — packed and unpacked counts side by side.
 //   node plan-dispatch.mjs --table
 //       Prints the depth-routing.md table rows.
@@ -37,6 +39,7 @@
 
 import { readFileSync } from "node:fs";
 import { resolveBudget } from "./route-depth.mjs";
+import { shardCount, SHARDABLE_FINDERS } from "./review-packet.mjs";
 
 /** Sub-agent dispatches per message — the concurrency cap. rules/dispatch-topology.md and
  *  skills/quality/pr-review/SKILL.md state the same number; L1 G84g holds all three equal. */
@@ -46,33 +49,45 @@ export const PR_REVIEW_MAX_PARALLEL = 6;
  *  dispatch's base cost at 8, while 8 still cuts a 20-candidate run from 20 dispatches to 3. */
 export const VERIFY_BATCH_MAX = 8;
 
+/** The most candidates a `--fanout` run verifies: twice the 20-comment inline cap. Round 8 kept 118
+ *  candidates after dedupe, which planned 33 batches in 6 messages (~32 minutes) for a report that
+ *  can post 20 inline. */
+export const VERIFY_CAP = 40;
+
+/** Two same-path candidates at most this many lines apart share a region and never share a batch. */
+export const REGION_LINES = 40;
+
 /** The lenses that share one dispatch. standards-conformance is excluded on purpose. */
 export const LENS_BUNDLE = Object.freeze(["holistic", "optimality", "measurability"]);
 
 /** finders.md's own table order — the order units are listed, so a plan is deterministic. */
 const FINDER_ORDER = ["correctness", "consumer-impact", "dependency", "intent", "standards", "quality"];
 
+const SEVERITY_RANK = /** @type {Record<string, number>} */ ({ critical: 4, high: 3, medium: 2, low: 1 });
+
 /**
  * @typedef {{ kind: "finder"|"lens-bundle"|"lens"|"verifier", id: string, finder?: string,
- *   lenses?: string[], members?: number[] }} Unit
+ *   shard?: number, lenses?: string[], members?: number[] }} Unit
  * @typedef {import("./route-depth.mjs").Budget} Budget
  */
 
 /**
- * One unit per active finder; `correctness` expands to one unit per vote.
+ * The finder dispatches. `hybrid` dispatches only `budget.isolatedFinders`; `parallel` dispatches
+ * every active finder, splitting each shardable one into `shards` units (`correctness@1` …).
  * @param {Budget} budget
+ * @param {{ shards?: number }} [opts]
  * @returns {Unit[]}
  */
-export function finderUnits(budget) {
-  if (budget.topology !== "parallel") return [];
+export function finderUnits(budget, opts = {}) {
+  if (budget.topology === "in-context") return [];
+  const shards = Math.max(1, Math.floor(opts.shards ?? 1));
   /** @type {Unit[]} */
   const units = [];
   for (const f of FINDER_ORDER) {
     if (!budget.finders[/** @type {keyof Budget["finders"]} */ (f)]) continue;
-    if (f === "correctness" && budget.correctnessVotes > 1) {
-      for (let v = 1; v <= budget.correctnessVotes; v++) {
-        units.push({ kind: "finder", id: `correctness#${v}`, finder: f });
-      }
+    if (budget.topology === "hybrid" && !budget.isolatedFinders.includes(f)) continue;
+    if (budget.topology === "parallel" && shards > 1 && SHARDABLE_FINDERS.includes(f)) {
+      for (let k = 1; k <= shards; k++) units.push({ kind: "finder", id: `${f}@${k}`, finder: f, shard: k });
     } else {
       units.push({ kind: "finder", id: f, finder: f });
     }
@@ -81,8 +96,9 @@ export function finderUnits(budget) {
 }
 
 /**
- * The lens dispatches. `skip` names lenses a run turned off by flag or by its own gate
- * (`--no-holistic`, the incremental-mode 2.4 skip, `TRIVIAL_SKIP`, …).
+ * The lens dispatches — `parallel` only; under `hybrid` the lenses run in the orchestrator's
+ * context. `skip` names lenses a run turned off by flag or by its own gate (`--no-holistic`, the
+ * incremental-mode 2.4 skip, `TRIVIAL_SKIP`, …).
  * @param {Budget} budget
  * @param {{ skip?: string[], packing?: boolean }} [opts]
  * @returns {Unit[]}
@@ -111,46 +127,80 @@ export function lensUnits(budget, opts = {}) {
 }
 
 /**
- * Partition candidates into verifier batches: at most `batchMax` per batch, and no two candidates
- * that share a `path` in one batch. The batch count is the smallest that satisfies both —
- * `max(ceil(n / batchMax), largest same-path group)` — and loads differ by at most one.
- *
- * Groups are placed largest first, each member into a different least-loaded batch. Placing g
- * members into the g least-loaded of B batches keeps every load within one of every other, so the
- * fullest batch holds ceil(n / B) <= batchMax. A candidate with no string `path` (an anchorless
- * finding) is its own group: it shares a file with nothing.
- * @param {Array<{ path?: unknown }>} candidates
- * @param {{ batchMax?: number }} [opts]
+ * How many independent finders raised a candidate: itself, plus every finder dedupe merged into it.
+ * @param {any} c
+ */
+function corroboration(c) {
+  const also = Array.isArray(c?._also_flagged_by) ? c._also_flagged_by.length : 0;
+  const sem = Array.isArray(c?._semantic_merged) ? c._semantic_merged.length : 0;
+  return 1 + also + sem;
+}
+
+/**
+ * The candidates a run verifies, capped at `cap`: highest `severity_hint` (or `severity`) first,
+ * then the most corroborated, then input order. Returns candidate indexes. Pure.
+ * @param {any[]} candidates
+ * @param {number} cap
+ * @returns {{ verify: number[], overflow: number[] }}
+ */
+export function selectForVerification(candidates, cap) {
+  const order = candidates.map((_, i) => i).sort((x, y) => {
+    const cx = candidates[x] ?? {}, cy = candidates[y] ?? {};
+    const sx = SEVERITY_RANK[String(cx.severity_hint ?? cx.severity ?? "")] ?? 0;
+    const sy = SEVERITY_RANK[String(cy.severity_hint ?? cy.severity ?? "")] ?? 0;
+    return sy - sx || corroboration(cy) - corroboration(cx) || x - y;
+  });
+  const keep = order.slice(0, Math.max(0, cap)).sort((x, y) => x - y);
+  const drop = order.slice(Math.max(0, cap)).sort((x, y) => x - y);
+  return { verify: keep, overflow: drop };
+}
+
+/**
+ * Whether two candidates may not share a verifier batch: the same path, and either within
+ * `regionLines` of each other, naming the same symbol, or one of them with no line (a whole-file
+ * claim). A candidate with no path shares a region with nothing.
+ * @param {any} a @param {any} b @param {number} regionLines
+ */
+export function conflicts(a, b, regionLines) {
+  const pa = a?.path, pb = b?.path;
+  if (typeof pa !== "string" || pa === "" || pa !== pb) return false;
+  const sa = String(a?.symbol ?? "").trim().toLowerCase(), sb = String(b?.symbol ?? "").trim().toLowerCase();
+  if (sa && sa !== "-" && sa === sb) return true;
+  if (typeof a?.line !== "number" || typeof b?.line !== "number") return true;
+  return Math.abs(a.line - b.line) <= regionLines;
+}
+
+/**
+ * Plan verifier batches: select at most `cap` candidates, then place each into the least-loaded
+ * batch that has room (< batchMax) and holds nothing it conflicts with, opening a new batch only
+ * when none qualifies. Candidates with the most conflicts are placed first. Deterministic. Members
+ * and overflow are indexes into `candidates`.
+ * @param {any[]} candidates
+ * @param {{ batchMax?: number, cap?: number, regionLines?: number }} [opts]
  */
 export function planVerifierBatches(candidates, opts = {}) {
   const batchMax = opts.batchMax ?? VERIFY_BATCH_MAX;
+  const cap = opts.cap ?? VERIFY_CAP;
+  const regionLines = opts.regionLines ?? REGION_LINES;
   if (!Number.isInteger(batchMax) || batchMax < 1) {
     throw new Error(`batchMax must be a positive integer, got ${JSON.stringify(batchMax)}`);
   }
+  if (!(cap === Infinity || (Number.isInteger(cap) && cap >= 0))) {
+    throw new Error(`cap must be a non-negative integer or Infinity, got ${JSON.stringify(cap)}`);
+  }
   if (!Array.isArray(candidates)) throw new Error("candidates must be an array");
-  /** @param {number} i */
-  const keyOf = (i) => {
-    const p = candidates[i]?.path;
-    return typeof p === "string" && p !== "" ? p : `\u0000anchorless#${i}`;
-  };
-  /** @type {Map<string, number[]>} */
-  const groups = new Map();
-  candidates.forEach((_, i) => {
-    const k = keyOf(i);
-    const g = groups.get(k);
-    if (g) g.push(i); else groups.set(k, [i]);
-  });
-  const n = candidates.length;
-  const largestGroup = Math.max(0, ...[...groups.values()].map((g) => g.length));
-  const batchCount = n === 0 ? 0 : Math.max(Math.ceil(n / batchMax), largestGroup);
+  const { verify, overflow } = selectForVerification(candidates, cap);
+  const degree = new Map(verify.map((i) => [i,
+    verify.filter((j) => j !== i && conflicts(candidates[i], candidates[j], regionLines)).length]));
+  const order = [...verify].sort((x, y) => (degree.get(y) ?? 0) - (degree.get(x) ?? 0) || x - y);
   /** @type {number[][]} */
-  const loads = Array.from({ length: batchCount }, () => []);
-  const ordered = [...groups.entries()].sort((a, b) =>
-    b[1].length - a[1].length || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-  for (const [, members] of ordered) {
-    const leastLoaded = loads.map((_, k) => k)
+  const loads = Array.from({ length: verify.length === 0 ? 0 : Math.ceil(verify.length / batchMax) }, () => []);
+  for (const ci of order) {
+    const fits = loads.map((_, k) => k)
+      .filter((k) => loads[k].length < batchMax
+        && !loads[k].some((m) => conflicts(candidates[ci], candidates[m], regionLines)))
       .sort((x, y) => loads[x].length - loads[y].length || x - y);
-    members.forEach((ci, j) => loads[leastLoaded[j]].push(ci));
+    if (fits.length) loads[fits[0]].push(ci); else loads.push([ci]);
   }
   const batches = loads.map((members, k) => {
     members.sort((x, y) => x - y);
@@ -158,12 +208,16 @@ export function planVerifierBatches(candidates, opts = {}) {
       id: `v${String(k + 1).padStart(2, "0")}`,
       members,
       paths: members.map((i) => {
-        const p = candidates[i]?.path;
-        return typeof p === "string" ? p : null;
+        const pth = candidates[i]?.path;
+        return typeof pth === "string" ? pth : null;
       }),
     };
   });
-  return { batchMax, largestGroup, batches };
+  const anomaly = overflow.length > 0
+    ? `${overflow.length} of ${candidates.length} candidates not verified — over the verification cap of ${cap}`
+      + ", lowest severity and least corroborated first"
+    : null;
+  return { batchMax, cap, regionLines, verified: verify.length, batches, overflow, anomaly };
 }
 
 /**
@@ -188,33 +242,36 @@ export function planMessages(units, opts = {}) {
 /**
  * The whole plan for one budget. `candidates` is either the surviving candidates (their paths
  * decide the batches) or a count, read as that many candidates on distinct paths — the lower
- * bound, which is what the depth-routing.md table states.
+ * bound, which is what the depth-routing.md table states. `packetLines` decides the shard count.
  * @param {Budget} budget
- * @param {{ candidates?: Array<{ path?: unknown }> | number, skip?: string[], packing?: boolean,
- *   batchMax?: number, maxParallel?: number }} [opts]
+ * @param {{ candidates?: any[] | number, skip?: string[], packing?: boolean,
+ *   batchMax?: number, maxParallel?: number, packetLines?: number }} [opts]
  */
 export function planDispatch(budget, opts = {}) {
   const packing = opts.packing ?? true;
   const batchMax = packing ? (opts.batchMax ?? VERIFY_BATCH_MAX) : 1;
-  const finders = finderUnits(budget);
+  const shards = budget.topology === "parallel" ? shardCount(opts.packetLines ?? 0) : 1;
+  const finders = finderUnits(budget, { shards });
   const lenses = lensUnits(budget, { skip: opts.skip, packing });
   const raw = opts.candidates ?? 0;
   const candidates = typeof raw === "number"
     ? Array.from({ length: Math.max(0, Math.floor(raw)) }, (_, i) => ({ path: `distinct-${i}` }))
     : raw;
+  const plan = budget.topology === "parallel"
+    ? planVerifierBatches(candidates, { batchMax, cap: packing ? VERIFY_CAP : Infinity })
+    : null;
   /** @type {Unit[]} */
-  const verifiers = budget.topology === "parallel"
-    ? planVerifierBatches(candidates, { batchMax }).batches
-      .map((b) => ({ kind: "verifier", id: b.id, members: b.members }))
-    : [];
+  const verifiers = plan ? plan.batches.map((b) => ({ kind: "verifier", id: b.id, members: b.members })) : [];
   const phaseD = [...finders, ...lenses];
   const maxParallel = opts.maxParallel ?? PR_REVIEW_MAX_PARALLEL;
   return {
     topology: budget.topology,
+    shards,
     finders: finders.length,
     lenses: lenses.length,
     verifiers: verifiers.length,
     subagents: finders.length + lenses.length + verifiers.length,
+    unverified: plan ? plan.overflow.length : 0,
     messages: {
       phaseD: planMessages(phaseD, { maxParallel }).length,
       phaseE: planMessages(verifiers, { maxParallel }).length,
@@ -235,26 +292,32 @@ export const TABLE_BANDS = Object.freeze([
   { label: "`t ≥ 0.95`", t: 0.95 },
 ]);
 
-/** The candidate count the table's total columns assume. */
+/** The candidate count the table's `--fanout` total assumes (and a packet under SHARD_LINES). */
 export const TABLE_CANDIDATES = 10;
 
 /** @returns {string[]} the header, separator, and one row per band */
 export function tableRows() {
   const rows = [
-    `| Band | Finder dispatches | Lens dispatches | Verifier dispatches | Total at ${TABLE_CANDIDATES} candidates | Before packing |`,
+    `| Band | Default (hybrid) sub-agents | \`--fanout\` finder dispatches | \`--fanout\` lens dispatches | \`--fanout\` verifier dispatches | \`--fanout\` total at ${TABLE_CANDIDATES} candidates |`,
     "| --- | --- | --- | --- | --- | --- |",
   ];
   for (const band of TABLE_BANDS) {
-    const budget = resolveBudget({ thoroughness: band.t });
-    const packed = planDispatch(budget, { candidates: TABLE_CANDIDATES });
-    const unpacked = planDispatch(budget, { candidates: TABLE_CANDIDATES, packing: false });
-    const bundle = packed.units.phaseD.find((u) => u.kind === "lens-bundle");
-    const lensCell = packed.lenses === 0 ? "0"
-      : `${packed.lenses} (${[bundle ? bundle.lenses?.join(" + ") : null,
-        packed.units.phaseD.some((u) => u.id === "standards-conformance") ? "standards-conformance" : null]
+    const def = planDispatch(resolveBudget({ thoroughness: band.t }), { candidates: TABLE_CANDIDATES });
+    const defCell = def.topology === "hybrid"
+      ? `${def.subagents} (${def.units.phaseD.map((u) => u.id).join(", ")})`
+      : "0 (in-context)";
+    const fb = resolveBudget({ thoroughness: band.t, fanout: true });
+    const fan = planDispatch(fb, { candidates: TABLE_CANDIDATES });
+    if (fan.topology !== "parallel") {
+      rows.push(`| ${band.label} | ${defCell} | 0 | 0 | 0 (in-context) | 0 |`);
+      continue;
+    }
+    const bundle = fan.units.phaseD.find((u) => u.kind === "lens-bundle");
+    const lensCell = fan.lenses === 0 ? "0"
+      : `${fan.lenses} (${[bundle ? bundle.lenses?.join(" + ") : null,
+        fan.units.phaseD.some((u) => u.id === "standards-conformance") ? "standards-conformance" : null]
         .filter(Boolean).join("; ")})`;
-    const verifierCell = budget.topology === "parallel" ? `⌈V / ${VERIFY_BATCH_MAX}⌉` : "0 (in-context)";
-    rows.push(`| ${band.label} | ${packed.finders} | ${lensCell} | ${verifierCell} | ${packed.subagents} | ${unpacked.subagents} |`);
+    rows.push(`| ${band.label} | ${defCell} | ${fan.finders} | ${lensCell} | ⌈min(V, ${VERIFY_CAP}) / ${VERIFY_BATCH_MAX}⌉ | ${fan.subagents} |`);
   }
   return rows;
 }
@@ -269,54 +332,88 @@ function selfTest() {
   const check = (name, ok, detail = "") => {
     if (ok) { passed++; console.log(`  ✓ ${name}`); } else { fails.push(name); console.log(`  ✗ ${name}${detail ? ` — ${detail}` : ""}`); }
   };
-  /** @param {string[]} paths */
-  const cands = (paths) => paths.map((path) => ({ path }));
-  /** @param {ReturnType<typeof planVerifierBatches>} plan @param {number} n */
-  const isPartition = (plan, n) => {
+  /** @param {Array<[string, number?, string?]>} specs */
+  const cands = (specs) => specs.map(([path, line, symbol]) => ({ path, line: line ?? 1, symbol: symbol ?? null }));
+  /** @param {ReturnType<typeof planVerifierBatches>} plan @param {number[]} expected */
+  const isPartitionOf = (plan, expected) => {
     const seen = plan.batches.flatMap((b) => b.members).sort((a, b) => a - b);
-    return seen.length === n && seen.every((v, i) => v === i);
+    return JSON.stringify(seen) === JSON.stringify([...expected].sort((a, b) => a - b));
   };
-  /** @param {ReturnType<typeof planVerifierBatches>} plan */
-  const pathDistinct = (plan) => plan.batches.every((b) => {
-    const ps = b.paths.filter((p) => p !== null);
-    return new Set(ps).size === ps.length;
-  });
+  /** @param {any[]} list @param {ReturnType<typeof planVerifierBatches>} plan */
+  const conflictFree = (list, plan) => plan.batches.every((b) =>
+    b.members.every((x, i) => b.members.slice(i + 1).every((y) => !conflicts(list[x], list[y], plan.regionLines))));
+  const all = (/** @type {number} */ n) => Array.from({ length: n }, (_, i) => i);
 
   // ---- planVerifierBatches ----
   check("no candidates → no batches", planVerifierBatches([]).batches.length === 0);
 
-  const distinct20 = planVerifierBatches(cands(Array.from({ length: 20 }, (_, i) => `f${i}.ts`)));
+  const distinct20 = cands(Array.from({ length: 20 }, (_, i) => [`f${i}.ts`]));
+  const d20 = planVerifierBatches(distinct20);
   check("20 candidates on distinct paths → 3 batches (⌈20/8⌉), loads 7/7/6",
-    distinct20.batches.length === 3
-      && JSON.stringify(distinct20.batches.map((b) => b.members.length).sort()) === JSON.stringify([6, 7, 7]),
-    JSON.stringify(distinct20.batches.map((b) => b.members.length)));
-  check("every candidate lands in exactly one batch", isPartition(distinct20, 20));
+    d20.batches.length === 3
+      && JSON.stringify(d20.batches.map((b) => b.members.length).sort()) === JSON.stringify([6, 7, 7]),
+    JSON.stringify(d20.batches.map((b) => b.members.length)));
+  check("every candidate lands in exactly one batch", isPartitionOf(d20, all(20)));
 
-  const mixedPaths = ["a.ts", "a.ts", "a.ts", "b.ts", "b.ts", "c.ts", "d.ts", "e.ts", "e.ts", "f.ts",
-    "g.ts", "h.ts", "a.ts", "i.ts", "j.ts", "k.ts", "l.ts", "m.ts"];
-  const mixed = planVerifierBatches(cands(mixedPaths));
-  check("no batch holds two candidates that share a path", pathDistinct(mixed));
-  check("mixed paths: still a partition, and every batch within batchMax",
-    isPartition(mixed, mixedPaths.length) && mixed.batches.every((b) => b.members.length <= VERIFY_BATCH_MAX));
-  check("mixed paths: batch count is max(⌈18/8⌉, largest group 4) = 4",
-    mixed.batches.length === 4 && mixed.largestGroup === 4, String(mixed.batches.length));
-  const loadsMixed = mixed.batches.map((b) => b.members.length);
-  check("loads differ by at most one", Math.max(...loadsMixed) - Math.min(...loadsMixed) <= 1, JSON.stringify(loadsMixed));
+  const hotFar = cands(Array.from({ length: 10 }, (_, i) => ["hot.ts", 100 + i * 200]));
+  const hf = planVerifierBatches(hotFar);
+  check("10 candidates on ONE path but in 10 distinct regions → 2 batches, not 10 (A/B round 8)",
+    hf.batches.length === 2 && isPartitionOf(hf, all(10)), String(hf.batches.length));
 
-  const onePath = planVerifierBatches(cands(Array.from({ length: 10 }, () => "hot.ts")));
-  check("10 candidates on ONE path → 10 single-candidate batches (the path rule wins over batchMax)",
-    onePath.batches.length === 10 && onePath.batches.every((b) => b.members.length === 1));
+  const hotNear = cands(Array.from({ length: 10 }, (_, i) => ["hot.ts", 100 + i * 4]));
+  const hn = planVerifierBatches(hotNear);
+  check("10 candidates in ONE region of one file → 10 single-candidate batches (the region rule wins over batchMax)",
+    hn.batches.length === 10 && hn.batches.every((b) => b.members.length === 1));
 
-  const anchorless = planVerifierBatches([{ path: undefined }, { path: "" }, {}, { path: "x.ts" }]);
-  check("candidates with no path are each their own group (batched together, never refused)",
+  const sameSymbol = cands([["s.ts", 10, "run"], ["s.ts", 900, "run"], ["s.ts", 500, "other"]]);
+  const ss = planVerifierBatches(sameSymbol);
+  check("two same-path candidates naming the same symbol never share a batch, however far apart",
+    conflictFree(sameSymbol, ss) && ss.batches.length === 2, JSON.stringify(ss.batches.map((b) => b.members)));
+
+  const wholeFile = [{ path: "w.ts", line: null, symbol: null }, { path: "w.ts", line: 800, symbol: null }];
+  check("a same-path candidate with no line conflicts with every other on that path",
+    planVerifierBatches(wholeFile).batches.length === 2);
+
+  const mixed = cands([["a.ts", 10], ["a.ts", 20], ["a.ts", 700], ["b.ts", 5], ["b.ts", 30], ["c.ts"], ["d.ts"],
+    ["e.ts", 1], ["e.ts", 400], ["f.ts"], ["g.ts"], ["h.ts"], ["a.ts", 15], ["i.ts"], ["j.ts"], ["k.ts"], ["l.ts"], ["m.ts"]]);
+  const mx = planVerifierBatches(mixed);
+  check("mixed: a partition, conflict-free, every batch within batchMax",
+    isPartitionOf(mx, all(mixed.length)) && conflictFree(mixed, mx) && mx.batches.every((b) => b.members.length <= VERIFY_BATCH_MAX));
+  check("mixed: 3 batches — the a.ts region holding 3 candidates sets the floor above ⌈18/8⌉",
+    mx.batches.length === 3, String(mx.batches.length));
+
+  const anchorless = planVerifierBatches([{ path: undefined }, { path: "" }, {}, { path: "x.ts", line: 1 }]);
+  check("candidates with no path conflict with nothing (batched together, never refused)",
     anchorless.batches.length === 1 && anchorless.batches[0].members.length === 4);
 
-  const again = planVerifierBatches(cands(mixedPaths));
-  check("deterministic: the same input plans the same batches", JSON.stringify(again) === JSON.stringify(mixed));
+  const again = planVerifierBatches(mixed);
+  check("deterministic: the same input plans the same batches", JSON.stringify(again) === JSON.stringify(mx));
+
+  // ---- the verification cap ----
+  const ranked = [
+    { path: "a.ts", line: 1, severity_hint: "low" },
+    { path: "b.ts", line: 1, severity_hint: "high" },
+    { path: "c.ts", line: 1, severity_hint: "medium", _also_flagged_by: ["quality"] },
+    { path: "d.ts", line: 1, severity_hint: "medium" },
+    { path: "e.ts", line: 1, severity_hint: "critical" },
+  ];
+  const capped = planVerifierBatches(ranked, { cap: 3 });
+  check("the cap keeps the highest severity, then the most corroborated",
+    JSON.stringify(capped.batches.flatMap((b) => b.members).sort()) === JSON.stringify([1, 2, 4])
+      && JSON.stringify(capped.overflow) === JSON.stringify([0, 3]), JSON.stringify(capped.overflow));
+  check("an over-cap run names the overflow as an anomaly, never silently",
+    capped.verified === 3 && /^2 of 5 candidates not verified — over the verification cap of 3/.test(capped.anomaly || ""));
+  check("at or under the cap there is no overflow and no anomaly",
+    planVerifierBatches(ranked).overflow.length === 0 && planVerifierBatches(ranked).anomaly === null);
+  const many = cands(Array.from({ length: 118 }, (_, i) => [`f${i % 16}.ts`, (i * 97) % 3700]));
+  const mplan = planVerifierBatches(many);
+  check("round 8's shape (118 candidates on 16 files) verifies VERIFY_CAP in ⌈40/8⌉-ish batches",
+    mplan.verified === VERIFY_CAP && mplan.overflow.length === 118 - VERIFY_CAP && mplan.batches.length <= 7,
+    String(mplan.batches.length));
 
   let threw = 0;
   for (const bad of [0, -1, 1.5, NaN]) {
-    try { planVerifierBatches(cands(["a"]), { batchMax: bad }); } catch { threw++; }
+    try { planVerifierBatches(cands([["a"]]), { batchMax: bad }); } catch { threw++; }
   }
   check("an invalid batchMax (0, -1, 1.5, NaN) throws rather than planning", threw === 4);
 
@@ -326,50 +423,47 @@ function selfTest() {
     JSON.stringify(msgs.map((m) => m.length)) === JSON.stringify([6, 6, 2]));
   check("no message exceeds PR_REVIEW_MAX_PARALLEL", msgs.every((m) => m.length <= PR_REVIEW_MAX_PARALLEL));
 
-  // ---- planDispatch at the tier defaults ----
+  // ---- planDispatch: the default (hybrid) path ----
   const quick = planDispatch(resolveBudget({ routedTier: "quick" }), { candidates: 10 });
   check("quick (t=0.2): in-context, zero sub-agents", quick.topology === "in-context" && quick.subagents === 0);
-
   const standard = planDispatch(resolveBudget({ routedTier: "standard" }), { candidates: 10 });
-  check("standard (t=0.5): 6 finders, 2 lens dispatches, 2 verifier batches → 10",
-    standard.finders === 6 && standard.lenses === 2 && standard.verifiers === 2 && standard.subagents === 10,
-    JSON.stringify({ f: standard.finders, l: standard.lenses, v: standard.verifiers }));
+  check("standard (t=0.5) default: hybrid, one sub-agent — the intent finder",
+    standard.topology === "hybrid" && standard.subagents === 1 && standard.units.phaseD[0]?.id === "intent");
+  const deep = planDispatch(resolveBudget({ routedTier: "deep" }), { candidates: 10, packetLines: 6612 });
+  check("deep (t=0.8) default: still one sub-agent, no lenses, no verifier dispatch, no shards",
+    deep.subagents === 1 && deep.lenses === 0 && deep.verifiers === 0 && deep.shards === 1);
 
-  const deep = planDispatch(resolveBudget({ routedTier: "deep" }), { candidates: 10 });
-  const deepBundle = deep.units.phaseD.find((u) => u.kind === "lens-bundle");
-  check("deep (t=0.8): 3 correctness votes + 5 finders = 8 finder dispatches", deep.finders === 8);
-  check("deep: holistic + optimality + measurability share ONE lens-bundle dispatch",
-    JSON.stringify(deepBundle?.lenses) === JSON.stringify(["holistic", "optimality", "measurability"]));
-  check("deep: standards-conformance is its own dispatch, never in the bundle",
-    deep.units.phaseD.some((u) => u.id === "standards-conformance" && u.kind === "lens")
-      && !deepBundle?.lenses?.includes("standards-conformance"));
-  check("deep: each correctness vote is its own dispatch",
-    deep.units.phaseD.filter((u) => u.finder === "correctness").length === 3);
-
-  const ceiling = planDispatch(resolveBudget({ effortHigh: true, routedTier: "deep" }), { candidates: 10 });
-  check("--effort high (t=1): 5 votes + 5 finders = 10 finder dispatches, 14 sub-agents at 10 candidates",
-    ceiling.finders === 10 && ceiling.subagents === 14, String(ceiling.subagents));
-  check("--effort high: phase D (12 units) takes 2 messages at the cap of 6", ceiling.messages.phaseD === 2);
-
-  const noDispatch = planDispatch(resolveBudget({ routedTier: "deep", dispatchAvailable: false }), { candidates: 10 });
-  check("no dispatch capability: zero sub-agents, whatever the thoroughness", noDispatch.subagents === 0);
-
-  const diffOnly = planDispatch(resolveBudget({ routedTier: "deep", depthCapability: "diff-only" }), { candidates: 0 });
-  check("diff-only at deep: consumer-impact is not dispatched (7 finders)",
-    diffOnly.finders === 7 && !diffOnly.units.phaseD.some((u) => u.finder === "consumer-impact"));
-
-  const skipped = planDispatch(resolveBudget({ routedTier: "deep" }), { skip: ["holistic", "optimality", "measurability"] });
+  // ---- planDispatch: --fanout ----
+  const fanDeep = planDispatch(resolveBudget({ routedTier: "deep", fanout: true }), { candidates: 10 });
+  const fanBundle = fanDeep.units.phaseD.find((u) => u.kind === "lens-bundle");
+  check("--fanout deep: 6 finders (votes retired), one lens bundle, standards-conformance alone",
+    fanDeep.finders === 6 && JSON.stringify(fanBundle?.lenses) === JSON.stringify(["holistic", "optimality", "measurability"])
+      && fanDeep.units.phaseD.some((u) => u.id === "standards-conformance" && u.kind === "lens")
+      && fanDeep.units.phaseD.filter((u) => u.finder === "correctness").length === 1);
+  const fanSharded = planDispatch(resolveBudget({ routedTier: "deep", fanout: true }), { candidates: 10, packetLines: 6612 });
+  check("--fanout on a 6,612-line packet: correctness, consumer-impact and quality split into 3 shards each",
+    fanSharded.shards === 3 && fanSharded.finders === 12
+      && ["correctness", "consumer-impact", "quality"].every((f) => fanSharded.units.phaseD.filter((u) => u.finder === f).length === 3)
+      && fanSharded.units.phaseD.filter((u) => u.finder === "intent").length === 1);
+  const fanNoDispatch = planDispatch(resolveBudget({ routedTier: "deep", fanout: true, dispatchAvailable: false }), { candidates: 10 });
+  check("no dispatch capability: zero sub-agents, whatever the topology asked for", fanNoDispatch.subagents === 0);
+  const diffOnly = planDispatch(resolveBudget({ routedTier: "deep", depthCapability: "diff-only", fanout: true }), { candidates: 0 });
+  check("--fanout diff-only: consumer-impact is not dispatched (5 finders)",
+    diffOnly.finders === 5 && !diffOnly.units.phaseD.some((u) => u.finder === "consumer-impact"));
+  const skipped = planDispatch(resolveBudget({ routedTier: "deep", fanout: true }), { skip: ["holistic", "optimality", "measurability"] });
   check("a lens skipped by its own gate leaves the bundle; an empty bundle is not dispatched",
     !skipped.units.phaseD.some((u) => u.kind === "lens-bundle") && skipped.lenses === 1);
 
   // ---- packing never costs a dispatch ----
   let regressed = "";
   for (const t of [0, 0.2, 0.4, 0.45, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 0.95, 1]) {
-    for (const n of [0, 1, 5, 8, 9, 20, 40]) {
-      const b = resolveBudget({ thoroughness: t });
-      const p = planDispatch(b, { candidates: n });
-      const u = planDispatch(b, { candidates: n, packing: false });
-      if (p.subagents > u.subagents || p.finders !== u.finders) regressed ||= `t=${t} n=${n}: packed ${p.subagents} vs unpacked ${u.subagents}`;
+    for (const fanout of [false, true]) {
+      for (const n of [0, 1, 5, 8, 9, 20, 40]) {
+        const b = resolveBudget({ thoroughness: t, fanout });
+        const pk = planDispatch(b, { candidates: n });
+        const up = planDispatch(b, { candidates: n, packing: false });
+        if (pk.subagents > up.subagents || pk.finders !== up.finders) regressed ||= `t=${t} fanout=${fanout} n=${n}: packed ${pk.subagents} vs unpacked ${up.subagents}`;
+      }
     }
   }
   check("packing never dispatches more sub-agents than unpacked, and never merges a finder", regressed === "", regressed);
@@ -377,7 +471,10 @@ function selfTest() {
   // ---- the doc table ----
   const rows = tableRows();
   check("the table has a header, a separator, and one row per band", rows.length === 2 + TABLE_BANDS.length);
-  check("the t < 0.4 row is zero sub-agents", /^\| `t < 0\.4` \| 0 \| 0 \| 0 \(in-context\) \| 0 \| 0 \|$/.test(rows[2]), rows[2]);
+  check("the t < 0.4 row is zero sub-agents on both paths",
+    /^\| `t < 0\.4` \| 0 \(in-context\) \| 0 \| 0 \| 0 \(in-context\) \| 0 \|$/.test(rows[2]), rows[2]);
+  check("every band from 0.4 up is one default sub-agent (intent)",
+    rows.slice(3).every((r) => r.includes("| 1 (intent) |")), rows.slice(3).join(" / "));
 
   console.log(`plan-dispatch self-test: ${passed}/${passed + fails.length}`);
   if (fails.length) {
@@ -401,17 +498,26 @@ function main() {
   if (args.includes("--table")) { console.log(tableRows().join("\n")); return; }
   if (args.includes("--verifier-batches")) {
     const file = argValue(args, "--verifier-batches");
-    if (!file) { console.error("usage: plan-dispatch.mjs --verifier-batches <candidates.json> [--batch-max <n>]"); process.exit(2); }
+    if (!file) { console.error("usage: plan-dispatch.mjs --verifier-batches <candidates.json> [--batch-max <n>] [--cap <n>]"); process.exit(2); }
     const data = JSON.parse(readFileSync(file, "utf8"));
     const list = Array.isArray(data) ? data : Array.isArray(data?.candidates) ? data.candidates
       : Array.isArray(data?.kept) ? data.kept : null;
     if (list === null) { console.error("candidates file must be an array, or carry a `candidates` or `kept` array"); process.exit(2); }
     const bm = argValue(args, "--batch-max");
-    const plan = planVerifierBatches(list, bm === undefined ? {} : { batchMax: Number(bm) });
+    const cp = argValue(args, "--cap");
+    const plan = planVerifierBatches(list, {
+      ...(bm === undefined ? {} : { batchMax: Number(bm) }),
+      ...(cp === undefined ? {} : { cap: Number(cp) }),
+    });
     console.log(JSON.stringify({
       batchMax: plan.batchMax,
+      cap: plan.cap,
+      regionLines: plan.regionLines,
       maxParallel: PR_REVIEW_MAX_PARALLEL,
+      verified: plan.verified,
       batches: plan.batches,
+      overflow: plan.overflow,
+      anomaly: plan.anomaly,
       messages: planMessages(plan.batches.map((b) => b.id)),
     }, null, 2));
     return;
@@ -423,13 +529,18 @@ function main() {
       routedTier: /** @type {any} */ (argValue(args, "--routed-tier")),
       depthCapability: argValue(args, "--depth-capability"),
       dispatchAvailable: !args.includes("--dispatch-unavailable"),
+      fanout: args.includes("--fanout"),
     });
     const n = Number(argValue(args, "--candidates") ?? 0);
-    const packed = planDispatch(budget, { candidates: n });
-    const unpacked = planDispatch(budget, { candidates: n, packing: false });
+    const pl = argValue(args, "--packet-lines");
+    const packetLines = pl === undefined ? 0 : Number(pl);
+    const packed = planDispatch(budget, { candidates: n, packetLines });
+    const unpacked = planDispatch(budget, { candidates: n, packing: false, packetLines });
     console.log(JSON.stringify({
       effectiveThoroughness: budget.effectiveThoroughness,
       topology: packed.topology,
+      shards: packed.shards,
+      unverified: packed.unverified,
       packed: { finders: packed.finders, lenses: packed.lenses, verifiers: packed.verifiers,
         subagents: packed.subagents, messages: packed.messages },
       unpacked: { finders: unpacked.finders, lenses: unpacked.lenses, verifiers: unpacked.verifiers,

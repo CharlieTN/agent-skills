@@ -238,8 +238,8 @@ behaviour, on every lever but two (noted below):
 | Lever | `t < 0.4` | `0.4 ≤ t < 0.5` | `0.5 ≤ t < 0.7` | `0.7 ≤ t < 0.8` | `0.8 ≤ t < 0.95` | `t ≥ 0.95` |
 | --- | --- | --- | --- | --- | --- | --- |
 | Active finders | correctness, intent, quality | *(same)* | + consumer-impact (delta), dependency, standards (delta) | *(same)* | consumer-impact/standards widen to **all** files | *(same)* |
-| Topology | in-context | **parallel**, one sub-agent per finder | *(same)* | *(same)* | *(same)* | *(same)* |
-| `correctness` votes | 1 | *(same)* | *(same)* | *(same)* | **3** | **5** |
+| Topology | in-context | **hybrid**: one context, plus the intent finder as its own sub-agent (`--fanout`: **parallel**) | *(same)* | *(same)* | *(same)* | *(same)* |
+| `correctness` votes | 1 | *(same)* | *(same)* | *(same)* | *(same — votes retired)* | *(same — votes retired)* |
 | Max verifier evidence tier | 1 | *(same)* | **2** | *(same)* | *(same)* | **3** |
 | Optimality lens | off | *(same)* | *(same)* | **on** | *(same)* | *(same)* |
 | Measurability lens | off | **on** | *(same)* | *(same)* | *(same)* | *(same)* |
@@ -296,26 +296,32 @@ the dispatch count is the number to watch, not the prompt size.
 `node agents/pr-reviewer/scripts/plan-dispatch.mjs --table` prints the table below.
 L1 `G84g` fails when the two differ, so regenerate the table rather than editing a cell.
 
-| Band | Finder dispatches | Lens dispatches | Verifier dispatches | Total at 10 candidates | Before packing |
+| Band | Default (hybrid) sub-agents | `--fanout` finder dispatches | `--fanout` lens dispatches | `--fanout` verifier dispatches | `--fanout` total at 10 candidates |
 | --- | --- | --- | --- | --- | --- |
-| `t < 0.4` | 0 | 0 | 0 (in-context) | 0 | 0 |
-| `0.4 ≤ t < 0.5` | 3 | 1 (holistic + measurability) | ⌈V / 8⌉ | 6 | 15 |
-| `0.5 ≤ t < 0.7` | 6 | 2 (holistic + measurability; standards-conformance) | ⌈V / 8⌉ | 10 | 19 |
-| `0.7 ≤ t < 0.8` | 6 | 2 (holistic + optimality + measurability; standards-conformance) | ⌈V / 8⌉ | 10 | 20 |
-| `0.8 ≤ t < 0.95` | 8 | 2 (holistic + optimality + measurability; standards-conformance) | ⌈V / 8⌉ | 12 | 22 |
-| `t ≥ 0.95` | 10 | 2 (holistic + optimality + measurability; standards-conformance) | ⌈V / 8⌉ | 14 | 24 |
+| `t < 0.4` | 0 (in-context) | 0 | 0 | 0 (in-context) | 0 |
+| `0.4 ≤ t < 0.5` | 1 (intent) | 3 | 1 (holistic + measurability) | ⌈min(V, 40) / 8⌉ | 6 |
+| `0.5 ≤ t < 0.7` | 1 (intent) | 6 | 2 (holistic + measurability; standards-conformance) | ⌈min(V, 40) / 8⌉ | 10 |
+| `0.7 ≤ t < 0.8` | 1 (intent) | 6 | 2 (holistic + optimality + measurability; standards-conformance) | ⌈min(V, 40) / 8⌉ | 10 |
+| `0.8 ≤ t < 0.95` | 1 (intent) | 6 | 2 (holistic + optimality + measurability; standards-conformance) | ⌈min(V, 40) / 8⌉ | 10 |
+| `t ≥ 0.95` | 1 (intent) | 6 | 2 (holistic + optimality + measurability; standards-conformance) | ⌈min(V, 40) / 8⌉ | 10 |
 
 How to read it:
 
-- `V` is the number of candidates that survive dedupe.
-  `⌈V / 8⌉` holds when every candidate sits on its own path.
-  When several share a path, the count is the larger of that and the biggest same-path group,
-  because two candidates on one path never share a verifier dispatch.
-- The two total columns assume 10 candidates on distinct paths.
-- *Before packing* is the same budget with one dispatch per lens and one per candidate — the shape
-  this pipeline dispatched before [`dispatch-topology.md § Packing`](./dispatch-topology.md#packing--how-units-become-dispatches).
-- The finder column never shrinks under packing: finders and `correctness` votes each keep their own
-  context.
+- The default review is `hybrid` from `t ≥ 0.4`: one sub-agent, the intent finder, at every band.
+  Everything else — the other finders, the lenses, verification — runs in the orchestrator's own
+  context, so there are no lens or verifier dispatches to count.
+- The `--fanout` columns are the opt-in parallel path.
+  `V` is the number of candidates that survive dedupe; at most `VERIFY_CAP` (40) of them are
+  verified, and the rest are reported as a `RUN_ANOMALY`.
+  `⌈min(V, 40) / 8⌉` holds when no two verified candidates share a code region (same path, within
+  40 lines or the same symbol); a region holding more candidates than that raises the count to the
+  region's size, because two candidates from one region never share a verifier dispatch.
+- The `--fanout` total assumes 10 candidates in distinct regions and a review packet under 2,500
+  lines.
+  A larger packet splits into up to 3 parts, and `correctness`, `consumer-impact`, and `quality`
+  each dispatch one worker per part — up to 6 more finder dispatches.
+- The finder column never packs two finders into one context; `correctness` runs one pass (votes
+  retired).
 - A lens turned off by its own gate (`--no-holistic`, the incremental-mode 2.4 skip, `TRIVIAL_SKIP`)
   leaves the bundle, and an empty bundle is not dispatched.
 - Holistic escalation (Step 2.4b) is not in the table: its traces are `Skill()` calls in the
@@ -323,7 +329,7 @@ How to read it:
 - Under `DEPTH_CAPABILITY = diff-only`, `consumer-impact` is not dispatched, so the finder column is
   one lower from `t ≥ 0.5` up.
 
-**Topology and dispatch mechanics** — what "parallel, one sub-agent per finder" and "verification in
+**Topology and dispatch mechanics** — what "hybrid", "parallel, one sub-agent per finder", and "verification in
 `PR_REVIEW_MAX_PARALLEL`-capped batches" mean operationally, and the `RUN_ANOMALY` line for a run
 that requested parallel but held no `Task` — are
 [`dispatch-topology.md`](./dispatch-topology.md#reading-a-budget-into-dispatch)'s job, not this

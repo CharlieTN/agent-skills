@@ -142,16 +142,21 @@ export function hydrateFilePatches(context) {
  * this run actually reviewed". Pure (D18): the caller resolves `capApplied`/`depthCapability`/
  * `contextAnomalies` from the context; this only formats them, and never begins with a glyph
  * (the renderer prepends its own ⚠️ — a value that did would double it).
- * @param {{ capApplied: boolean, depthCapability?: string, contextAnomalies?: any[], noDispatchAt?: number }} args
+ * @param {{ capApplied: boolean, depthCapability?: string, contextAnomalies?: any[], noDispatchAt?: number, noDispatchTopology?: string }} args
  * @returns {string|undefined}
  */
-export function buildAutoRunAnomaly({ capApplied, depthCapability, contextAnomalies, noDispatchAt }) {
+export function buildAutoRunAnomaly({ capApplied, depthCapability, contextAnomalies, noDispatchAt, noDispatchTopology }) {
   const parts = [];
   // A/B iteration 2: every in-context arm hand-wrote dispatch-topology.md's no-dispatch line into
   // context.render.RUN_ANOMALY, which REPLACED this function's output and dropped prepare-review's
   // own anomalies (two arms re-merged them by hand, one re-ran finalize three times). `--no-dispatch`
   // makes the line computed, with the budget's own effective thoroughness.
-  if (typeof noDispatchAt === "number") {
+  // A/B round 8: the default topology at t >= 0.4 is `hybrid` (only the intent finder is its own
+  // sub-agent), so the no-dispatch degrade names what it actually lost on that path.
+  if (typeof noDispatchAt === "number" && noDispatchTopology === "hybrid") {
+    parts.push("no sub-agent dispatch available — the intent finder ran in-context with the other finders"
+      + ` at effective thoroughness ${noDispatchAt}, instead of as its own sub-agent`);
+  } else if (typeof noDispatchAt === "number") {
     parts.push("no sub-agent dispatch available — finders and verification ran in-context, serially,"
       + ` at effective thoroughness ${noDispatchAt}, instead of the parallel topology that value would otherwise dispatch`);
   }
@@ -540,7 +545,9 @@ export function finalizeReview({ context, judgments, profile = "balanced", flatO
   // duplicating the renderer's own prefix). Computed here, a live run never hand-authors this
   // and can never reintroduce the glyph.
   const capApplied = context?.routing?.capApplied === true;
-  const noDispatchAt = context?.dispatchUnavailable === true && context?.budget?.topology === "parallel"
+  const noDispatchTopology = context?.budget?.topology;
+  const noDispatchAt = context?.dispatchUnavailable === true
+    && (noDispatchTopology === "parallel" || noDispatchTopology === "hybrid")
     && typeof context?.budget?.effectiveThoroughness === "number"
     ? context.budget.effectiveThoroughness : undefined;
   const autoRunAnomaly = buildAutoRunAnomaly({
@@ -548,6 +555,7 @@ export function finalizeReview({ context, judgments, profile = "balanced", flatO
     depthCapability: context?.workspace?.depthCapability || context?.depthCapability,
     contextAnomalies: context?.anomalies,
     noDispatchAt,
+    noDispatchTopology,
   });
 
   // MEMORIES_USED / MEMORIES_SUMMARY — computed from judgments.memory's two arrays (D4:
@@ -1071,6 +1079,10 @@ async function selfTest() {
     check("buildAutoRunAnomaly renders the no-dispatch line with the effective thoroughness",
       typeof noDispatch === "string" && noDispatch.startsWith("no sub-agent dispatch available")
         && noDispatch.includes("at effective thoroughness 0.8"));
+    const noDispatchHybrid = buildAutoRunAnomaly({ capApplied: false, contextAnomalies: [], noDispatchAt: 0.8, noDispatchTopology: "hybrid" });
+    check("on the default hybrid topology the no-dispatch line names the intent finder it could not isolate",
+      typeof noDispatchHybrid === "string" && noDispatchHybrid.includes("the intent finder ran in-context")
+        && noDispatchHybrid.includes("at effective thoroughness 0.8") && !noDispatchHybrid.includes("parallel topology"));
     // A/B iteration 2: a supplied RUN_ANOMALY used to REPLACE the computed one.
     const merged = mergeRunAnomaly("reviewer identity unknown", "1 prepare-time anomaly (x)");
     check("mergeRunAnomaly keeps a supplied anomaly AND the computed one",

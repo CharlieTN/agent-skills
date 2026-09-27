@@ -50,7 +50,7 @@ import { fileURLToPath } from "node:url";
 import { Timing } from "./review-telemetry.mjs";
 import { classifyDivergence, blobDelta, deltaCounts, churnState, FULL_REFRESH_DELTA } from "./delta-triage.mjs";
 import { routeDepth, resolveBudget } from "./route-depth.mjs";
-import { buildReviewPacket, consumersByFile } from "./review-packet.mjs";
+import { buildReviewPacket, buildPacketParts, consumersByFile } from "./review-packet.mjs";
 import { discoverStandards, trivialSkip } from "./discover-standards.mjs";
 import { scanGate4 } from "./gate4-scan.mjs";
 
@@ -1219,12 +1219,20 @@ async function prepare(opts) {
   const packetPath = join(sidecarDir, "review-packet.md");
   let packet = null;
   try {
-    const built = buildReviewPacket({
+    const packetInput = {
       title: meta.title, body: meta.body, repo, number, headSha: checkoutSha, files,
       consumers: consumersByFile(impact), workspaceDir: workspace.dir || null,
-    });
+    };
+    const built = buildReviewPacket(packetInput);
     writeFileSync(packetPath, built.text, "utf8");
-    packet = { path: packetPath, lines: built.lines, files: built.files, maxLines: built.maxLines, contextLines: built.contextLines };
+    // A/B round 8: the parts sharded `--fanout` workers read. Written whenever the packet is over
+    // SHARD_LINES — a few files on disk, read only by a `--fanout` run (review-packet.mjs).
+    const parts = buildPacketParts(packetInput, built).map((part) => {
+      const partPath = join(sidecarDir, `review-packet.part-${part.index}.md`);
+      writeFileSync(partPath, part.text, "utf8");
+      return { index: part.index, path: partPath, lines: part.lines, files: part.files };
+    });
+    packet = { path: packetPath, lines: built.lines, files: built.files, maxLines: built.maxLines, contextLines: built.contextLines, parts };
   } catch (e) {
     anomalies.push(`review packet not built: ${String(e && e.message || e).slice(0, 200)} — read the diff sidecar instead`);
   }

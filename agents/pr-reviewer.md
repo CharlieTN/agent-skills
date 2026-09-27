@@ -272,7 +272,7 @@ file because each is long, and a phase the body only summarises is a phase that 
 - `agents/pr-reviewer/rules/report-rendering.md` + `agents/pr-reviewer/rules/terminal-report.md` — the shapes Steps 3–4 post: the Step 3 terminal template (gate table, numbered finding cards, three verdict presentations, diagnostics log) and the Step 4 `REPORT_BODY` payload (keys incl. `RUN.tier` / `RUN.depth`, `IMPACT`, `WITHHELD`, headline forms, `<details>` sections, Gate 3 slot pair, gate-table cell rules, `INLINE_COMMENTS_JSON`). Reference, not procedure — read each at its own step.
 - [`agents/pr-reviewer/rules/agent0-runtime.md`](./pr-reviewer/rules/agent0-runtime.md) — **host rule, read only inside a Dash0 Agent0 Automation.** Changes no phase, finding, gate or verdict — it owns *delivery* into that sandbox (scoped install path, fixed skill enum, one-level delegation, repo-scoped GitHub credential), the `sandbox.setupScript` contract, the `prepare-review.mjs` entry point, and why the dispatch prompt stays short. Inert on any other harness — do not read it.
 
-**Research basis**: [`agents/pr-reviewer/references/detection-research.md`](./pr-reviewer/references/detection-research.md) — what each borrowed principle came from (finder/verifier separation, aggressive finders, diversify-then-vote, effort tiers, incremental-by-default, candidate → promote → auto-disable), what this design deliberately rejected, and why no published precision figure is a target here. Reference only — a run never needs to read it.
+**Research basis**: [`agents/pr-reviewer/references/detection-research.md`](./pr-reviewer/references/detection-research.md) — what each borrowed principle came from, what this design deliberately rejected, and why no published precision figure is a target here. Reference only — a run never needs to read it.
 
 ---
 
@@ -295,10 +295,11 @@ Examine the **raw arguments** verbatim. Do not paraphrase.
 | `--measurable-strict` | Force the measurability lens to strict for this run. Strict is already the default, so this re-asserts the bar (`missing` on a new failure mode is an `issue:`, `unlinked` is a `suggestion:`) only when the repo set `measurable: advisory`. Also settable as `measurable: strict` in the review config |
 | `--measurable-advisory` | Opt the measurability lens down to advisory for this run, so no measurability finding reaches `FAIL_REASONS` (`missing` → `suggestion:`, `unlinked` → aggregated `nitpick:`). Also settable as `measurable: advisory` in the review config |
 | `--skip-gates` | Skip Gates 1–5, run inline review (Gate 6) only |
+| `--intent-from <path>` | `/pr-review` runs the intent finder as its own sub-agent: skip it here; merge the candidates in `<path>` before Step 2.5 ([`dispatch-topology.md`](./pr-reviewer/rules/dispatch-topology.md#the-three-topologies)) |
 | `--with a,b,c` | Up to 3 additional review lenses |
 | `--no-fix-links` | Suppress the "Fix with Agent0" buttons for this run. They render by default everywhere (`agents/shared/rules/agent0-fix-links.md`); this is the per-run opt-out and beats every other signal. |
 | `--fix-links` | Force the buttons on for this run, overriding an `agent0_fix_links: false` in the review config. Rarely needed — they are already on by default. |
-| `--effort high` | Force `DEPTH_TIER = deep`, enable Tier-2/3 receipts where the toolchain allows, and widen diversify-then-vote to N=5 ([`depth-routing.md`](./pr-reviewer/rules/depth-routing.md#--effort)). Also settable as `effort: high` in the review config. `--full` is the narrower alias — it forces `deep` and nothing else |
+| `--effort high` | Force `DEPTH_TIER = deep`, enable Tier-2/3 receipts where the toolchain allows ([`depth-routing.md`](./pr-reviewer/rules/depth-routing.md#--effort)). Also settable as `effort: high` in the review config. `--full` is the narrower alias — it forces `deep` and nothing else |
 | `--thoroughness <0..1>` | Continuous dispatch/scope override; `--effort high` = `1`. Also `thoroughness: <n>` in config — [depth-routing.md § Thoroughness budget](./pr-reviewer/rules/depth-routing.md#thoroughness-budget) |
 | `--dry-run` | Run the full pipeline through the rendered artifacts, then **stop**: zero GitHub writes (no sticky, no review, no thread resolve/reply) and zero LoreKit writes (no state record, no knowledge/hotspot writes). `REPORT_BODY`, the inline comment bodies, and the pointer body are written to scratch (`$(scratchRoot())/<run-id>/` — see [`rules/pipeline.md`](./pr-reviewer/rules/pipeline.md#--dry-run)) instead of posted. The **one** stated exception to Step 4c's "unconditional" state write |
 | `--isolated` | Comparable repeat run for the A/B harness and the shadow run (pr-reviewer deterministic pipeline, D13): skip the Step 0.7 LoreKit state-record read entirely (first-run semantics on every invocation — `PRIOR_RUN=none` unconditionally), force `RUN_MODE=full` (the D1/D6 first-run trigger), and require `--pin-head <sha>`. See [`rules/pipeline.md`](./pr-reviewer/rules/pipeline.md#--isolated) |
@@ -1450,8 +1451,7 @@ Three properties this must keep, because getting any wrong silently disables the
 
 Two caps apply **after** the table, in order: (1) `DEPTH_CAPABILITY == "diff-only"` caps
 `DEPTH_TIER` at `standard` — a `deep` review needs a workspace it does not have, announce the cap
-when it fires; (2) `--effort high` raises `DEPTH_TIER` to `deep` and widens diversify-then-vote to
-N=5 ([`finders.md`](./pr-reviewer/rules/finders.md)), subject to cap 1.
+when it fires; (2) `--effort high` raises `DEPTH_TIER` to `deep` and sets thoroughness 1 ([`depth-routing.md`](./pr-reviewer/rules/depth-routing.md#--effort)), subject to cap 1.
 
 Announce: `Depth tier: <DEPTH_TIER> — <the matching rule>; inputs: blast_radius=<BLAST_RADIUS>,
 semver_delta=<max of IMPACT_DEPS[].semver_delta or "none">, high_stakes=<count>,
@@ -2045,10 +2045,9 @@ of `verification-receipt.md` (a semantic no-execution check — `tsc`, `go vet`,
 only Tier 1 grep. On these shapes a "plausible" claim is not enough to block a PR, and an executed
 receipt is what turns a checklist hit into a defensible `(blocking)` finding.
 
-Run the verifier in an isolated sub-agent when `Task` is available, one dispatch per candidate,
-parallel where the runtime allows. In-agent it runs serially in this turn; the isolation is about
-not carrying the finders' framing into the adjudication, and reading the rule in the same context
-that produced the candidate is the weaker but acceptable form.
+Where the verifier runs follows `budget.topology` ([`dispatch-topology.md`](./pr-reviewer/rules/dispatch-topology.md)):
+this turn under `in-context` and `hybrid`, batched sub-agents under `--fanout`'s `parallel`. In this
+turn, reading the rule in the context that produced the candidate is the weaker but acceptable form.
 
 ### 2.7 Score the confirmed findings
 

@@ -9061,9 +9061,14 @@ const isPollBlock = (block) =>
       "skills/quality/review-loop", "skills/delivery/create-pr",
       "skills/quality/polish", "skills/quality/review-changes",
     ];
-    const r = spawnSync("git", ["diff", "--quiet", "origin/main", "--", ...AC18_PATHS], { cwd: REPO_ROOT, encoding: "utf8" });
-    s.check("G66j AC-18's caller skills (review-loop/create-pr/polish/review-changes) are byte-unchanged vs. origin/main",
-      r.status === 0, r.status === null ? "git not found" : `git diff exit ${r.status}`);
+    // Compared against the MERGE-BASE, not origin/main's tip: the property is "this branch did not
+    // edit these skills", and main moving on (#212 edited review-loop on 2026-09-26) is not this
+    // branch's edit. G82 keys its base the same way for the same reason.
+    const mb = spawnSync("git", ["merge-base", "HEAD", "origin/main"], { cwd: REPO_ROOT, encoding: "utf8" });
+    const base = mb.status === 0 ? (mb.stdout || "").trim() : "origin/main";
+    const r = spawnSync("git", ["diff", "--quiet", base, "HEAD", "--", ...AC18_PATHS], { cwd: REPO_ROOT, encoding: "utf8" });
+    s.check("G66j AC-18's caller skills (review-loop/create-pr/polish/review-changes) are byte-unchanged vs. the merge-base with origin/main",
+      r.status === 0, r.status === null ? "git not found" : `git diff ${base.slice(0, 7)} HEAD exit ${r.status}`);
   }
 
   // The offline proof of the --fanout glue chain (D17): a raw finder-candidate fixture through
@@ -9163,8 +9168,10 @@ const isPollBlock = (block) =>
 
     // Arm C's two named deviations, reversed in the text: verification batched by path, and the
     // standards lens folded into the standards finder.
-    s.check("G81 path-batched verification is named and forbidden as an arm-C deviation",
-      /arm-c/i.test(fanoutSection) && /never batch candidates that share a path/i.test(fanoutSection));
+    // A/B round 8 re-keyed the rule from path to CODE REGION (same path within REGION_LINES, or the
+    // same symbol): a path-only key made one 33-candidate file force 33 verifier batches.
+    s.check("G81 region-batched verification is named and forbidden as an arm-C deviation",
+      /arm-c/i.test(fanoutSection) && /never batch two candidates from one code region/i.test(fanoutSection));
     s.check("G81 the standards lens and standards finder are stated as two separate dispatches",
       /standards-conformance.*standards.*(two separate dispatches|never one folded into)/is.test(fanoutSection)
       || /two separate dispatches/i.test(fanoutSection));
@@ -9548,8 +9555,8 @@ const isPollBlock = (block) =>
     s.check("G84g dispatch-topology.md bundles holistic/optimality/measurability and keeps standards-conformance out",
       /\| holistic broad pass, optimality, measurability \| \*\*one lens-bundle dispatch\*\*/.test(dtTxt)
         && /\| standards-conformance lens \| one, never in the bundle \|/.test(dtTxt));
-    s.check("G84g dispatch-topology.md keeps finders and correctness votes at one dispatch each",
-      /\| each active finder \| one each \|/.test(dtTxt) && /\| each `correctness` vote \| one each \|/.test(dtTxt));
+    s.check("G84g dispatch-topology.md keeps each finder at one dispatch and states correctness votes are retired",
+      /\| each active finder \| one each \|/.test(dtTxt) && /\| `correctness` votes \| \*\*retired — one pass\*\* \|/.test(dtTxt));
     s.check("G84g dispatch-topology.md states the queue rules: one message per cap, each unit once, one retry at most",
       /Send the next message only after every dispatch in the current one has returned/.test(dtTxt)
         && /Dispatch each unit exactly once/.test(dtTxt) && /never retried a third time/.test(dtTxt));
@@ -9800,7 +9807,7 @@ const isPollBlock = (block) =>
   }
   const prep = readFileSync(join(SCRIPTS, "prepare-review.mjs"), "utf8");
   s.check("G84m prepare-review.mjs builds the packet and runs Step 1.7b's functions into the context",
-    /import \{ buildReviewPacket, consumersByFile \} from "\.\/review-packet\.mjs"/.test(prep)
+    /import \{ buildReviewPacket, (buildPacketParts, )?consumersByFile \} from "\.\/review-packet\.mjs"/.test(prep)
       && /import \{ discoverStandards, trivialSkip \} from "\.\/discover-standards\.mjs"/.test(prep)
       && /\n    packet,\n    trivialSkip: trivial,\n    standards,/.test(prep));
   const body = readFileSync(join(REPO_ROOT, "agents/pr-reviewer.md"), "utf8");
@@ -9823,6 +9830,76 @@ const isPollBlock = (block) =>
   s.check("G84m the verifier self-check names the severity crosswalk as its one exception",
     /One named exception: "blocking": true requires severity high or critical/.test(selfCheck)
       && /Never change verdict, severity, blocking/.test(selfCheck));
+}
+
+// ── G84n (A/B round 8 → iteration 5): the default is hybrid, the fan-out is sharded and capped ──
+// Round 8's first real `--fanout` run found every known defect on sync-tray#72 but projected to
+// ~57 minutes: every worker read the whole packet (8–14 min each), two correctness votes added 49
+// candidates, and a path-only batching key made one 33-candidate file force 33 verifier batches.
+// Rounds 7–8 also showed the isolated intent finder catching the top defect 3 of 3 times. This
+// guards the five changes that follow from those numbers, each against the code, not the prose alone.
+{
+  const RD = join(REPO_ROOT, "agents/pr-reviewer/scripts/route-depth.mjs");
+  const PD = join(REPO_ROOT, "agents/pr-reviewer/scripts/plan-dispatch.mjs");
+  const RP = join(REPO_ROOT, "agents/pr-reviewer/scripts/review-packet.mjs");
+  const PR = join(REPO_ROOT, "agents/pr-reviewer/scripts/prepare-review.mjs");
+  const DT = join(REPO_ROOT, "agents/pr-reviewer/rules/dispatch-topology.md");
+  const SK = join(REPO_ROOT, "skills/quality/pr-review/SKILL.md");
+  const BODY = join(REPO_ROOT, "agents/pr-reviewer.md");
+  const rd = readFileSync(RD, "utf8"), pd = readFileSync(PD, "utf8"), rp = readFileSync(RP, "utf8");
+  const pr = readFileSync(PR, "utf8"), dt = readFileSync(DT, "utf8"), sk = readFileSync(SK, "utf8");
+  const body = readFileSync(BODY, "utf8");
+  const probe = (/** @type {string} */ code) => spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", cwd: REPO_ROOT });
+
+  // (1) hybrid is the default at t >= 0.4; parallel only through `fanout`.
+  const topo = probe(`import { resolveBudget } from "./agents/pr-reviewer/scripts/route-depth.mjs";
+    const b = (i) => { const r = resolveBudget(i); return [r.topology, r.isolatedFinders.length, r.correctnessVotes]; };
+    console.log(JSON.stringify([b({ thoroughness: 0.3 }), b({ thoroughness: 0.8 }), b({ thoroughness: 1 }), b({ thoroughness: 0.8, fanout: true })]));`);
+  s.check("G84n resolveBudget: in-context below 0.4, hybrid (intent isolated) above it, parallel only with fanout, one correctness pass everywhere",
+    topo.status === 0 && (topo.stdout || "").trim() === JSON.stringify([["in-context", 0, 1], ["hybrid", 1, 1], ["hybrid", 1, 1], ["parallel", 6, 1]]),
+    (topo.stdout || topo.stderr || "").trim().slice(0, 200));
+  s.check("G84n the hybrid path is wired end to end: the body grammar knows --intent-from, SKILL.md Step 2 sends the intent worker in the same message, dispatch-topology.md says how to wait for it",
+    /\| `--intent-from <path>` \|/.test(body)
+      && /In \*\*one message\*\*, dispatch both/.test(sk) && sk.includes("--intent-from <that path>")
+      && /check every 20 seconds, for at most 10 minutes/.test(dt) && /The review never loses the finder itself/.test(dt));
+
+  // (2) sharded packet parts for the per-file finders.
+  s.check("G84n review-packet.mjs exports the shard contract and prepare-review.mjs writes the parts",
+    /export const SHARD_LINES = \d+;/.test(rp) && /export const SHARD_MAX = \d+;/.test(rp)
+      && /export function buildPacketParts\(/.test(rp) && /buildPacketParts\(packetInput, built\)/.test(pr)
+      && /review-packet\.part-\$\{part\.index\}\.md/.test(pr));
+  const rpt = spawnSync(process.execPath, [RP, "--self-test"], { encoding: "utf8" });
+  s.check("G84n review-packet.mjs --self-test proves every inlined file lands in exactly one part, byte-identical",
+    rpt.status === 0 && /every inlined file is inlined in exactly one part, byte-identical to the full packet/.test(rpt.stdout || ""),
+    (rpt.stdout || rpt.stderr || "").split("\n").filter((l) => l.includes("✗")).join(" | "));
+  const shard = spawnSync(process.execPath, [PD, "--count", "--fanout", "--thoroughness", "0.8", "--packet-lines", "6612", "--candidates", "10"], { encoding: "utf8" });
+  let shardPlan = null; try { shardPlan = JSON.parse(shard.stdout || "null"); } catch { /* reported below */ }
+  s.check("G84n --fanout on a 6,612-line packet shards correctness/consumer-impact/quality into 3 workers each",
+    shardPlan !== null && shardPlan.shards === 3
+      && ["correctness@1", "correctness@3", "consumer-impact@2", "quality@3"].every((id) => shardPlan.phaseD.includes(id))
+      && shardPlan.phaseD.includes("intent") && !shardPlan.phaseD.includes("intent@1"),
+    (shard.stdout || shard.stderr || "").slice(0, 200));
+
+  // (3) region-keyed verifier batches + (4) the verification cap, one number in three files.
+  const pdt = spawnSync(process.execPath, [PD, "--self-test"], { encoding: "utf8" });
+  s.check("G84n plan-dispatch.mjs --self-test proves region batching and the cap",
+    pdt.status === 0 && /10 candidates on ONE path but in 10 distinct regions → 2 batches/.test(pdt.stdout || "")
+      && /the cap keeps the highest severity, then the most corroborated/.test(pdt.stdout || "")
+      && /an over-cap run names the overflow as an anomaly, never silently/.test(pdt.stdout || ""),
+    (pdt.stdout || pdt.stderr || "").split("\n").filter((l) => l.includes("✗")).join(" | "));
+  const cap = Number(/export const VERIFY_CAP = (\d+);/.exec(pd)?.[1]);
+  const region = Number(/export const REGION_LINES = (\d+);/.exec(pd)?.[1]);
+  s.check(`G84n VERIFY_CAP (${cap}) is one number in plan-dispatch.mjs, dispatch-topology.md, and SKILL.md`,
+    Number.isInteger(cap) && dt.includes(`\`VERIFY_CAP\` (${cap})`) && sk.includes(`\`VERIFY_CAP\` (${cap})`));
+  s.check(`G84n REGION_LINES (${region}) is one number in plan-dispatch.mjs, dispatch-topology.md, and SKILL.md`,
+    Number.isInteger(region) && dt.includes(`\`REGION_LINES\` (${region})`) && sk.includes(`\`REGION_LINES\` (${region})`));
+  s.check("G84n both documents route the overflow's anomaly through context.render.RUN_ANOMALY, never a silent drop",
+    /pass its `anomaly` string through `context\.render\.RUN_ANOMALY`/.test(dt) && /never drop it silently/.test(sk));
+
+  // (5) votes retired, stated where the old ladder lived.
+  s.check("G84n votes are retired in route-depth.mjs, dispatch-topology.md, and SKILL.md Step c",
+    /const CORRECTNESS_VOTES = 1;/.test(rd) && /## Diversify then vote \(moved here from the agent body\) — retired/.test(dt)
+      && /never as diversify-then-vote/.test(sk) && !/N = 5 sub-agents/.test(sk));
 }
 
 // ── G82: pr-reviewer.md size ratchet + the L2-read sections stay byte-identical to base (D15,

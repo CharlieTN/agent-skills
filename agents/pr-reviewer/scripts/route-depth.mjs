@@ -196,8 +196,13 @@ export const RISK_FLOOR = 0.5;
 const T_TOPOLOGY = 0.4;
 const T_FINDERS_MID = 0.5; // consumer-impact(delta) + dependency + standards(delta) join
 const T_FINDERS_HIGH = 0.8; // consumer-impact/standards widen delta -> all
-const T_VOTES_3 = 0.8;
-const T_VOTES_5 = 0.95;
+/** A/B round 8 (sync-tray#72, the first real `--fanout` run): two correctness votes raised 24 and 25
+ *  candidates and dedupe merged few of them across the two, so the votes added candidates for the
+ *  verifier instead of corroborating each other — at ~10 minutes of one worker each. Votes are
+ *  retired: every budget runs ONE correctness pass. The field stays in the budget (always 1) so a
+ *  consumer reading it keeps working, and a future run that shows votes adding confirmed recall
+ *  reintroduces the ladder here and in depth-routing.md together. */
+const CORRECTNESS_VOTES = 1;
 const T_VERIFY_TIER_2 = 0.5;
 const T_VERIFY_TIER_3 = 0.95;
 const T_OPTIMALITY = 0.7;
@@ -227,6 +232,14 @@ export const TOOL_CALL_BANDS = Object.freeze([
 const T_TOOLCALLS_1_5 = 0.8;
 const T_TOOLCALLS_2 = 0.95;
 
+/** A/B rounds 7–8: the default review runs in ONE context, plus the intent finder as its own
+ *  sub-agent. Isolated, the intent finder flagged the highest-severity agreed defect on sync-tray#72
+ *  in 3 of 3 runs (5–6 minutes each); run in one context with the other finders, the default
+ *  setting had missed it in 4 of 4 rounds. The full parallel topology (every finder its own
+ *  sub-agent) found every known defect but projected to ~57 minutes, so it is reached only through
+ *  `/pr-review --fanout` (the `fanout` input), never by thoroughness alone. */
+export const HYBRID_ISOLATED_FINDERS = Object.freeze(["intent"]);
+
 /** @param {string[]} shape @param {string} band */
 function highStakesReason(shape, band) {
   const hit = (shape ?? []).find((s) => HIGH_STAKES_SHAPES.has(s));
@@ -239,6 +252,7 @@ function highStakesReason(shape, band) {
  *   thoroughness?: number, routedTier?: "deep"|"standard"|"quick",
  *   shape?: string[], band?: string, depthCapability?: string,
  *   dispatchAvailable?: boolean, effortHigh?: boolean, changedFiles?: number,
+ *   fanout?: boolean,
  * }} ResolveBudgetInput
  * @typedef {{
  *   effectiveThoroughness: number, requestedThoroughness: number,
@@ -246,7 +260,7 @@ function highStakesReason(shape, band) {
  *   finders: {correctness: boolean, intent: boolean, quality: boolean,
  *     "consumer-impact": boolean, dependency: boolean, standards: boolean},
  *   finderScope: {"consumer-impact": "none"|"delta"|"all", standards: "none"|"delta"|"all"},
- *   correctnessVotes: 1|3|5, topology: "in-context"|"parallel",
+ *   correctnessVotes: 1, topology: "in-context"|"hybrid"|"parallel", isolatedFinders: string[],
  *   maxVerificationTier: 1|2|3, holisticEscalationCap: number,
  *   optimalityLens: boolean, measurabilityLens: boolean, holisticBroadPass: boolean,
  *   toolCallMultiplier: 1|1.5|2, toolCalls: number|null,
@@ -315,6 +329,13 @@ export function resolveBudget(i = {}) {
   /** @type {1|1.5|2} */
   const toolCallMultiplier = t >= T_TOOLCALLS_2 ? 2 : t >= T_TOOLCALLS_1_5 ? 1.5 : 1;
 
+  /** @type {"in-context"|"hybrid"|"parallel"} */
+  const topology = !dispatchAvailable || t < T_TOPOLOGY ? "in-context" : i.fanout ? "parallel" : "hybrid";
+  const activeFinders = /** @type {string[]} */ (["correctness", "consumer-impact", "dependency", "intent", "standards", "quality"])
+    .filter((f) => f === "consumer-impact" ? consumerImpactActive : f === "correctness" || f === "intent" || f === "quality" ? true : findersMid);
+  const isolatedFinders = topology === "hybrid" ? [...HYBRID_ISOLATED_FINDERS]
+    : topology === "parallel" ? activeFinders : [];
+
   return {
     effectiveThoroughness: t,
     requestedThoroughness: base,
@@ -333,8 +354,9 @@ export function resolveBudget(i = {}) {
       "consumer-impact": consumerImpactScope,
       standards: findersMid ? (findersHigh ? "all" : "delta") : "none",
     },
-    correctnessVotes: t >= T_VOTES_5 ? 5 : t >= T_VOTES_3 ? 3 : 1,
-    topology: dispatchAvailable && t >= T_TOPOLOGY ? "parallel" : "in-context",
+    correctnessVotes: CORRECTNESS_VOTES,
+    topology,
+    isolatedFinders,
     maxVerificationTier: t >= T_VERIFY_TIER_3 ? 3 : t >= T_VERIFY_TIER_2 ? 2 : 1,
     holisticEscalationCap: Math.round(10 * t),
     optimalityLens: t >= T_OPTIMALITY,
@@ -403,7 +425,8 @@ function selfTest() {
 
   total++;
   const st = resolveBudget({ routedTier: "standard" });
-  if (st.effectiveThoroughness === 0.5 && st.correctnessVotes === 1 && st.topology === "parallel"
+  if (st.effectiveThoroughness === 0.5 && st.correctnessVotes === 1 && st.topology === "hybrid"
+    && JSON.stringify(st.isolatedFinders) === '["intent"]'
     && st.maxVerificationTier === 2 && st.optimalityLens === false && st.measurabilityLens === true
     && st.finders["consumer-impact"] === true && st.finderScope["consumer-impact"] === "delta"
     && st.finders.standards === true && st.finderScope.standards === "delta"
@@ -412,7 +435,7 @@ function selfTest() {
 
   total++;
   const dp = resolveBudget({ routedTier: "deep" });
-  if (dp.effectiveThoroughness === 0.8 && dp.correctnessVotes === 3 && dp.topology === "parallel"
+  if (dp.effectiveThoroughness === 0.8 && dp.correctnessVotes === 1 && dp.topology === "hybrid"
     && dp.maxVerificationTier === 2 && dp.optimalityLens === true && dp.measurabilityLens === true
     && dp.finderScope["consumer-impact"] === "all" && dp.finderScope.standards === "all"
     && dp.holisticEscalationCap === 8 && dp.holisticBroadPass === true) passed++;
@@ -465,7 +488,7 @@ function selfTest() {
 
   total++;
   const eh = resolveBudget({ effortHigh: true, routedTier: "deep" });
-  if (eh.effectiveThoroughness === 1 && eh.correctnessVotes === 5 && eh.maxVerificationTier === 3
+  if (eh.effectiveThoroughness === 1 && eh.correctnessVotes === 1 && eh.maxVerificationTier === 3
     && eh.holisticEscalationCap === 10) passed++;
   else fails.push(`resolveBudget(--effort high) did not reach the ceiling on every lever: ${JSON.stringify(eh)}`);
 
@@ -523,12 +546,29 @@ function selfTest() {
     else fails.push(`tool-call budget drifted: ${JSON.stringify({ q: q22.toolCalls, s: s22.toolCalls, d: d22.toolCalls, c: c22.toolCalls, d5: d5.toolCalls, d40: d40.toolCalls, u: unknown.toolCalls })}`);
   }
 
+  // ---- resolveBudget: topology (A/B rounds 7–8) — hybrid by default, parallel only via --fanout ----
+  total++;
+  {
+    const low = resolveBudget({ thoroughness: 0.3 });
+    const hyb = resolveBudget({ thoroughness: 0.8 });
+    const fan = resolveBudget({ thoroughness: 0.8, fanout: true });
+    const fanNoDispatch = resolveBudget({ thoroughness: 0.8, fanout: true, dispatchAvailable: false });
+    const fanLow = resolveBudget({ thoroughness: 0.3, fanout: true });
+    if (low.topology === "in-context" && low.isolatedFinders.length === 0
+      && hyb.topology === "hybrid" && JSON.stringify(hyb.isolatedFinders) === '["intent"]'
+      && fan.topology === "parallel" && fan.isolatedFinders.length === 6
+      && fanNoDispatch.topology === "in-context" && fanLow.topology === "in-context"
+      && [low, hyb, fan].every((b) => b.correctnessVotes === 1)) passed++;
+    else fails.push(`topology/isolatedFinders/votes drifted: ${JSON.stringify({ low: low.topology, hyb: [hyb.topology, hyb.isolatedFinders], fan: [fan.topology, fan.isolatedFinders.length], fanNoDispatch: fanNoDispatch.topology, fanLow: fanLow.topology })}`);
+  }
+
   // ---- resolveBudget: monotonicity — for any t1 < t2, budget(t2) is a
   // superset of budget(t1) on every lever. No lever may ever regress as
   // thoroughness rises. ----
   total++;
   const grid = Array.from({ length: 11 }, (_, n) => Math.round(n * 10) / 100);
   const scopeRank = { none: 0, delta: 1, all: 2 };
+  const topoRank = { "in-context": 0, hybrid: 1, parallel: 2 };
   let monotonicityBroken = null;
   for (let a = 0; a < grid.length && !monotonicityBroken; a++) {
     for (let b = a + 1; b < grid.length && !monotonicityBroken; b++) {
@@ -541,7 +581,7 @@ function selfTest() {
         [scopeRank[lo.finderScope["consumer-impact"]] <= scopeRank[hi.finderScope["consumer-impact"]], "consumer-impact scope narrowed"],
         [scopeRank[lo.finderScope.standards] <= scopeRank[hi.finderScope.standards], "standards scope narrowed"],
         [lo.correctnessVotes <= hi.correctnessVotes, "correctnessVotes regressed"],
-        [lo.topology !== "parallel" || hi.topology === "parallel", "topology regressed from parallel to in-context"],
+        [topoRank[lo.topology] <= topoRank[hi.topology], "topology regressed toward in-context"],
         [lo.maxVerificationTier <= hi.maxVerificationTier, "maxVerificationTier regressed"],
         [lo.holisticEscalationCap <= hi.holisticEscalationCap, "holisticEscalationCap regressed"],
         [!lo.optimalityLens || hi.optimalityLens, "optimalityLens regressed"],
