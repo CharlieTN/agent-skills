@@ -47,7 +47,7 @@ import { writeFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync } from 
 import { tmpdir } from "node:os";
 import { join, dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Timing } from "./review-telemetry.mjs";
+import { Timing, beginRun, appendRecord, hostFacts, ledgerPath } from "./review-telemetry.mjs";
 import { classifyDivergence, blobDelta, deltaCounts, churnState, FULL_REFRESH_DELTA } from "./delta-triage.mjs";
 import { routeDepth, resolveBudget } from "./route-depth.mjs";
 import { buildReviewPacket, buildPacketParts, consumersByFile } from "./review-packet.mjs";
@@ -1610,6 +1610,30 @@ async function prepare(opts) {
     anomalies,
   };
 
+  // Run telemetry (review-telemetry.mjs): this is where a review's trace begins. The ledger sits
+  // next to context.json, so every later command finds it through `dirname(context)`, and the
+  // `prepare` step is backdated to this process's own start. `--no-telemetry` skips it (an intent
+  // worker preparing its own context is part of the reviewer's run, not a run of its own).
+  if (opts.telemetry !== false) {
+    try {
+      const runDir = dirname(outPath);
+      const startNs = BigInt(timing.startedAt()) * 1_000_000n;
+      beginRun(runDir, {
+        ...hostFacts(),
+        repo, number, head_sha: checkoutSha, head_ref: meta.headRefName || undefined,
+        mode: runMode.mode, tier: routing.tier, thoroughness: budget.effectiveThoroughness, topology: budget.topology,
+      }, { ns: startNs });
+      /** @type {Record<string, number>} */
+      const phaseAttrs = {};
+      for (const [name, ms] of Object.entries(context.timing?.phases || {})) phaseAttrs[`phase.${name.replace(/[^a-z0-9]+/gi, "_").toLowerCase()}_ms`] = ms;
+      appendRecord(runDir, { t: "step", phase: "start", name: "prepare", ns: startNs });
+      appendRecord(runDir, { t: "step", phase: "end", attrs: { ...phaseAttrs, files: files.length, delta_lines: context.deltaLines } });
+      context.telemetry = { runDir, ledger: ledgerPath(runDir) };
+    } catch (e) {
+      anomalies.push(`run telemetry not started: ${String(e && e.message || e).slice(0, 160)}`);
+    }
+  }
+
   writeFileSync(outPath, JSON.stringify(context, null, 2), "utf8");
   return { context, outPath };
 }
@@ -2089,6 +2113,7 @@ async function main(argv) {
     reviewerLogin: "",
     workspace: true,
     impact: true,
+    telemetry: true,
     timeoutMs: 90000,
     quiet: false,
     inlinePayloads: false,
@@ -2111,6 +2136,7 @@ async function main(argv) {
     else if (a === "--reviewer-login") opts.reviewerLogin = argv[++i];
     else if (a === "--no-workspace") opts.workspace = false;
     else if (a === "--no-impact") opts.impact = false;
+    else if (a === "--no-telemetry") opts.telemetry = false;
     else if (a === "--timeout-ms") opts.timeoutMs = Number(argv[++i]);
     else if (a === "--quiet") opts.quiet = true;
     else if (a === "--inline-payloads") opts.inlinePayloads = true;

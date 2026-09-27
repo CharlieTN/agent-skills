@@ -126,7 +126,7 @@ defect in 3 of 3 runs, where the default setting in one context had missed it in
 2. In **one message**, dispatch both:
    - `pr-reviewer` with `<PR_REF> <pass-through flags> --intent-from <that path>`;
    - a general-purpose worker (the harness's general sub-agent type) with the [worker preamble](#worker-preamble--every-dispatch-in-steps-c-e-and-f),
-     told to run `prepare-review.mjs --pr <PR_REF> --out <scratch dir>/context.json` (add
+     told to run `prepare-review.mjs --pr <PR_REF> --no-telemetry --out <scratch dir>/context.json` (add
      `--review-sha <sha> --isolated` when the pass-through flags carry `--review-sha`), read
      `finders.md` and the review packet it wrote, act as the `intent` finder only, and write its
      candidates to that path as a JSON array.
@@ -630,6 +630,9 @@ exactly once, and retry a unit only once when it returned no readable output fil
 [`dispatch-topology.md § Packing`](../../../agents/pr-reviewer/rules/dispatch-topology.md#packing--how-units-become-dispatches)
 owns those rules and the expected sub-agent count per thoroughness band.
 `plan-dispatch.mjs` prints the messages in the order to send them.
+Mark each message in the run's telemetry: `review-telemetry.mjs worker <unit> start` for every unit
+just before the message and `worker <unit> end` once it returns, each joined with `;` to a command you
+run anyway ([`run-telemetry.md`](../../../agents/pr-reviewer/rules/run-telemetry.md#what-you-mark-the-model-steps)).
 
 ### The default-flip gate
 

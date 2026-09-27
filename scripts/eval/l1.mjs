@@ -9902,6 +9902,47 @@ const isPollBlock = (block) =>
       && /never as diversify-then-vote/.test(sk) && !/N = 5 sub-agents/.test(sk));
 }
 
+// ── G84o: run telemetry — per-step spans in the shape Dash0's AI Coding Insights reads ──
+// A/B rounds 3–9 timed only four coarse phases per run, so no single step's wall-clock cost was
+// known. review-telemetry.mjs keeps a cross-process ledger and exports one trace per run. Guarded
+// here: the self-test (tree, contract, harness rule, opt-in export into a real local receiver),
+// the three scripts that record steps without the model, the marker rule, and the CI smoke run.
+{
+  const RT = join(REPO_ROOT, "agents/pr-reviewer/scripts/review-telemetry.mjs");
+  const rtRun = spawnSync(process.execPath, [RT, "--self-test"], { encoding: "utf8" });
+  const out = rtRun.stdout || "";
+  s.check("G84o review-telemetry.mjs --self-test proves the invoke_agent root, no chat/execute_tool spans, the harness rule, opt-in export, and a real export",
+    rtRun.status === 0
+      && /root span is `invoke_agent pr-reviewer`/.test(out)
+      && /no span is a `chat` or `execute_tool` span/.test(out)
+      && /inside a plugin-covered harness with no joined session, no gen_ai\.harness\.name/.test(out)
+      && /rule 1 — a host's OTEL_EXPORTER_OTLP_ENDPOINT alone is never used/.test(out)
+      && /with an endpoint: exported to \/v1\/traces and \/v1\/metrics/.test(out),
+    out.split("\n").filter((l) => l.includes("✗")).join(" | "));
+  const pr = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/scripts/prepare-review.mjs"), "utf8");
+  const fin = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/scripts/finalize.mjs"), "utf8");
+  const ewp = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/scripts/execute-write-plan.mjs"), "utf8");
+  s.check("G84o prepare-review.mjs starts the run and records `prepare`; --no-telemetry skips it",
+    /beginRun\(runDir,/.test(pr) && /name: "prepare", ns: startNs/.test(pr) && /"--no-telemetry"\) opts\.telemetry = false/.test(pr));
+  s.check("G84o finalize.mjs records `finalize` and the outcome, and finishes the run under --dry-run",
+    /name: "finalize", ns: PROCESS_START_NS/.test(fin) && /if \(how\.dryRun \|\| how\.failed\)/.test(fin) && /finishRun\(runDir/.test(fin));
+  s.check("G84o execute-write-plan.mjs records `post` and finishes a real run",
+    /name: "post", ns: PROCESS_START_NS/.test(ewp) && /await finishRun\(runDir/.test(ewp));
+  const rtDoc = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/rules/run-telemetry.md"), "utf8");
+  const body = readFileSync(join(REPO_ROOT, "agents/pr-reviewer.md"), "utf8");
+  s.check("G84o run-telemetry.md states the marker rule and the opt-in, and the agent body routes to it",
+    /\*\*Never spend a tool call on a marker\.\*\*/.test(rtDoc) && /Export is opt-in\./.test(rtDoc)
+      && body.includes("(./pr-reviewer/rules/run-telemetry.md)"));
+  // The workflow ships as a template until someone with `workflows` permission installs it; the
+  // guard reads whichever copy exists, the installed one first.
+  const installed = join(REPO_ROOT, ".github/workflows/review-telemetry-smoke.yml");
+  const smoke = existsSync(installed) ? installed : join(REPO_ROOT, "agents/pr-reviewer/templates/review-telemetry-smoke.workflow.yml");
+  const smokeTxt = existsSync(smoke) ? readFileSync(smoke, "utf8") : "";
+  s.check("G84o the CI smoke run exports one synthetic run when the telemetry code changes, and fails if it was not exported",
+    smokeTxt.includes("agents/pr-reviewer/scripts/review-telemetry.mjs") && smokeTxt.includes("PR_REVIEWER_OTLP_ENDPOINT")
+      && /jq -e '\.exported == true'/.test(smokeTxt) && smokeTxt.includes("smoke=true"));
+}
+
 // ── G82: pr-reviewer.md size ratchet + the L2-read sections stay byte-identical to base (D15,
 // AC-3/AC-5/AC-6, plan feat/pr-reviewer-shrink-fanout-ab) ──
 //

@@ -50,6 +50,7 @@ import { toFindingsBusRecords } from "./finalize/findings-bus.mjs";
 import { buildWritePlan } from "./finalize/write-plan.mjs";
 import { scratchRoot } from "./prepare-review.mjs";
 import { MARKER_RE } from "./fingerprint.mjs";
+import { appendRecord, finishRun, readLedger } from "./review-telemetry.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FINALIZE_SELF_TESTS = [
@@ -1926,6 +1927,47 @@ async function selfTest() {
   console.log("\n✓ finalize self-test: all checks passed");
 }
 
+/** When this process started — the `finalize` step span's start (review-telemetry.mjs). */
+const PROCESS_START_NS = BigInt(Date.now()) * 1_000_000n;
+
+/**
+ * Record the `finalize` step and the run's outcome in the run-telemetry ledger next to
+ * context.json, and — on a dry run, where nothing is posted after this — finish and export the
+ * trace. A context with no ledger (built by an older prepare-review.mjs, or `--no-telemetry`)
+ * records nothing. Never throws: telemetry never fails a review.
+ * @param {string} contextPath @param {any} result @param {any} judgments
+ * @param {{ dryRun: boolean, failed: boolean }} how
+ * @returns {Promise<string|null>} the run dir, when a ledger exists
+ */
+async function recordFinalizeTelemetry(contextPath, result, judgments, how) {
+  try {
+    const runDir = dirname(contextPath);
+    if (!readLedger(runDir).some((r) => r.t === "run")) return null;
+    const candidates = Array.isArray(judgments?.candidates) ? judgments.candidates : [];
+    appendRecord(runDir, { t: "step", phase: "start", name: "finalize", ns: PROCESS_START_NS });
+    appendRecord(runDir, { t: "step", phase: "end" });
+    appendRecord(runDir, {
+      t: "attr", target: "run",
+      attrs: {
+        verdict: result?.verdict,
+        candidates: candidates.length,
+        confirmed: candidates.filter((/** @type {any} */ c) => c?.verdict === "confirmed").length,
+        contradicted: candidates.filter((/** @type {any} */ c) => c?.verdict === "contradicted").length,
+        posted_inline: Array.isArray(result?.inline) ? result.inline.length : undefined,
+        deferred: Array.isArray(result?.deferred) ? result.deferred.length : undefined,
+        dry_run: how.dryRun,
+      },
+    });
+    if (how.dryRun || how.failed) {
+      const out = await finishRun(runDir, how.failed ? { status: "error", message: "finalize.mjs could not render the report" } : {});
+      console.log(`finalize: run telemetry ${out.exported ? "exported" : `written (${("reason" in out && out.reason) || ("skipped" in out && out.skipped) || "not exported"})`} → ${join(runDir, "telemetry-summary.json")}`);
+    }
+    return runDir;
+  } catch {
+    return null;
+  }
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const opts = parseArgs(argv);
@@ -2122,6 +2164,10 @@ async function main() {
     historical: context?.historical || null,
     isolated: Boolean(context?.isolated),
   });
+  const telemetryRunDir = await recordFinalizeTelemetry(/** @type {string} */ (opts.context), result, judgments, { dryRun: isDryRun, failed: renderFailed });
+  // execute-write-plan.mjs records the `post` step and exports the trace; this is how it finds
+  // the ledger. Absent when no ledger exists.
+  if (telemetryRunDir && !isDryRun) writePlan.telemetry_run_dir = telemetryRunDir;
   writeFileSync(join(outDir, "write-plan.json"), JSON.stringify(writePlan, null, 2));
   console.log(`finalize: wrote write-plan.json (${writePlan.thread_reply.length} replies, `
     + `${writePlan.thread_resolve.length} resolves, ${writePlan.review_create.comments.length} inline comments)`);

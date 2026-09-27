@@ -66,6 +66,9 @@ With `--intent-from <path>`:
 2. Run every other finder, lens, and gate as usual.
 3. Before Step 2.5, read `<path>`.
    If it does not exist yet, wait for it — check every 20 seconds, for at most 10 minutes.
+   On the command that reads it, fold the worker into this run's telemetry with
+   `review-telemetry.mjs worker intent import --from <dir of path> --done <path>`
+   ([`run-telemetry.md`](./run-telemetry.md#what-you-mark-the-model-steps)).
 4. If it never appears or does not parse, run the intent finder in this context and add
    `intent worker returned no readable candidates — ran intent in-context` to `RUN_ANOMALY` through
    `context.render.RUN_ANOMALY`.

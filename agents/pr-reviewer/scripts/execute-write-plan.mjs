@@ -29,6 +29,10 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { run as defaultRun, scratchRoot } from "./prepare-review.mjs";
+import { appendRecord, finishRun } from "./review-telemetry.mjs";
+
+/** When this process started — the `post` step span's start. */
+const PROCESS_START_NS = BigInt(Date.now()) * 1_000_000n;
 
 /**
  * The last pre-flight before a review.create POST — a check that survives the renderers being
@@ -646,6 +650,14 @@ async function main() {
     process.exit(2);
   }
   const result = await executeWritePlan(writePlan, { repo, dryRun: Boolean(opts["dry-run"]) });
+  // Run telemetry (review-telemetry.mjs): a real run's last step. finalize.mjs names the ledger's
+  // directory in the plan; a dry run was already finished there, so nothing is recorded here.
+  if (writePlan?.telemetry_run_dir && !opts["dry-run"]) {
+    const runDir = String(writePlan.telemetry_run_dir);
+    appendRecord(runDir, { t: "step", phase: "start", name: "post", ns: PROCESS_START_NS });
+    appendRecord(runDir, { t: "step", phase: "end", attrs: { result_code: result.code ?? 0 } });
+    await finishRun(runDir, result.code === 5 || result.code === 3 ? { status: "error", message: `execute-write-plan exited ${result.code}` } : {});
+  }
   if (result.code === 5) {
     console.error(`execute-write-plan: refused — ${result.reason}`);
     process.exit(5);
