@@ -10062,6 +10062,68 @@ const isPollBlock = (block) =>
       && /Use an ingest-only token limited to one dataset/.test(rtDoc) && !/writes `PR_REVIEWER_OTLP_ENDPOINT`/.test(rtDoc));
 }
 
+// ── G84q: on a Dash0 Agent0 Automation, hybrid runs as two workers in one message ──
+// #201 told a top-level Agent0 run to dispatch every finder, every Phase E candidate and every
+// 2.4b trace as its own `general` sub-agent. That was documented, never wired, and never ran (the
+// Review automation was re-pinned to #201 after its last run), and it contradicted
+// dispatch-topology.md's hybrid default. The one measurement of that shape (A/B round 8) projected
+// ~57 minutes against a 12-minute automation timeout. A dispatch there blocks the turn, so hybrid
+// runs as two workers sent together — the intent finder alone, the other finders in one context —
+// and everything from Step 2.5 on, verification included, stays in the top-level run.
+{
+  const RT = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/rules/agent0-runtime.md"), "utf8");
+  const DT = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/rules/dispatch-topology.md"), "utf8");
+  const FIN = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/scripts/finalize.mjs"), "utf8");
+  const flat = (/** @type {string} */ t) => t.replace(/\s+/g, " ");
+  const HEADING = "## Phase D: two workers in one message; never expect a second rung";
+  const ANCHOR = "#phase-d-two-workers-in-one-message-never-expect-a-second-rung";
+  const sec = (() => {
+    const at = RT.indexOf(`\n${HEADING}\n`);
+    if (at === -1) return "";
+    const rest = RT.slice(at + 1);
+    const next = rest.indexOf("\n## ", 1);
+    return flat(next === -1 ? rest : rest.slice(0, next));
+  })();
+  s.check("G84q agent0-runtime.md has the two-worker Phase D section, linked from its Contents",
+    sec !== "" && RT.includes(`(${ANCHOR})`));
+  s.check("G84q the section takes the topology from dispatch-topology.md and context.budget, with the same 0.4 breakpoint",
+    sec.includes("[`dispatch-topology.md`](./dispatch-topology.md)") && sec.includes("`in-context` below thoroughness 0.4, `hybrid` from 0.4"));
+  s.check("G84q under hybrid it sends exactly two general sub-agents in one message: intent alone, the other finders together",
+    sec.includes("send **exactly two `general` sub-agents in one message**")
+      && /\| intent \| `intent` only \| `<scratch>\/intent\.json` \|/.test(sec)
+      && /\| other finders \| every other finder active in `context\.budget\.finders`[^|]*in one context \| `<scratch>\/others\.json` \|/.test(sec));
+  s.check("G84q verification and 2.4b stay in the top-level run, under dispatch-topology.md's Verification section",
+    sec.includes("(./dispatch-topology.md#verification--in-your-own-context)") && sec.includes("**Never dispatch anything else.**")
+      && /Phase E verifies one candidate at a time in this turn/.test(sec) && /2\.4b's targeted holistic traces are `Skill\(\)` calls in this turn/.test(sec)
+      && /^## Verification — in your own context$/m.test(DT));
+  s.check("G84q the worker prompt names absolute paths, the constraints file, a path-only return, and forbids reading the agent",
+    sec.includes("`/tmp/workspace/pr-reviewer/pr-reviewer/rules/finders.md`") && sec.includes("`/tmp/workspace/pr-reviewer/RUN-CONSTRAINTS.md`")
+      && sec.includes("return only that path in the final message") && sec.includes("do not read `pr-reviewer.md` or the bundle"));
+  s.check("G84q a failed worker is never re-dispatched: its finders run in this context and the run says so",
+    sec.includes("**do not dispatch it again**") && sec.includes("worker returned no readable candidates — ran its finders in-context")
+      && sec.includes("`context.render.RUN_ANOMALY`"));
+  // The telemetry marker the rule names is the one finalize.mjs reads to know intent ran isolated.
+  s.check("G84q the rule's `worker intent end` marker is the ledger record finalize.mjs reads as intentIsolated",
+    sec.includes("`worker intent end`") && FIN.includes(`r.unit === "intent" && r.phase === "end"`));
+  s.check("G84q the review-loop path still dispatches nothing",
+    sec.includes("**When `review-loop` dispatched you, there is no dispatch at all.**") && sec.includes("the second rung does not exist"));
+  const all = flat(RT);
+  s.check("G84q #201's per-finder, per-candidate fan-out is gone from the rule, its budget row included",
+    !all.includes("Dispatch them as multiple `general` sub-agents") && !all.includes("per-candidate verifier dispatches")
+      && !/also \*\*top-level\*\* fan-outs/.test(all) && !/\| Phase D \| serial \| concurrent fan-out \|/.test(RT)
+      && /\| Phase D \| serial \| two workers in one message \(intent; the other finders\) \|/.test(RT));
+  s.check("G84q dispatch-topology.md's hybrid wait points Agent0 runs at the two-worker section",
+    DT.includes(`(./agent0-runtime.md${ANCHOR})`));
+  // The rule's intent-only isolation and 0.4 breakpoint are the code's, not a restatement that can drift.
+  const probe = spawnSync(process.execPath, ["--input-type=module", "-e",
+    `import { resolveBudget, HYBRID_ISOLATED_FINDERS } from "./agents/pr-reviewer/scripts/route-depth.mjs";
+     console.log(JSON.stringify([resolveBudget({ thoroughness: 0.39 }).topology, resolveBudget({ thoroughness: 0.4 }).topology, HYBRID_ISOLATED_FINDERS]));`],
+    { encoding: "utf8", cwd: REPO_ROOT });
+  s.check("G84q route-depth.mjs agrees: in-context at 0.39, hybrid at 0.4, and intent is the only isolated finder",
+    probe.status === 0 && (probe.stdout || "").trim() === JSON.stringify(["in-context", "hybrid", ["intent"]]),
+    (probe.stdout || probe.stderr || "").trim().slice(0, 200));
+}
+
 // ── G82: pr-reviewer.md size ratchet + the L2-read sections stay byte-identical to base (D15,
 // AC-3/AC-5/AC-6, plan feat/pr-reviewer-shrink-fanout-ab) ──
 //
