@@ -10054,7 +10054,7 @@ const isPollBlock = (block) =>
   s.check("G84p run-telemetry.md tells an automation to export the settings through $DASH0_AGENT_ENV with an ingest-only token",
     /### On an Agent0 Automation/.test(rtDoc) && rtDoc.includes("sandbox.envVars")
       && rtDoc.includes(`printf 'export PR_REVIEWER_OTLP_HEADERS=%q\\n'`) && rtDoc.includes('>> "$DASH0_AGENT_ENV"')
-      && /ingest-only token/.test(rtDoc) && !/writes `PR_REVIEWER_OTLP_ENDPOINT`/.test(rtDoc));
+      && /Use an ingest-only token limited to one dataset/.test(rtDoc) && !/writes `PR_REVIEWER_OTLP_ENDPOINT`/.test(rtDoc));
 }
 
 // ── G82: pr-reviewer.md size ratchet + the L2-read sections stay byte-identical to base (D15,
