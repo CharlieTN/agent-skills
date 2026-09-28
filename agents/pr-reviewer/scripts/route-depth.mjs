@@ -196,7 +196,7 @@ export const RISK_FLOOR = 0.5;
 const T_TOPOLOGY = 0.4;
 const T_FINDERS_MID = 0.5; // consumer-impact(delta) + dependency + standards(delta) join
 const T_FINDERS_HIGH = 0.8; // consumer-impact/standards widen delta -> all
-/** A/B round 8 (sync-tray#72, the first real `--fanout` run): two correctness votes raised 24 and 25
+/** A/B round 8 (sync-tray#72, a run with every finder as its own sub-agent): two correctness votes raised 24 and 25
  *  candidates and dedupe merged few of them across the two, so the votes added candidates for the
  *  verifier instead of corroborating each other — at ~10 minutes of one worker each. Votes are
  *  retired: every budget runs ONE correctness pass. The field stays in the budget (always 1) so a
@@ -211,9 +211,8 @@ const T_MEASURABILITY = 0.4;
  *  it ran unconditionally (gated only by holistic-review.md's five
  *  TRIVIAL_SKIP conditions, never by thoroughness), so whether it ran on a
  *  given budget was ambiguous. `T_TOPOLOGY`'s own breakpoint (0.4) is reused
- *  here deliberately: below it there is no parallel dispatch to run the pass
- *  as a sub-agent, so tying the two together is not a second independent
- *  guess. This is a reported, deliberate deviation from "always on" at the
+ *  here deliberately: below it the review dispatches nothing, so tying the two
+ *  together is not a second independent guess. This is a reported, deliberate deviation from "always on" at the
  *  very bottom of the quick tier (t=0.2) — `routedTier === "deep"` still
  *  forces it on regardless of any override, same shape as the risk floor. */
 const T_HOLISTIC_BROAD = 0.4;
@@ -235,9 +234,9 @@ const T_TOOLCALLS_2 = 0.95;
 /** A/B rounds 7–8: the default review runs in ONE context, plus the intent finder as its own
  *  sub-agent. Isolated, the intent finder flagged the highest-severity agreed defect on sync-tray#72
  *  in 3 of 3 runs (5–6 minutes each); run in one context with the other finders, the default
- *  setting had missed it in 4 of 4 rounds. The full parallel topology (every finder its own
- *  sub-agent) found every known defect but projected to ~57 minutes, so it is reached only through
- *  `/pr-review --fanout` (the `fanout` input), never by thoroughness alone. */
+ *  setting had missed it in 4 of 4 rounds. A fully parallel topology (every finder its own
+ *  sub-agent, the removed `/pr-review --fanout`) found every known defect but projected to ~57
+ *  minutes against 9–13 for one context, so there is no parallel topology. */
 export const HYBRID_ISOLATED_FINDERS = Object.freeze(["intent"]);
 
 /** @param {string[]} shape @param {string} band */
@@ -252,7 +251,6 @@ function highStakesReason(shape, band) {
  *   thoroughness?: number, routedTier?: "deep"|"standard"|"quick",
  *   shape?: string[], band?: string, depthCapability?: string,
  *   dispatchAvailable?: boolean, effortHigh?: boolean, changedFiles?: number,
- *   fanout?: boolean,
  * }} ResolveBudgetInput
  * @typedef {{
  *   effectiveThoroughness: number, requestedThoroughness: number,
@@ -260,7 +258,7 @@ function highStakesReason(shape, band) {
  *   finders: {correctness: boolean, intent: boolean, quality: boolean,
  *     "consumer-impact": boolean, dependency: boolean, standards: boolean},
  *   finderScope: {"consumer-impact": "none"|"delta"|"all", standards: "none"|"delta"|"all"},
- *   correctnessVotes: 1, topology: "in-context"|"hybrid"|"parallel", isolatedFinders: string[],
+ *   correctnessVotes: 1, topology: "in-context"|"hybrid", isolatedFinders: string[],
  *   maxVerificationTier: 1|2|3, holisticEscalationCap: number,
  *   optimalityLens: boolean, measurabilityLens: boolean, holisticBroadPass: boolean,
  *   toolCallMultiplier: 1|1.5|2, toolCalls: number|null,
@@ -329,12 +327,9 @@ export function resolveBudget(i = {}) {
   /** @type {1|1.5|2} */
   const toolCallMultiplier = t >= T_TOOLCALLS_2 ? 2 : t >= T_TOOLCALLS_1_5 ? 1.5 : 1;
 
-  /** @type {"in-context"|"hybrid"|"parallel"} */
-  const topology = !dispatchAvailable || t < T_TOPOLOGY ? "in-context" : i.fanout ? "parallel" : "hybrid";
-  const activeFinders = /** @type {string[]} */ (["correctness", "consumer-impact", "dependency", "intent", "standards", "quality"])
-    .filter((f) => f === "consumer-impact" ? consumerImpactActive : f === "correctness" || f === "intent" || f === "quality" ? true : findersMid);
-  const isolatedFinders = topology === "hybrid" ? [...HYBRID_ISOLATED_FINDERS]
-    : topology === "parallel" ? activeFinders : [];
+  /** @type {"in-context"|"hybrid"} */
+  const topology = !dispatchAvailable || t < T_TOPOLOGY ? "in-context" : "hybrid";
+  const isolatedFinders = topology === "hybrid" ? [...HYBRID_ISOLATED_FINDERS] : [];
 
   return {
     effectiveThoroughness: t,
@@ -546,20 +541,18 @@ function selfTest() {
     else fails.push(`tool-call budget drifted: ${JSON.stringify({ q: q22.toolCalls, s: s22.toolCalls, d: d22.toolCalls, c: c22.toolCalls, d5: d5.toolCalls, d40: d40.toolCalls, u: unknown.toolCalls })}`);
   }
 
-  // ---- resolveBudget: topology (A/B rounds 7–8) — hybrid by default, parallel only via --fanout ----
+  // ---- resolveBudget: topology (A/B rounds 7–8) — hybrid from 0.4, in-context below or with no dispatch ----
   total++;
   {
     const low = resolveBudget({ thoroughness: 0.3 });
     const hyb = resolveBudget({ thoroughness: 0.8 });
-    const fan = resolveBudget({ thoroughness: 0.8, fanout: true });
-    const fanNoDispatch = resolveBudget({ thoroughness: 0.8, fanout: true, dispatchAvailable: false });
-    const fanLow = resolveBudget({ thoroughness: 0.3, fanout: true });
+    const noDispatch = resolveBudget({ thoroughness: 0.8, dispatchAvailable: false });
+    const top = resolveBudget({ thoroughness: 1 });
     if (low.topology === "in-context" && low.isolatedFinders.length === 0
       && hyb.topology === "hybrid" && JSON.stringify(hyb.isolatedFinders) === '["intent"]'
-      && fan.topology === "parallel" && fan.isolatedFinders.length === 6
-      && fanNoDispatch.topology === "in-context" && fanLow.topology === "in-context"
-      && [low, hyb, fan].every((b) => b.correctnessVotes === 1)) passed++;
-    else fails.push(`topology/isolatedFinders/votes drifted: ${JSON.stringify({ low: low.topology, hyb: [hyb.topology, hyb.isolatedFinders], fan: [fan.topology, fan.isolatedFinders.length], fanNoDispatch: fanNoDispatch.topology, fanLow: fanLow.topology })}`);
+      && top.topology === "hybrid" && noDispatch.topology === "in-context" && noDispatch.isolatedFinders.length === 0
+      && [low, hyb, top].every((b) => b.correctnessVotes === 1)) passed++;
+    else fails.push(`topology/isolatedFinders/votes drifted: ${JSON.stringify({ low: low.topology, hyb: [hyb.topology, hyb.isolatedFinders], top: top.topology, noDispatch: noDispatch.topology })}`);
   }
 
   // ---- resolveBudget: monotonicity — for any t1 < t2, budget(t2) is a
@@ -568,7 +561,7 @@ function selfTest() {
   total++;
   const grid = Array.from({ length: 11 }, (_, n) => Math.round(n * 10) / 100);
   const scopeRank = { none: 0, delta: 1, all: 2 };
-  const topoRank = { "in-context": 0, hybrid: 1, parallel: 2 };
+  const topoRank = { "in-context": 0, hybrid: 1 };
   let monotonicityBroken = null;
   for (let a = 0; a < grid.length && !monotonicityBroken; a++) {
     for (let b = a + 1; b < grid.length && !monotonicityBroken; b++) {
