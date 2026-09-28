@@ -296,7 +296,7 @@ Examine the **raw arguments** verbatim. Do not paraphrase.
 | `--measurable-strict` | Force the measurability lens to strict for this run. Strict is already the default, so this re-asserts the bar (`missing` on a new failure mode is an `issue:`, `unlinked` is a `suggestion:`) only when the repo set `measurable: advisory`. Also settable as `measurable: strict` in the review config |
 | `--measurable-advisory` | Opt the measurability lens down to advisory for this run, so no measurability finding reaches `FAIL_REASONS` (`missing` → `suggestion:`, `unlinked` → aggregated `nitpick:`). Also settable as `measurable: advisory` in the review config |
 | `--skip-gates` | Skip Gates 1–5, run inline review (Gate 6) only |
-| `--intent-from <path>` | `/pr-review` runs the intent finder as its own sub-agent: skip it here; merge `<path>`'s candidates before Step 2.5 ([`dispatch-topology.md`](./pr-reviewer/rules/dispatch-topology.md#the-three-topologies)) |
+| `--intent-from <path>` | `/pr-review` runs the intent finder as its own sub-agent: skip it here; merge `<path>`'s candidates before Step 2.5 ([`dispatch-topology.md`](./pr-reviewer/rules/dispatch-topology.md#the-two-topologies)) |
 | `--with a,b,c` | Up to 3 additional review lenses |
 | `--no-fix-links` | Suppress the "Fix with Agent0" buttons for this run. They render by default everywhere (`agents/shared/rules/agent0-fix-links.md`); this is the per-run opt-out and beats every other signal. |
 | `--fix-links` | Force the buttons on for this run, overriding an `agent0_fix_links: false` in the review config. Rarely needed — they are already on by default. |
