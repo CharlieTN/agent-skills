@@ -9210,7 +9210,7 @@ const isPollBlock = (block) =>
     (skillText.split("\n").find((l) => l.includes("--fanout")) || "").trim().slice(0, 120));
   const rdSrc = readIf("agents/pr-reviewer/scripts/route-depth.mjs");
   s.check("G66r route-depth.mjs's resolveBudget returns no parallel topology and reads no fanout input",
-    rdSrc !== "" && !/topology\s*===?\s*"parallel"|:\s*"parallel"|\bi\.fanout\b/.test(rdSrc));
+    rdSrc !== "" && !/"parallel"|\.fanout\b/.test(rdSrc));
   const topo = readIf("agents/pr-reviewer/rules/dispatch-topology.md");
   s.check("G66r dispatch-topology.md names two topologies and has no parallel row",
     /^## The two topologies$/m.test(topo) && !/^\| `parallel` \|/m.test(topo));
