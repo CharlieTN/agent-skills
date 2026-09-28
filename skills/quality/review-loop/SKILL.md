@@ -20,7 +20,7 @@ argument-hint: '<PR-URL|#n> [--cap N] [--critical] [--external-review] [--interv
 license: MIT
 metadata:
   author: mthines
-  version: '1.9.0'
+  version: '1.10.0'
   workflow_type: command
   tags:
     - review
@@ -72,7 +72,7 @@ sub-agent dispatch tool (`Task(subagent_type="pr-reviewer", prompt="<PR-URL> [--
 **Do not** call `Skill("pr-reviewer", …)` — there is no skill by that name and it
 errors with `Unknown skill: pr-reviewer`.
 
-#### Dash0 Agent0 Automation sandboxes
+#### Dash0 Agent0 sandboxes
 
 When `/tmp/workspace/agent-skills/env.sh` exists, the loop is running in an Agent0
 Automation sandbox, where `pr-reviewer` cannot be dispatched and `Skill()` cannot
@@ -83,6 +83,12 @@ reached: sub-step A dispatches a `general` sub-agent pointed at the compiled
 `Skill("<name>")` becomes a read of the installed `SKILL.md`. The sandbox is prepared
 by [`scripts/agent0-setup.sh`](../../../scripts/agent0-setup.sh), pasted as the
 automation's `sandbox.setupScript`.
+
+An Agent0 session that ran **no** setup script has neither that file nor the bundle.
+That is the generic automation answering a `/review-loop` comment, and any chat thread whose sandbox was not prepared.
+Its dispatch tool offers `explore` and `general`, not `pr-reviewer`.
+Step 0 does **not** skip there.
+It installs the bundle into `/tmp/workspace` itself ([`rules/agent0-runtime.md` § Install on demand](./rules/agent0-runtime.md#install-on-demand-when-the-marker-is-absent)), which takes seconds with no browser, and continues on the same `general` route.
 
 #### The dispatch tool is a capability, not a fixed name
 
@@ -144,21 +150,29 @@ tool at all, so that dispatch fails outright (`Failed to run agent`). `pr-review
 from running in a fresh, isolated context, so "play the role yourself" would
 produce a self-review wearing a reviewer's label, which is worse than no review.
 
+What that rules out is the **context**, not the agent **type**.
+A `general` sub-agent that reads the `pr-reviewer` definition runs the same procedure in its own fresh context, so it is a reviewer route ([Step 0](#step-0-resolve-the-pr-and-preconditions) rows 2 and 4), not a substitute.
+Only a review performed in the loop's own context is forbidden.
+
 Check for it in [Step 0](#step-0-resolve-the-pr-and-preconditions) and **self-report
 a clean skip** rather than letting the caller discover it as a mid-loop tool error:
 
-Two causes produce the same absent capability, and they get **different skip
+Four causes leave the loop without a reviewer, and they get **different skip
 lines** because they have different fixes. Report the one you can evidence; when
-you cannot tell them apart, report the harness line:
+you cannot tell the first two apart, report the harness line:
 
 | Cause | How you know | Skip line |
 | --- | --- | --- |
 | **Nested dispatch** (caller error, fixable today) | You are running as a dispatched sub-agent — the caller's prompt dispatched this loop rather than running it | `skipped (nested dispatch — review-loop must run at the top level; the caller consumed the delegation budget)` |
 | **Harness exposes no dispatch tool** (environment) | This is the top-level session and no tool that dispatches a sub-agent is present under any name — `Task`, `Agent`, or another spelling | `skipped (sub-agent dispatch unavailable; pr-reviewer requires it)` |
+| **`pr-reviewer` is not an agent type here, and there is no Agent0 workspace** (install) | Step 0 row 5: a dispatch tool exists, its agent types omit `pr-reviewer`, and `/tmp/workspace` does not exist | `skipped (pr-reviewer is not a dispatchable agent type here). Install the agent, or re-run with --external-review.` |
+| **The Agent0 on-demand install failed** (environment) | Step 0 row 4 ran the [install](./rules/agent0-runtime.md#install-on-demand-when-the-marker-is-absent) and `/tmp/workspace/agent-skills/env.sh` still does not exist | `skipped (Agent0 install failed: <the setup log's last line>)` |
 
 ```markdown
 - [TIMESTAMP] review-loop — skipped (nested dispatch — review-loop must run at the top level; the caller consumed the delegation budget). Have the caller run the loop itself, or dispatch it with --external-review.
 - [TIMESTAMP] review-loop — skipped (sub-agent dispatch unavailable; pr-reviewer requires it)
+- [TIMESTAMP] review-loop — skipped (pr-reviewer is not a dispatchable agent type here). Install the agent, or re-run with --external-review.
+- [TIMESTAMP] review-loop — skipped (Agent0 install failed: could not download scripts/agent0-setup.sh)
 ```
 
 Return that skip as the loop's terminal result. Do **not** retry the dispatch and
@@ -208,7 +222,7 @@ Everything else is a flag.
 | `--no-refresh` | Run the convergence loop as normal but skip the final PR-description refresh and Linear note. |
 | `--external-review` | Replace sub-step A: wait for an **out-of-process** reviewer instead of dispatching `pr-reviewer`. See [Sub-step A — external-review mode](#sub-step-a--external-review-mode). |
 | `--interval S` | Poll interval in seconds for `--external-review`, default `300`, **clamped to `540`**. Ignored without `--external-review`. |
-| `--no-ci` | Skip sub-step D (the CI pass). Callers that own their own CI phase pass this — `create-pr` (Steps 7–9) and `autonomous-workflow` (Phase 7) both do. |
+| `--no-ci` | Skip sub-step D (the CI pass). Callers that own their own CI phase pass this — `create-pr` (Steps 7–8) and `autonomous-workflow` (Phase 7) both do. |
 | `--no-preview-run` | Skip [Step 1.6](#step-16-ui-verify-run-report-only-once-on-exit), the report-only ui-verify run at exit. `autonomous-workflow` passes this because its Phase 7 spec rehearsal already runs the same specs against the preview; `create-pr` does **not**, so a hand-driven UI PR gets its authored spec verified here. |
 | `--merge` | Merge the PR (squash) on the first agent approval. After the loop, [Step 2.5](#step-25-merge-under---merge-on-approval) merges **only** when the run reached clean convergence (`all-threads-resolved` — every non-blocking comment fixed or answered), the final review is an approval (pr-reviewer `PASS`, or a GitHub `reviewDecision == APPROVED` under `--external-review`), and CI is green. It undrafts first (the one case that overrides *never undraft*). It never merges on a non-clean convergence, a non-PASS verdict, or pending/red CI — it reports why and stops. |
 
@@ -242,23 +256,45 @@ REPO="${RESOLVED_REPO#*/}"
 
 If no PR reference is found, abort: `review-loop requires a PR URL or #<n>.`
 
-**Precondition — sub-agent dispatch (best-effort).** The loop's first sub-step
+**Precondition — a reviewer route (best-effort).** The loop's first sub-step
 dispatches the `pr-reviewer` agent, which has no in-context substitute (see
 [Dispatch mechanics](#dispatch-mechanics--read-before-invoking)). Before entering
-the loop, check for the **capability**, not a name: does any available tool
-dispatch a sub-agent?
+the loop, resolve **how** it is dispatched — `REVIEWER_ROUTE` — from capabilities,
+never from a tool name. Take the **first** row that matches:
 
-1. Scan your available tools for one whose job is dispatching a sub-agent —
-   `Task` and `Agent` are the two spellings in circulation, and a tool that takes
-   a `subagent_type` (or equivalent agent-name) parameter is one whatever it is
-   called.
-2. Found one → **proceed**, and dispatch `pr-reviewer` through it. Substitute its
-   name wherever this file writes `Task(...)`; the call shape is otherwise
-   identical.
-3. Found none → emit the skip line from that section and return, without running
-   sub-steps B or C. Pick the line by cause — **nested dispatch** when you are
+| Row | Condition | `REVIEWER_ROUTE` | Sub-step A dispatches |
+| --- | --- | --- | --- |
+| 1 | No available tool dispatches a sub-agent | `none` | Nothing — emit the dispatch-unavailable or nested-dispatch skip line and return |
+| 2 | `/tmp/workspace/agent-skills/env.sh` exists | `agent0` | A `general` sub-agent reading the `pr-reviewer` bundle — [`rules/agent0-runtime.md`](./rules/agent0-runtime.md) |
+| 3 | The dispatch tool's own list of agent types includes `pr-reviewer` | `named` | `pr-reviewer` |
+| 4 | That list omits `pr-reviewer`, and `/tmp/workspace` exists | `agent0`, after the [on-demand install](./rules/agent0-runtime.md#install-on-demand-when-the-marker-is-absent) | As row 2 |
+| 5 | That list omits `pr-reviewer`, and `/tmp/workspace` does not exist | `none` | Nothing — emit `skipped (pr-reviewer is not a dispatchable agent type here)` and return |
+
+How to evaluate each row:
+
+1. **Row 1 — the tool.** Scan your available tools for one whose job is
+   dispatching a sub-agent — `Task` and `Agent` are the two spellings in
+   circulation, and a tool that takes a `subagent_type` (or equivalent
+   agent-name) parameter is one whatever it is called. Substitute its name
+   wherever this file writes `Task(...)`; the call shape is otherwise identical.
+   Found none → pick the skip line by cause — **nested dispatch** when you are
    running as a dispatched sub-agent, the harness line otherwise — and do **not**
    retry: one absent-capability return is conclusive.
+2. **Row 2 — the marker.** A sandbox that ran the setup script keeps the bundle
+   route even if its setup also registered `pr-reviewer` as an agent type: that
+   route is the one validated on the host.
+3. **Rows 3–5 — the agent type.** Read the list of agent types the dispatch tool
+   itself publishes, in its description or its `subagent_type` parameter. Claude
+   Code's `Task` lists them under "Available agent types"; Agent0's `task` lists
+   `explore` and `general`, plus any agent the session's setup registered. Read
+   it — never test-dispatch to find out. When no list is visible at all,
+   dispatch `pr-reviewer` once: a rejection that names the agent type
+   (`Unknown agent type`, `not a valid agent type`) is that list's answer arriving
+   late, so continue at rows 4–5. It is never a row-1 skip, because the tool worked.
+4. **Row 4 — the install.** Run it once, in this context. The file
+   `/tmp/workspace/agent-skills/env.sh` existing afterwards is the only success
+   test; when it does not exist, emit the install-failed skip line and return —
+   never retry the install, and never review in this context instead.
 
 **Never conclude "no dispatch" from the absence of the single name `Task`.** That
 misread is what this step exists to prevent: the harness behind Claude Code on
@@ -266,13 +302,20 @@ the web names the tool `Agent`, so a `Task`-only check skips the review on every
 cloud session, reports the PR as unreviewable, and the failure is invisible
 because a skip is a legitimate outcome.
 
+**Never conclude "no reviewer" from a dispatch tool that lacks the `pr-reviewer`
+type.** That misread skipped every `/review-loop` in Agent0 sessions without a
+setup script: the `task` tool was present, `pr-reviewer` was not one of its types,
+and the run reported the loop as unrunnable although rows 2–4 exist for exactly
+that host.
+
 **Skip this precondition entirely when `--external-review` is set** — that mode
 dispatches no `pr-reviewer`, so an absent dispatch tool is not disqualifying.
 
 **This check cannot be made certain**, and the contract does not pretend otherwise:
 there is no capability-introspection API, and on some harnesses a refused dispatch
 surfaces as an uncatchable error rather than a return value. When the check is
-inconclusive, attempt the dispatch — and if it fails, emit the same skip line rather
+inconclusive, attempt the dispatch — and if it fails for any reason other than an
+unknown agent type (which continues at rows 4–5, above), emit the same skip line rather
 than retrying or working around it. The value is **placement**: one clean logged
 deviation instead of a mid-Phase-6 error the caller must interpret.
 
@@ -428,6 +471,8 @@ while ITERATION < CAP:
         # <dispatch> is the harness's sub-agent dispatch tool — Task, Agent, or
         # another spelling; Step 0 resolved which one. pr-reviewer is an AGENT,
         # so never Skill("pr-reviewer").
+        # REVIEWER_ROUTE == "named": the call above, unchanged.
+        # REVIEWER_ROUTE == "agent0" (Step 0 row 2, or row 4 after the install):
         # AGENT0 == 1 (rules/agent0-runtime.md): subagent_type="general" with the
         # short bundle-pointing prompt from that rule — never pr-reviewer, and
         # never a review in this context. A refusal or BLOCKED reply is not a
@@ -567,7 +612,7 @@ gh pr checks "$PR_NUMBER" --repo "$RESOLVED_REPO"
 
 This is a **query, not a watch**: it adds no `gh … --watch` site and spends nothing
 from the watch budgets that
-[`create-pr` Step 9](../../delivery/create-pr/SKILL.md) and
+[`create-pr` Step 8](../../delivery/create-pr/SKILL.md) and
 [`phase-7-ci-gate.md`](../../workflow/autonomous-workflow/rules/phase-7-ci-gate.md)
 each count inside their own invocation. `ci-auto-fix` likewise keeps its own local
 counter, so delegating to it stays inside the existing contract — no budget is
@@ -644,13 +689,19 @@ Skip this step entirely when **any** of:
 - `NO_PREVIEW_RUN == 1` — the caller owns preview verification (`autonomous-workflow`
   passes this; its Phase 7 rehearses the same specs).
 - `NO_FEEDBACK == 1` — report-only mode applied nothing, so there is nothing new to verify.
-- the loop returned a dispatch skip (no dispatch tool, nested dispatch) — no run happened.
+- the loop returned a dispatch skip (no dispatch tool, nested dispatch, `pr-reviewer` not a dispatchable agent type, Agent0 install failed) — no run happened.
 
-Otherwise dispatch it **once**, regardless of iteration count:
+Otherwise dispatch it **once**, regardless of iteration count, **always with `--unattended`**:
 
 ```text
-Skill("ui-verify", "run <PR-URL>")
+Skill("ui-verify", "run <PR-URL> --unattended")
 ```
+
+`--unattended` is mandatory here, not a host-specific choice: this step runs at the end of a
+loop the caller expects to finish on its own, and without the flag `ui-verify`'s `auto` driver
+stops to ask `AskUserQuestion` whenever Chrome is absent — blocking forever in an automation, and
+failing outright on a host that has no ask-user tool. Under the flag it runs Playwright or returns
+`inconclusive: no driver available (…)`, never a question.
 
 `ui-verify run` owns the whole procedure: it reads the committed
 `<!-- ui-verify:v1 -->` block (the **only** source — never the gitignored
@@ -681,7 +732,7 @@ Map its outcome into the report:
 | `no spec` (no block — not a UI PR, or `author` never ran) | `not run (no ui-verify block)` — log and continue |
 | `inconclusive: preview not deployed` | `inconclusive (preview not deployed at exit)` — note `re-run /ui-verify run <PR-URL> once the preview is up`. Never a red |
 | `inconclusive: no access path for deployment lookup (pass --url)` | `inconclusive (no deployment lookup on this access path)` — note `re-run /ui-verify run <PR-URL> --url <preview-url>`. Never a red, and never recorded as `preview not deployed`: no lookup ran, so waiting for the build fixes nothing and only an explicit URL changes the outcome |
-| any other `inconclusive: <reason>` (`preview building`, `no preview environment`, `preview deploy failed`, `preview URL not published`) | `inconclusive (<reason> at exit)` — log the reason verbatim and continue. Never a red |
+| any other `inconclusive: <reason>` (`preview building`, `no preview environment`, `preview deploy failed`, `preview URL not published`, `no driver available (unattended — …)`) | `inconclusive (<reason> at exit)` — log the reason verbatim and continue. Never a red |
 | `empty spec` (markers present, body empty) | `not run (empty ui-verify block)` — log and continue. Distinct from `no spec` on purpose: `author` **did** run and embedded nothing, which is a spec-authoring bug worth naming, not a PR that needed no spec |
 | `NOT RUN (<reason>)` (`chrome unavailable, user declined Playwright`, `sub-agent dispatch unavailable`, `no Chrome extension and no sub-agent dispatch available`) | `not run (<reason>)` — log the reason verbatim and continue. Never a red: no driver executed, so there is no verdict to be red about |
 | `green` | `green (<N> specs on <preview-url>)` |
@@ -714,7 +765,7 @@ the loop's fixes:
    )"
    ```
 
-Then, **best-effort**, note the linked Linear ticket (skip silently if any part is absent):
+Then, **best-effort**, note the linked Linear ticket (skip with one report line if any part is absent):
 
 - Detect a ticket from the branch name (`.../ABC-123-...`), the PR title/body, or `gh pr view`.
 - If a ticket id is found **and** the Linear MCP tools are connected, post a short comment on the ticket linking the PR and stating that review converged (e.g. `Review loop converged — PR <url> ready for review.`).
@@ -774,7 +825,7 @@ After the loop exits (converged, no-progress, or at cap), emit a compact summary
 review-loop on PR #<n> (<RESOLVED_REPO>)
 
 Iterations: <N> of <CAP>
-Stop reason: <all-threads-resolved | no-progress (flags remain) | cap-reached | ci-red (cap on ci-auto-fix handoffs) | ci-error (check query failed) | poll error | reviewer-refused (Agent0) | report-only (--no-feedback) | skipped (sub-agent dispatch unavailable) | skipped (nested dispatch — must run at top level)>
+Stop reason: <all-threads-resolved | no-progress (flags remain) | cap-reached | ci-red (cap on ci-auto-fix handoffs) | ci-error (check query failed) | poll error | reviewer-refused (Agent0) | report-only (--no-feedback) | skipped (sub-agent dispatch unavailable) | skipped (nested dispatch — must run at top level) | skipped (pr-reviewer is not a dispatchable agent type here) | skipped (Agent0 install failed: <reason>)>
 # Report the STOP_REASON the loop actually set — never re-derive it from the
 # iteration count. `Iterations: 1 of 1` is what report-only, a first-iteration
 # convergence, and a CAP=1 run all look like from the outside.
@@ -783,7 +834,9 @@ Stop reason: <all-threads-resolved | no-progress (flags remain) | cap-reached | 
 # skip as "report-only" because it is the nearest token — report-only means a
 # review pass ran and its findings were not applied, which is the opposite of a
 # PR that was never reviewed.
-Review source: <pr-reviewer | external>
+Review source: <pr-reviewer | pr-reviewer bundle via general sub-agent (Agent0<, installed on demand>) | external>
+# Name the route Step 0 resolved. "installed on demand" marks a row-4 run, so a
+# reader can tell a prepared sandbox from one the loop set up itself.
 # No count on the external arm: the shared poll is a liveness probe and returns only
 # NEW_FEEDBACK / NO_FEEDBACK / POLL_ERROR. It exposes no event count, and widening a
 # shared contract with two callers for a report cosmetic is not worth it.
@@ -824,6 +877,7 @@ threads over a red build is not a review-ready PR.
 - **The only permitted `polish` invocation is `Skill("polish", "simplify")`.** Non-simplify modes trigger an internal agent pass and create a dispatch cycle.
 - **This loop runs at the top level, never inside a sub-agent.** Its first sub-step is a delegation, so a caller that dispatches the loop instead of running it spends the delegation budget one level too high and the loop can only skip at iteration 0 ([Caller contract](#caller-contract--run-this-loop-at-the-top-level-never-inside-a-sub-agent)). A caller limited to one dispatch passes `--external-review` **deliberately** — the loop never adds that flag to itself.
 - **In an Agent0 sandbox the review is a `general` dispatch, never an in-context review.** Detect the host by the presence of `/tmp/workspace/agent-skills/env.sh`, never from a failed call, and follow [`rules/agent0-runtime.md`](./rules/agent0-runtime.md). A reviewer reply that refuses is `reviewer-refused`, never a clean pass.
+- **A dispatch tool without the `pr-reviewer` type is a route to resolve, never a skip.** Step 0 reads the tool's own list of agent types; when `pr-reviewer` is absent and `/tmp/workspace` exists, it installs the bundle on demand and dispatches the `general` reviewer. The only skips on that path are row 5 (no Agent0 workspace) and a failed install, each with its own line.
 - **The dispatch precondition tests a capability, never a tool name.** `Task` and `Agent` are two spellings of the same capability; concluding "no dispatch available" because the name `Task` is absent skips the review on every harness that spells it otherwise ([The dispatch tool is a capability, not a fixed name](#the-dispatch-tool-is-a-capability-not-a-fixed-name)).
 - **One absent-dispatch skip is terminal.** Never retry the dispatch and never work around it: the capability's absence is fixed by the dispatch topology before any code is read, so a retry costs a round trip and returns the same answer.
 - **A skip is never reported as convergence, and never as report-only.** Zero open threads plus green CI is not convergence when no review pass produced a verdict; say plainly that the loop did not run and the PR was not reviewed.
@@ -851,7 +905,6 @@ threads over a red build is not a review-ready PR.
 | `polish` (bare) | **Downstream, not a caller.** `polish`'s Pass A invokes `pr-reviewer` directly and never calls `review-loop`; this loop only invokes `Skill("polish", "simplify")`. |
 | `create-pr` | Upstream caller — delegates post-draft review to `review-loop` after opening the draft PR. |
 | `autonomous-workflow` Phase 6/7 | Invokes `review-loop` in place of the retired `reviewer` agent dispatches. |
-| `review-changes` | Routes to `review-loop` as the primary convergence entry point. |
 | `ci-auto-fix` | Sub-step D: dispatched as a subagent on a red check, capped at 2 handoffs per run. Owns the fix; this loop only classifies and delegates. Skipped under `--no-ci`. |
 | `ui-verify run` | Step 1.6: dispatched once at exit on a UI PR to run the committed spec against the preview deployment. Report-only — never gates convergence or undrafts. Skipped under `--no-preview-run` (which `autonomous-workflow` passes, its Phase 7 owning the same rehearsal) or when the skill is absent. Pairs with `create-pr` Step 6.4, which authored the spec. |
 | `review-activity-poll` | Shared rule owning the `--external-review` wait — [`agents/shared/rules/review-activity-poll.md`](../../../agents/shared/rules/review-activity-poll.md), co-owned with `implement-suggestion --watch`. |
