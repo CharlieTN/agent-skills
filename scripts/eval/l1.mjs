@@ -9723,8 +9723,8 @@ const isPollBlock = (block) =>
     const bodyTxt = readFileSync(join(REPO_ROOT, "agents/pr-reviewer.md"), "utf8");
     s.check("G84l prepare-review.mjs validates --reviewer-login and the body's ME capture resets on a gh failure",
       /export function isGithubLogin\(/.test(prTxt) && /isGithubLogin\(suppliedLogin\)/.test(prTxt)
-        && bodyTxt.includes('ME=$(gh api user --jq .login 2>/dev/null) || ME=""')
-        && !bodyTxt.includes('ME=$(gh api user --jq .login 2>/dev/null || echo "")'));
+        && bodyTxt.includes(`ME=$(gh api graphql -f query='{ viewer { login } }' --jq .data.viewer.login 2>/dev/null) || ME=""`)
+        && !/ME=\$\(gh api [^\n]*\|\| echo ""\)/.test(bodyTxt));
   }
   // G84i (A/B round 3 → iteration 1): three pipeline defects the sync-tray#72 arms hit.
   // (1) Every --isolated write-plan targeted the PR's LIVE sticky; --isolated now requires
