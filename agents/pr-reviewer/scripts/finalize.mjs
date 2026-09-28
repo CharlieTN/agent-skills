@@ -143,23 +143,20 @@ export function hydrateFilePatches(context) {
  * this run actually reviewed". Pure (D18): the caller resolves `capApplied`/`depthCapability`/
  * `contextAnomalies` from the context; this only formats them, and never begins with a glyph
  * (the renderer prepends its own ⚠️ — a value that did would double it).
- * @param {{ capApplied: boolean, depthCapability?: string, contextAnomalies?: any[], noDispatchAt?: number, noDispatchTopology?: string }} args
+ * @param {{ capApplied: boolean, depthCapability?: string, contextAnomalies?: any[], noDispatchAt?: number }} args
  * @returns {string|undefined}
  */
-export function buildAutoRunAnomaly({ capApplied, depthCapability, contextAnomalies, noDispatchAt, noDispatchTopology }) {
+export function buildAutoRunAnomaly({ capApplied, depthCapability, contextAnomalies, noDispatchAt }) {
   const parts = [];
   // A/B iteration 2: every in-context arm hand-wrote dispatch-topology.md's no-dispatch line into
   // context.render.RUN_ANOMALY, which REPLACED this function's output and dropped prepare-review's
   // own anomalies (two arms re-merged them by hand, one re-ran finalize three times). `--no-dispatch`
   // makes the line computed, with the budget's own effective thoroughness.
-  // A/B round 8: the default topology at t >= 0.4 is `hybrid` (only the intent finder is its own
+  // A/B round 8: the only topology that dispatches is `hybrid` (the intent finder is its own
   // sub-agent), so the no-dispatch degrade names what it actually lost on that path.
-  if (typeof noDispatchAt === "number" && noDispatchTopology === "hybrid") {
+  if (typeof noDispatchAt === "number") {
     parts.push("no sub-agent dispatch available — the intent finder ran in-context with the other finders"
       + ` at effective thoroughness ${noDispatchAt}, instead of as its own sub-agent`);
-  } else if (typeof noDispatchAt === "number") {
-    parts.push("no sub-agent dispatch available — finders and verification ran in-context, serially,"
-      + ` at effective thoroughness ${noDispatchAt}, instead of the parallel topology that value would otherwise dispatch`);
   }
   if (capApplied) {
     parts.push(`depth capability (${depthCapability || "diff-only"}) capped this run below the deep tier its mode would otherwise require`);
@@ -418,7 +415,7 @@ export function finalizeReview({ context, judgments, profile = "balanced", flatO
   const placed = place(lineValidated, { profile });
   const overCapDeferred = placed.deferred;
 
-  // --fanout Step f's shape fallback: a verified finding that still fails render-comment.mjs's
+  // The shape fallback: a verified finding that still fails render-comment.mjs's
   // shape after its one repair round is NEVER dropped. A non-blocking one moves to the report
   // body's deferred section (it cannot post inline as-is, and a mechanically truncated
   // non-blocker is worth less than its full text in the report); a blocking one posts inline with
@@ -551,7 +548,7 @@ export function finalizeReview({ context, judgments, profile = "balanced", flatO
   // so a delivered worker (context.intentIsolated, read from the run ledger) means nothing was lost,
   // and the line would claim an in-context intent finder that never ran.
   const noDispatchAt = context?.dispatchUnavailable === true
-    && (noDispatchTopology === "parallel" || (noDispatchTopology === "hybrid" && context?.intentIsolated !== true))
+    && noDispatchTopology === "hybrid" && context?.intentIsolated !== true
     && typeof context?.budget?.effectiveThoroughness === "number"
     ? context.budget.effectiveThoroughness : undefined;
   const autoRunAnomaly = buildAutoRunAnomaly({
@@ -559,7 +556,6 @@ export function finalizeReview({ context, judgments, profile = "balanced", flatO
     depthCapability: context?.workspace?.depthCapability || context?.depthCapability,
     contextAnomalies: context?.anomalies,
     noDispatchAt,
-    noDispatchTopology,
   });
 
   // MEMORIES_USED / MEMORIES_SUMMARY — computed from judgments.memory's two arrays (D4:
@@ -656,11 +652,11 @@ export function finalizeReview({ context, judgments, profile = "balanced", flatO
 }
 
 /**
- * D17: the `--fanout` orchestrator's candidate-merge step. Finder sub-agents each emit
+ * D17: the pre-verification candidate merge. Finders each emit
  * finders.md's PRE-verification candidate record (`finder`, `defect_class`, `path`, `line`,
  * `symbol`, `claim`, `bad_outcome`, `evidence`, `severity_hint`, `fix`, `verify_by` — no
  * `prefix`, no `body`, both of which are the VERIFIER's fields per judgments.schema.json). The
- * orchestrator concatenates every finder's output and must merge cross-finder duplicates before
+ * reviewer concatenates every finder's output (the hybrid intent worker's included) and merges cross-finder duplicates before
  * spending verifier budget on the same defect twice — the exact job `finalize/dedupe.mjs`'s
  * `dedupe()` already does for the post-verification pool inside `finalizeReview()`.
  *
@@ -758,7 +754,7 @@ export function coerceShape(f) {
 }
 
 /**
- * D4 / AC-10: the `--fanout` orchestrator's post-synthesis pre-flight (Step f, one repair round).
+ * D4 / AC-10: the post-synthesis shape pre-flight (one repair round).
  * Maps every judgments.json candidate through the REAL `toInlineCommentPayload` -> `renderComment`
  * path — the exact code the posting run itself calls, not a second hand-rolled shape validator —
  * and reports which candidates would fail to render, naming the candidate's index and the FIELD
@@ -1080,13 +1076,9 @@ async function selfTest() {
       typeof both === "string" && both.includes("diff-only") && both.includes("3 prepare-time anomalies"));
     // A/B iteration 2: --no-dispatch renders dispatch-topology.md's line from the budget.
     const noDispatch = buildAutoRunAnomaly({ capApplied: false, contextAnomalies: [], noDispatchAt: 0.8 });
-    check("buildAutoRunAnomaly renders the no-dispatch line with the effective thoroughness",
+    check("the no-dispatch line names the intent finder it could not isolate, with the effective thoroughness",
       typeof noDispatch === "string" && noDispatch.startsWith("no sub-agent dispatch available")
-        && noDispatch.includes("at effective thoroughness 0.8"));
-    const noDispatchHybrid = buildAutoRunAnomaly({ capApplied: false, contextAnomalies: [], noDispatchAt: 0.8, noDispatchTopology: "hybrid" });
-    check("on the default hybrid topology the no-dispatch line names the intent finder it could not isolate",
-      typeof noDispatchHybrid === "string" && noDispatchHybrid.includes("the intent finder ran in-context")
-        && noDispatchHybrid.includes("at effective thoroughness 0.8") && !noDispatchHybrid.includes("parallel topology"));
+        && noDispatch.includes("the intent finder ran in-context") && noDispatch.includes("at effective thoroughness 0.8"));
     // Round 10: a delivered hybrid intent worker (the ledger folded it in) means nothing was lost.
     {
       const j0 = { candidates: [], gates: { gate1: { status: "PASS", details: "x" }, gate4: { precandidate_dispositions: [], ai_stub_findings: [] }, gate5: { status: "PASS", details: "x" } },
@@ -1108,11 +1100,11 @@ async function selfTest() {
       mergeRunAnomaly(undefined, undefined) === undefined);
   }
   {
-    // End to end through finalizeReview: a parallel budget + dispatchUnavailable + a caller-supplied
+    // End to end through finalizeReview: a hybrid budget + dispatchUnavailable + a caller-supplied
     // RUN_ANOMALY all reach the payload, none replacing another.
     const ctx = {
       mode: "full", headSha: "abc1234def", routing: { tier: "deep" }, workspace: { depthCapability: "checkout" },
-      budget: { topology: "parallel", effectiveThoroughness: 0.5 }, dispatchUnavailable: true,
+      budget: { topology: "hybrid", effectiveThoroughness: 0.5 }, dispatchUnavailable: true,
       anomalies: ["reviewer identity unknown (/user 401) — relation defaulted to cross"],
       render: { RUN_ANOMALY: "caller note" },
     };
@@ -1519,7 +1511,7 @@ async function selfTest() {
       && JSON.stringify(Object.keys(r.findingsBusRecords[0]).sort()) === JSON.stringify([...FINDINGS_BUS_FIELDS].sort()));
   }
 
-  // D17: dedupeCandidates() — the --fanout orchestrator's candidate-merge step, operating on
+  // D17: dedupeCandidates() — the pre-verification candidate merge, operating on
   // finders.md's PRE-verification record shape (no prefix, no body — claim/defect_class instead).
   {
     const finderCandidates = [
@@ -1587,7 +1579,7 @@ async function selfTest() {
         && badResult.violations[0].index === 0 && badResult.violations[0].field === "TITLE");
   }
 
-  // --fanout Step f: a verified candidate that STILL fails --check-shape after its one repair
+  // A verified candidate that STILL fails --check-shape after its one repair
   // round is never dropped. finalizeReview() coerces it: a blocking finding posts inline with a
   // renderer-legal truncated title/body (and still FAILs Gate 6); a non-blocking one that cannot
   // render inline lands in the report body's deferred section.
@@ -1997,9 +1989,9 @@ async function main() {
   if (opts["self-test"]) { await selfTest(); return; }
   if (opts["replay-fixtures"]) { await runReplayFixtures(); return; }
 
-  // D4: --check-shape <judgments.json> — the --fanout Step f pre-flight. Exit 0 (ok) or 1, with
-  // {ok, violations} on stdout either way, so the orchestrator can parse the violations to decide
-  // which verifier to re-dispatch for the one repair round.
+  // D4: --check-shape <judgments.json> — the post-synthesis shape pre-flight. Exit 0 (ok) or 1, with
+  // {ok, violations} on stdout either way, so the caller can parse the violations to decide
+  // which candidates to repair in the one repair round.
   if (opts["check-shape"]) {
     const inPath = /** @type {string} */(opts["check-shape"]);
     const judgments = JSON.parse(readFileSync(inPath, "utf8"));
@@ -2008,12 +2000,11 @@ async function main() {
     process.exit(result.ok ? 0 : 1);
   }
 
-  // D17: the --fanout orchestrator's candidate-merge step (skills/quality/pr-review/SKILL.md's
-  // `--fanout` orchestration, step d). Reads a JSON file — a raw array, or {candidates:[...]} —
-  // of finder-stage (pre-verification) candidate records concatenated across the parallel finder
-  // dispatch, and writes {kept, dropped} deduped by dedupeCandidates() above. Standalone: this
-  // branch runs before the --context/--judgments/--out-dir requirement below, because the
-  // orchestrator calls it BEFORE judgments.json exists at all.
+  // D17: the pre-verification candidate merge. Reads a JSON file — a raw array, or {candidates:[...]} —
+  // of finder-stage (pre-verification) candidate records concatenated across the finders (the
+  // hybrid intent worker's included), and writes {kept, dropped} deduped by dedupeCandidates()
+  // above. Standalone: this branch runs before the --context/--judgments/--out-dir requirement
+  // below, because the reviewer calls it BEFORE judgments.json exists at all.
   if (opts["dedupe-candidates"]) {
     const inPath = /** @type {string} */(opts["dedupe-candidates"]);
     const raw = JSON.parse(readFileSync(inPath, "utf8"));
@@ -2042,7 +2033,7 @@ async function main() {
 
   const contextRaw = JSON.parse(readFileSync(/** @type {string} */(opts.context), "utf8"));
   const context = withRenderAt(hydrateFilePatches(contextRaw));
-  // `--no-dispatch`: the reviewer held no sub-agent dispatch tool, so a `parallel` budget ran
+  // `--no-dispatch`: the reviewer held no sub-agent dispatch tool, so a `hybrid` budget ran
   // in-context (rules/dispatch-topology.md § No-dispatch fallback). finalizeReview() renders the
   // prescribed RUN_ANOMALY part from the budget itself.
   if (opts["no-dispatch"]) context.dispatchUnavailable = true;

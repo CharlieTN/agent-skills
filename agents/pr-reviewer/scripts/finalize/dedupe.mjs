@@ -97,8 +97,8 @@ export function markAgreementPromoted(kept) {
 // ── semantic dedupe (plan D5) ───────────────────────────────────────────────────────────────────
 //
 // `dedupe()` above only catches an EXACT (path, line, prefix) match or an adjacent-line match with
-// the same first-40-characters of body. Neither catches the shape the live `/pr-review --fanout`
-// run on dash0hq/dash0#20230 actually produced: the same defect filed FOUR times, once per finder,
+// the same first-40-characters of body. Neither catches the shape a live run with every finder as its
+// own sub-agent on dash0hq/dash0#20230 actually produced: the same defect filed FOUR times, once per finder,
 // each under its own `defect_class` — `edge-case` / `contract-break` / `scope-creep` /
 // `missing-update` — with each finder wording the claim differently. `dedupe()`'s `prefix` equality
 // requirement (pre-verification, `prefix` stands in for `defect_class`) can never catch this: the

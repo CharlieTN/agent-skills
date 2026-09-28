@@ -16,26 +16,26 @@ continuous 0–1 knob and the breakpoints; [`route-depth.mjs`](../scripts/route-
 budget's `topology` field *means in practice* — nothing here hard-codes a tier's topology, because
 there is no longer a fixed per-tier table to hard-code: `resolveBudget()` is what decides.
 
-This is **not** a restatement of [`skills/quality/pr-review/SKILL.md`](../../../skills/quality/pr-review/SKILL.md)'s
-`--fanout` orchestration, which already prescribes its own Steps c/e explicitly for that opt-in flag.
-It governs the *ordinary* single-dispatch review (`/pr-review`, or `Task(subagent_type="pr-reviewer", …)`
-with no `--fanout`) on a harness where that one dispatch can itself still hold `Task` and fan out
-further. The two independently converge on a similar shape because this file's design follows that
-one's precedent by reference, not by copy.
+It governs the single-dispatch review — `/pr-review`, or `Task(subagent_type="pr-reviewer", …)` —
+including the one sub-agent its default budget isolates.
 
 `finders.md` and `finding-verifier.md` stay byte-identical — this file is orchestration, not rubric.
 Neither finder candidates nor verifier verdicts change shape; only *how many dispatches produce them,
 and in what grouping* is prescribed here.
 
-## The three topologies
+## The two topologies
 
-`resolveBudget()` returns one of three values in `budget.topology`:
+`resolveBudget()` returns one of two values in `budget.topology`:
 
 | Topology | When | Sub-agents | Why |
 | --- | --- | --- | --- |
 | `in-context` | `t < 0.4`, or no dispatch capability | none | A quick review is cheaper than one dispatch's base cost. |
 | `hybrid` | **the default at `t ≥ 0.4`** | the intent finder only (`budget.isolatedFinders`) | A/B rounds 7–8 on sync-tray#72: isolated, the intent finder flagged the highest-severity agreed defect in 3 of 3 runs, in 5–6 minutes each; in one context with the other finders, the default setting had missed it in 4 of 4 rounds. |
-| `parallel` | `/pr-review --fanout` only (`resolveBudget({ …, fanout: true })`) | every active finder, sharded per file group; lenses; verifier batches | Round 8, the first real fan-out: every known defect raised, but ~57 minutes projected against 9–13 for one context. Thoroughness alone never selects it. |
+
+There is no third, fully parallel topology.
+In A/B round 8 every finder as its own sub-agent, sharded per file group and followed by batched
+verifier dispatches (the removed `/pr-review --fanout`), raised every known defect but projected to
+~57 minutes against 9–13 for one context; the hybrid split kept the one finder whose isolation paid.
 
 **Running `hybrid`:**
 
@@ -46,12 +46,12 @@ and in what grouping* is prescribed here.
    Where it cannot, dispatch it first and wait: the wait is 5–6 minutes on a 22-file PR, and it is
    what made the default catch the top defect.
 2. Run every other active finder, every lens, and verification in your own context, exactly as
-   `in-context` does — including the orchestrator-as-verifier steps under *Verification* below.
+   `in-context` does — including the self-check under *Verification* below.
 3. Before Step 2.5 consolidation, read the intent finder's output file and add its candidates to
    the pool.
    An intent candidate is verified in your context like any other; it is not trusted because it
    came from a sub-agent.
-4. If the dispatch returned no readable output file, retry it once (the queue rules below).
+4. If the dispatch returned no readable output file, retry it once, and never a third time.
    A second failure is a `RUN_ANOMALY` naming the unit — and the intent finder then runs in-context,
    so the review never loses the finder itself.
 
@@ -86,79 +86,6 @@ lenses in-context → read intent's file → verify every candidate in-context �
 dispatch intent → wait → run the other finders       # serialises what was meant to overlap
 ```
 
-## `PR_REVIEW_MAX_PARALLEL`
-
-The concurrency cap for this pipeline is **6** sub-agent dispatches per message.
-Never put two candidates from the same **code region** in the same verifier dispatch: the same `path`
-and within `REGION_LINES` (40) lines of each other, or naming the same symbol, or either one with no
-line.
-That is the same rule `skills/quality/pr-review/SKILL.md` Step e states for `--fanout`: batching two
-claims about one region together is the shared-summary problem `finders.md`'s independence rule
-forbids at the finder stage, moved one step downstream, and it makes the verifier quieter on each
-claim instead of adversarial on one.
-Two claims 400 lines apart in one file share no code for the verifier to conflate, and the old
-path-only key cost round 8 a floor of 33 batches because one file carried 33 candidates.
-
-## Packing — how units become dispatches
-
-A/B round 2 measured wall-clock and tokens as driven by **sub-agent count**: every dispatch pays a
-base of roughly 110–160k tokens before it reads a line of the diff, and round 2's arms ran 22
-(`t = 0.8`) and 33 (`t = 1.0`) sub-agents.
-[`plan-dispatch.mjs`](../scripts/plan-dispatch.mjs) is the executable form of the grouping below;
-never group by hand.
-
-| Unit | Dispatches | Why |
-| --- | --- | --- |
-| each active finder | one each | A/B round 1: the arm that ran `intent`/`standards`/`quality` in one context missed the best-corroborated bug. |
-| each shard of a per-file finder (`correctness`, `consumer-impact`, `quality`) | one each, over its own packet part | Round 8: every fan-out worker read the whole 6,600-line packet and took 8–14 minutes. |
-| `correctness` votes | **retired — one pass** | Round 8: two votes raised 24 and 25 candidates that dedupe barely merged, at ~10 minutes of one worker each. |
-| holistic broad pass, optimality, measurability | **one lens-bundle dispatch** for whichever of the three are active | The three lenses read the same whole-change context and none reads another's output, so separate contexts buy nothing. |
-| standards-conformance lens | one, never in the bundle | `SKILL.md` Step c: the lens and the `standards` finder are two separate dispatches. |
-| verification | one per batch of at most **`VERIFY_BATCH_MAX` (8)** candidates, no two from one region, at most `VERIFY_CAP` (40) candidates per run | One dispatch per candidate paid the full base for each verdict. |
-
-Plan the verification batches from the deduped candidates, then dispatch one verifier per batch:
-
-```bash
-node agents/pr-reviewer/scripts/plan-dispatch.mjs --verifier-batches <deduped-candidates.json>
-```
-
-It prints each batch's candidate indexes and paths, the messages to send them in, and any overflow.
-It verifies at most `VERIFY_CAP` (40) candidates — twice the 20-comment inline cap — ranked by
-`severity_hint`, then by how many finders raised the candidate, then input order.
-When it reports `overflow`, pass its `anomaly` string through `context.render.RUN_ANOMALY` so the report
-says how many candidates went unverified; `finalize.mjs` merges it with every other anomaly.
-Never verify the overflow in a second pass to get under the cap, and never drop it without the
-anomaly.
-Round 8 kept 118 candidates after dedupe and planned 33 batches in 6 messages, about 32 minutes of
-verification for a report that posts at most 20 comments inline.
-A batched verifier judges each candidate as if it were the only one: it writes one verdict per
-candidate, in the order given, and never lets one candidate's evidence or verdict inform another's.
-The expected count per thoroughness band is
-[`depth-routing.md § Expected sub-agents per band`](./depth-routing.md#expected-sub-agents-per-band).
-
-**Messages, queueing, and no re-dispatch.**
-
-1. A message carries at most `PR_REVIEW_MAX_PARALLEL` (6) dispatches.
-   Units beyond the cap wait in the queue `plan-dispatch.mjs` printed.
-2. Send the next message only after every dispatch in the current one has returned.
-   Phase D (finders, the lens bundle, the standards lens) goes first; Phase E (verifier batches)
-   starts after dedupe, because its input is Phase D's output.
-3. Dispatch each unit exactly once.
-   A unit that returned a readable output path is done and is never re-dispatched.
-4. The only second dispatch of a unit is one retry when it returned no readable output file.
-   A second failure is recorded as a `RUN_ANOMALY` naming the unit, never retried a third time.
-   Step f's one shape-repair round in `SKILL.md` is a separate, already-bounded case.
-
-```text
-# correct: --fanout on a 6,600-line packet — 12 finder shards + 2 lens units at a cap of 6
-message 1: correctness@1..@3, consumer-impact@1..@3   → wait for all 6
-message 2: dependency, intent, standards, quality@1..@3
-message 3: lens-bundle, standards-conformance
-
-# incorrect: 12 dispatches in one message, then re-dispatching the ones the harness queued
-message 1: all 12 → 4 come back late → dispatch those 4 again
-```
-
 ## Reading a budget into dispatch
 
 Bind the budget once, right after `DEPTH_TIER` — `resolveBudget({ thoroughness, routedTier:
@@ -174,57 +101,76 @@ reads it, never re-derives it:
   meaning `pr-reviewer.md`'s Step 2.4d/2.4e scope language already uses.
 - **`budget.correctnessVotes`** — always `1` (votes retired; see *Diversify then vote* below). A
   single pass, with `votes` omitted.
-- **`budget.topology`** — `"in-context"`, `"hybrid"`, or `"parallel"` (see *The three topologies*
-  above). `"hybrid"` dispatches only `budget.isolatedFinders` and runs everything else in the
-  orchestrator's turn; `"parallel"` — reached only through `--fanout` — dispatches every active finder
-  (the per-file ones sharded), in as few messages as the cap allows (see *Packing* above);
-  `"in-context"` dispatches nothing. `budget` already folds `dispatchAvailable` into this field — a
+- **`budget.topology`** — `"in-context"` or `"hybrid"` (see *The two topologies* above).
+  `"hybrid"` dispatches only `budget.isolatedFinders` and runs everything else in the reviewer's own
+  turn; `"in-context"` dispatches nothing. `budget` already folds `dispatchAvailable` into this field — a
   caller never checks `Task` separately.
-- **`budget.maxVerificationTier`** — the ceiling on `verify-behavior`'s Tier 1–3 evidence ladder a
-  verifier dispatch may reach for this run (`finding-verifier.md`'s own per-candidate judgment still
+- **`budget.maxVerificationTier`** — the ceiling on `verify-behavior`'s Tier 1–3 evidence ladder
+  verification may reach for this run (`finding-verifier.md`'s own per-candidate judgment still
   decides whether a given candidate needs it).
 - **`budget.holisticEscalationCap`** — replaces the flat "cap 10" / "cap 3" language at 2.4b with
   `budget.holisticEscalationCap` directly; `2.4b`'s own incremental-mode gate (`ESCALATE_IN_INCREMENTAL`)
   is unchanged and still decides *whether* 2.4b runs at all in incremental mode.
 - **`budget.optimalityLens`** / **`budget.measurabilityLens`** — replace the flat `DEPTH_TIER ==
   "deep"` / `DEPTH_TIER != "quick"` gates at 2.4c/2.4e with these booleans directly.
-  Under `"parallel"`, the active ones and the holistic broad pass (`budget.holisticBroadPass`) run
-  together in **one lens-bundle dispatch** that writes each lens's output separately; the
-  standards-conformance lens is its own dispatch (see *Packing* above).
 
 **`prepare-review.mjs` cannot know whether the agent reading `context.json` holds `Task`**, so the
-`budget` it writes there always assumes `dispatchAvailable: true` and no `--fanout` — so it says
-`hybrid` at `t ≥ 0.4`. The agent re-derives the real value itself:
+`budget` it writes there always assumes `dispatchAvailable: true` — so it says `hybrid` at `t ≥ 0.4`. The agent re-derives the real value itself:
 `topology = <Task held?> ? context.budget.topology : "in-context"`. Every other field
 on `budget` (finders, scope, votes, verifier tier, the two lens booleans, the escalation cap) is
 unaffected by dispatch availability and is read straight off `context.json`.
 
-**Verification dispatch, when `budget.topology == "parallel"`:** one verifier per batch that
-`plan-dispatch.mjs --verifier-batches` planned — at most `VERIFY_BATCH_MAX` (8) candidates, no two
-sharing a `path` — sent at most `PR_REVIEW_MAX_PARALLEL` (6) per message.
-**When `budget.topology` is `"in-context"` or `"hybrid"`:** sequential, in the orchestrator's own turn.
-The orchestrator is then its own verifier, so it takes the same two steps a verifier dispatch does:
-read `comment-spine.mjs --shape-caps` once before writing any candidate's `title`, `body`, or
-`evidence_anchors`, and run `validate-judgments.mjs --shape-only` on its candidates before
-`finalize.mjs`, under the same 2-round bound.
-In A/B rounds 3–5 the in-context arms skipped both and spent up to four validate rounds on
+## Verification — in your own context
+
+Verification runs sequentially in the reviewer's own turn under both topologies.
+You are then your own verifier, so take the two steps a separate verifier would, and record each one:
+
+1. Read the live shape caps once, before writing any candidate's `title`, `body`, or
+   `evidence_anchors`:
+
+   ```bash
+   node agents/pr-reviewer/scripts/comment-spine.mjs --shape-caps
+   ```
+
+   Never write against a remembered 60/200-character limit; the renderer enforces what this prints.
+2. Before `finalize.mjs`, run the shape check on the candidates file you wrote:
+
+   ```bash
+   node agents/pr-reviewer/scripts/validate-judgments.mjs --shape-only <candidates.json>
+   ```
+
+   - Exit 0 with `OK`: continue.
+   - Exit 1: stderr names each violation by candidate index and field. Edit only the named fields,
+     then run it again — at most 2 fix-and-rerun rounds. A third failure goes to `finalize.mjs` as
+     is.
+   - Exit 2 (the check could not run): continue, and name it in `RUN_ANOMALY`.
+   - Never change a verdict, severity, `blocking`, `R`, `A`, or `Ac` to pass the check, and never
+     delete a candidate: the check governs how a finding is written, not whether it is true.
+   - One exception: `"blocking": true` requires severity `high` or `critical`. That is the severity
+     crosswalk, not a shape rule — re-apply it: raise the tier only if the base impact is broken
+     behaviour, security, data loss, or misimplemented intent; otherwise set `blocking` to `false`.
+
+`--shape-only` validates each candidate against `judgments.schema.json`'s `$defs.candidate`, the
+candidate-level domain rules, and `finalize.mjs`'s own `checkShape()`, imported rather than copied;
+it accepts a bare array of candidates or `{ "candidates": [...] }`.
+A candidate still over a cap after the two rounds is not dropped: `finalize.mjs`'s `coerceShape()`
+routes it, so a verified finding is never lost over its shape.
+In A/B rounds 3–5 the in-context arms skipped both steps and spent up to four validate rounds on
 evidence notes over the cap.
 
 **No-dispatch fallback is a degrade, not a silent equivalence — name it.** `resolveBudget()` already
 returns `topology: "in-context"` whenever `dispatchAvailable` is `false`, whatever thoroughness
 requested — it never silently reports a shape it could not run. When that happened on a run whose
-thoroughness would otherwise have crossed the 0.4 breakpoint, set, for the default `hybrid` shape:
+thoroughness would otherwise have crossed the 0.4 breakpoint, set:
 
 ```text
 RUN_ANOMALY: no sub-agent dispatch available — the intent finder ran in-context with the other
 finders at effective thoroughness <t>, instead of as its own sub-agent
 ```
 
-and for `--fanout`'s `parallel` shape, the line naming the parallel topology instead.
-
 Set it by passing **`--no-dispatch`** to `finalize.mjs`, never by hand-writing it.
 `finalize.mjs` renders the line from `context.budget` (only when the budget's topology was `hybrid`
-or `parallel`, with its own effective thoroughness) and merges it with every other anomaly it
+and no intent worker delivered, with its own effective thoroughness) and merges it with every other anomaly it
 computes.
 A value you also supply in `context.render.RUN_ANOMALY` is merged in, never a replacement: in A/B
 iteration 2 every in-context arm hand-wrote this line there, which dropped `prepare-review.mjs`'s
@@ -253,52 +199,21 @@ carries `votes`.
 Round 8 measured the opposite — two votes raised 24 and 25 candidates and dedupe merged few of them
 across the two, so the votes added work for the verifier rather than agreement, at ~10 minutes of
 one worker each.
-Sharding the per-file finders now addresses the uneven-attention problem permuted order was for:
-each shard reads a third of a long packet instead of the tail of all of it.
 Reintroduce votes only with a run that shows them adding **confirmed** recall, and change
 `route-depth.mjs`'s `CORRECTNESS_VOTES` and `depth-routing.md` together.
 
 ## Worker prompts
 
-Every sub-agent this topology dispatches — each finder in Phase D, each verifier in Phase E — gets
-the **same worker preamble** `skills/quality/pr-review/SKILL.md`'s `--fanout` orchestration already
-defines, reused verbatim by reference rather than restated here:
-[`skills/quality/pr-review/SKILL.md § Worker preamble`](../../../skills/quality/pr-review/SKILL.md#worker-preamble--every-dispatch-in-steps-c-e-and-f).
+The intent worker gets the worker preamble, whether you dispatch it yourself or `/pr-review`
+dispatches it alongside you:
+[`skills/quality/pr-review/SKILL.md § Worker preamble`](../../../skills/quality/pr-review/SKILL.md#worker-preamble--the-intent-worker).
 It tells the worker to read only the files it was handed by absolute path, never to read
 `agents/pr-reviewer.md` itself, to read the review packet (`context.packet.path`) before opening any
 workspace file, and to write its JSON output to a path and return only that path — never the payload
 inline.
 
-**A sharded `--fanout` worker names its packet part instead** — `context.packet.parts[k − 1].path`
-for shard `k` (`correctness@2` reads part 2).
-A part keeps the description and the whole file index, and inlines only that shard's files,
-rendered byte-identically to the full packet; those files are the worker's whole scope.
-
-**Every finder, lens, and verifier dispatch names the review packet by absolute path.** It is the
-largest single cut in a worker's turn count: an isolated intent finder on sync-tray#72 spent 21–40
-tool calls and 5–6 minutes, most of them paging a 5,260-line diff and opening files around hunks to
-see context and find a line number to cite — all of which `review-packet.mjs` assembles once,
-before any model turn, with head line numbers on every line.
-
-Every verifier dispatch's prompt additionally carries the live shape caps, pasted verbatim, never
-restated as fixed numbers:
-
-```bash
-node agents/pr-reviewer/scripts/comment-spine.mjs --shape-caps
-```
-
-so `title`, `body`, `evidence[]`, and the fenced-suggestion line cap a verifier writes against are
-checked against the caps the renderer will actually enforce, never a value someone remembered.
-
-Every verifier dispatch's prompt also ends with the **verifier self-check** block, appended after the
-preamble and the shape caps, verbatim and by reference:
-[`skills/quality/pr-review/SKILL.md § Verifier self-check`](../../../skills/quality/pr-review/SKILL.md#verifier-self-check--appended-to-every-verifier-dispatch-in-step-e).
-It tells the verifier to run `validate-judgments.mjs --shape-only` on its own output file before
-returning, fix only the fields the check names, and stop after 2 fix-and-rerun rounds.
-It must never change a verdict, a severity, or `blocking` to pass the check — except the one error
-that is the severity crosswalk rather than a shape rule, which it resolves by re-applying the
-crosswalk.
-The single-dispatch path uses the same block as `--fanout`, for the same reason it uses the same
-preamble: one copy, so a verifier dispatched by either path runs the same check.
-A verifier that returns `SHAPE-UNRESOLVED` changes nothing downstream.
-`finalize.mjs`'s `coerceShape()` still routes the candidate, and never drops it.
+**The dispatch names the review packet by absolute path.** It is the largest single cut in the
+worker's turn count: an isolated intent finder on sync-tray#72 spent 21–40 tool calls and 5–6
+minutes, most of them paging a 5,260-line diff and opening files around hunks to see context and
+find a line number to cite — all of which `review-packet.mjs` assembles once, before any model turn,
+with head line numbers on every line.
