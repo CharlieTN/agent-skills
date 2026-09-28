@@ -49,10 +49,10 @@ export function measure(text) {
  * `INLINE_COMMENTS_JSON` and runs every assertion in `rules/posting.md`, only skipping the final
  * `POST`/`PATCH`; `--isolated` alone only changes Step 0.7's prior-state read. So paths (a), (b),
  * and (c) below all load IDENTICAL bytes — every orchestrator-side run loads `rules/posting.md`.
- * The only path that genuinely never loads it is (d): a `--fanout` worker, which G81's preamble
- * forbids from reading `agents/pr-reviewer.md` at all. This is the honest result the delta asked
+ * The only path that genuinely never loads it is (d): the hybrid intent worker, whose preamble
+ * forbids it from reading `agents/pr-reviewer.md` at all. This is the honest result the delta asked
  * for when it said "if ... a write run still loads ~100%, say so plainly": the real per-run-path
- * win from this split is confined to fan-out workers, not to dry-run/isolated/review-sha.
+ * win from this split is confined to that worker, not to dry-run/isolated/review-sha.
  *
  * Four paths (mirrors the plan's naming, kept even though (a)/(b)/(c) now collapse to one value):
  *   (a) full write run with a prior state   — agent body + posting.md
@@ -60,8 +60,8 @@ export function measure(text) {
  *       prior-state vs first-run branching is prose INSIDE the agent body, not a separate file)
  *   (c) dry-run / --isolated / --review-sha — agent body + posting.md (identical to (a)/(b) — see
  *       "CORRECTED FINDING" above; these flags change what Step 4 DOES, not whether it loads)
- *   (d) fan-out worker role                 — does NOT read agents/pr-reviewer.md at all (the
- *       --fanout worker preamble, G81, forbids it); `agent_bytes` is reported as 0 for this path
+ *   (d) the hybrid intent worker            — does NOT read agents/pr-reviewer.md at all (its
+ *       worker preamble forbids it); `agent_bytes` is reported as 0 for this path
  *       on that basis, not measured against a worker prompt this tool has no access to
  *
  * @param {string} agentText
@@ -88,9 +88,9 @@ export function pathMeasures(agentText, postingText) {
         ...writeRun,
         note: "corrected: these flags skip Step 4's POST/PATCH, not the Step 4 load — identical bytes to (a)/(b)",
       },
-      "d_fanout_worker": {
+      "d_intent_worker": {
         loads: [],
-        note: "worker preamble (G81) forbids reading agents/pr-reviewer.md — not measured here",
+        note: "the intent worker's preamble forbids reading agents/pr-reviewer.md — not measured here",
         raw_bytes: 0, normalized_bytes: 0, words: 0, approx_tokens: 0,
       },
     },
@@ -169,8 +169,8 @@ function selfTest() {
     cBytes === aBytes);
   check("pathMeasures: (a)/(b)/(c) all load strictly more than agent_only alone (posting.md IS loaded)",
     aBytes > pm.agent_only.raw_bytes && cBytes > pm.agent_only.raw_bytes);
-  check("pathMeasures: (d) fan-out worker measures zero agent-body bytes",
-    pm.paths.d_fanout_worker.raw_bytes === 0 && pm.paths.d_fanout_worker.loads.length === 0);
+  check("pathMeasures: (d) the intent worker measures zero agent-body bytes",
+    pm.paths.d_intent_worker.raw_bytes === 0 && pm.paths.d_intent_worker.loads.length === 0);
 
   const failed = cases.filter((c) => !c.pass);
   for (const c of cases) process.stdout.write(`${c.pass ? "ok" : "FAIL"} - ${c.name}\n`);

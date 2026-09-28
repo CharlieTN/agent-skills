@@ -17,7 +17,7 @@
 //   ├─ pr_review.step prepare           pr_review.step.kind=script
 //   ├─ pr_review.step finders           pr_review.step.kind=model
 //   ├─ pr_review.step unmarked          a gap between marked steps
-//   ├─ pr_review.worker intent          a sub-agent this run dispatched (hybrid, --fanout)
+//   ├─ pr_review.worker intent          the hybrid intent worker, folded in by `worker intent import`
 //   └─ …
 //
 // Identity and VCS attributes go on EVERY span, as the plugin does: gen_ai.agent.name,
@@ -151,10 +151,6 @@ export const STEPS = Object.freeze({
   finalize: "script",
   post: "script",
   state: "model",
-  "fanout-finders": "dispatch",
-  dedupe: "script",
-  "fanout-verify": "dispatch",
-  assemble: "model",
 });
 const STEP_NAME_RE = /^[a-z][a-z0-9-]{0,39}$/;
 /** A gap shorter than this between two marked steps is bookkeeping, not an unmarked step. */

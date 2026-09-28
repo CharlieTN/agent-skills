@@ -168,7 +168,7 @@ review-context.json  (prepare-review.mjs)
   + standards.json    (discover-standards.mjs — normative lines with doc:line; TRIVIAL_SKIP in context)
         │
         ▼
-judgments.json        (the model — single-context agent OR /pr-review --fanout)
+judgments.json        (the model — one context, plus the hybrid intent worker's candidates)
         │
         ▼  validate-judgments.mjs (schema SSOT)
         │
@@ -182,18 +182,10 @@ write-result.json     (execute-write-plan.mjs, or the agent executing ops over M
 Each artifact's shape, and the op → MCP tool mapping below, are filled in as
 each phase lands (Phase 2 onward); this section is the index they attach to.
 
-**`/pr-review --fanout`** (default OFF; see
-[`skills/quality/pr-review/SKILL.md`](../../../skills/quality/pr-review/SKILL.md#--fanout--opt-in-parallel-orchestration)
-for the full orchestration) fills in the SAME `judgments.json → finalize.mjs` steps above from
-parallel sub-agent dispatches instead of one single-context pass, with two artifacts this flow
-gains only under `--fanout`:
-
-```
-<scratchRoot()>/<run-id>/{candidates,lenses,verdicts}/…   (one file per finder/lens/verifier dispatch)
-        │  finalize.mjs --dedupe-candidates  (cross-finder merge, BEFORE verification)
-        ▼
-deduped.json → (verified, per candidate) → judgments.json   (same as the diagram above, from here on)
-```
+Under the default `hybrid` topology the intent worker writes its candidates to its own file, which
+this agent reads before Step 2.5 and pools with its own finders' candidates
+([`dispatch-topology.md`](./dispatch-topology.md#the-two-topologies)); from there the flow is the
+diagram above.
 
 `finalize.mjs --dedupe-candidates <file> [--out <file>]` and
 `finalize.mjs --context … --judgments … --out-dir … --writer github|findings-bus [--bus-path <file>] [--dry-run] [--no-dispatch]`

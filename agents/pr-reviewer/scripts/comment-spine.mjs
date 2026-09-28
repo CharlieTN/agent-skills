@@ -501,11 +501,9 @@ export function assertAbsent(where, v, why) {
 
 /**
  * The comment-shape caps, sourced LIVE from the constants above — never restated as bare numbers.
- * (plan D4/AC-9): a `--fanout` run's verifier sub-agents get no chance to read this file's source
- * (the worker preamble forbids it), so this is the one way they learn the real caps rather than a
- * hand-typed `60-char` / `200-char` that drifts the moment `TITLE_MAX`/`PROSE_MAX` change. `--shape-
- * caps` pastes this block VERBATIM into every verifier prompt (`skills/quality/pr-review/SKILL.md
- * § --fanout`, Step e).
+ * (plan D4/AC-9): whoever writes a candidate's title and body — the reviewer verifying in its own
+ * turn — reads the real caps here rather than a hand-typed `60-char` / `200-char` that drifts the
+ * moment `TITLE_MAX`/`PROSE_MAX` change (`rules/dispatch-topology.md § Verification`).
  * @returns {string}
  */
 export function shapeCapsBlock() {

@@ -2046,9 +2046,8 @@ of `verification-receipt.md` (a semantic no-execution check — `tsc`, `go vet`,
 only Tier 1 grep. On these shapes a "plausible" claim is not enough to block a PR, and an executed
 receipt is what turns a checklist hit into a defensible `(blocking)` finding.
 
-Where the verifier runs follows `budget.topology` ([`dispatch-topology.md`](./pr-reviewer/rules/dispatch-topology.md)):
-this turn under `in-context` and `hybrid`, batched sub-agents under `--fanout`'s `parallel`. In this
-turn, reading the rule in the context that produced the candidate is the weaker but acceptable form.
+The verifier runs in this turn under both topologies ([`dispatch-topology.md`](./pr-reviewer/rules/dispatch-topology.md)):
+reading the rule in the context that produced the candidate is the weaker but acceptable form.
 
 ### 2.7 Score the confirmed findings
 
@@ -2399,8 +2398,8 @@ casualty count.
 **Every run reaching Step 3 reaches Step 4** — `--dry-run` (which `--review-sha` requires) still
 builds the payload and runs every assertion: 4a/4b render to scratch, never posted, and 4c/4d are
 not written. `--isolated` skips Step 0.7's prior-state read, forces `full`, and requires
-`--pin-head` unless `--review-sha` is set (`rules/pipeline.md`). A `--fanout` worker never reaches
-Step 4 — posting is the orchestrator's job.
+`--pin-head` unless `--review-sha` is set (`rules/pipeline.md`). The intent worker never reaches
+Step 4 — posting is this agent's job.
 
 **Read [`rules/posting.md`](./pr-reviewer/rules/posting.md) before writing anything in this
 step** — it owns the full procedure below, in order, with every incident narrative and

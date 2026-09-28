@@ -96,8 +96,6 @@ node "$TELEMETRY" finish --status error --message "<why the run stopped>" --run-
 
 A finalize re-run after one that already exported is not added to the trace; the summary line says so.
 
-Under `--fanout`, the orchestrator marks each unit around its message: `worker <unit> start` for every unit before the message, `worker <unit> end` after it returns — one command each side, never one per unit.
-
 ## Exporting to Dash0
 
 Export is opt-in.

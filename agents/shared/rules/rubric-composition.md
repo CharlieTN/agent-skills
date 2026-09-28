@@ -63,14 +63,14 @@ Walk findings in load order. For each new finding, if a prior finding has:
 
 Dedupe runs **before** the per-comment confidence check (`per-comment-confidence.md`) — no point scoring a duplicate.
 
-**`/pr-review --fanout`'s SEMANTIC pass (plan feat/pr-reviewer-shrink-fanout-ab, D5).** The rule
-above requires the SAME Conventional-Comments prefix, which a fan-out run's finders can never
+**The SEMANTIC pass over the pre-verification pool (plan feat/pr-reviewer-shrink-fanout-ab, D5).** The rule
+above requires the SAME Conventional-Comments prefix, which independent finders can never
 satisfy for the same underlying defect: pre-verification, the prefix stand-in is each finder's own
 `defect_class`, and finders name the same issue differently by construction (`edge-case` vs.
 `contract-break` vs. `scope-creep` vs. `missing-update` — the real failure on dash0hq/dash0#20230,
 where one issue posted as four separate findings). `finalize/dedupe.mjs`'s `semanticDedupe()` runs
-as a SECOND pass, after the exact/adjacent pass above, over the `--fanout` orchestrator's
-pre-verification candidate pool only (`dedupeCandidates()`, never `finalizeReview()`'s
+as a SECOND pass, after the exact/adjacent pass above, over a
+pre-verification candidate pool only (`finalize.mjs --dedupe-candidates`) (`dedupeCandidates()`, never `finalizeReview()`'s
 post-verification path): two candidates merge iff same `path`, both `symbol` non-null and equal,
 both `line` within 3 of each other, and a claim-token Jaccard similarity `>= 0.21` (calibrated on
 the real run: true duplicates scored 0.23–0.46, every distinct pair on the same path scored

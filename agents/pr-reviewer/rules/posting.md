@@ -12,8 +12,8 @@ tags:
 
 **Loaded by every run reaching Step 3** — including `--dry-run`/`--isolated`/`--review-sha`, which
 skip only the final `POST`/`PATCH`, not the load (see the agent body's Step 4 router for why). Only
-a `--fanout` worker skips this file, since G81 forbids a worker from reading `agents/pr-reviewer.md`
-at all. Owns 4a–4d verbatim — every incident narrative and access-path branch, unshortened.
+the hybrid intent worker skips this file: it never reaches Step 4, and its preamble forbids it from
+reading `agents/pr-reviewer.md` at all. Owns 4a–4d verbatim — every incident narrative and access-path branch, unshortened.
 
 ---
 
