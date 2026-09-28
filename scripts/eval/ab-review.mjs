@@ -19,10 +19,12 @@
  *     key — never a rationale, a thread count, or any other field). Without `--write`
  *     this is a dry run: nothing on disk changes.
  *
- *   plan --manifest <m> --worktree <abs> --arms A,B --runs 3 --out <dir>
+ *   plan --manifest <m> --worktree <abs> [--worktree-b <abs>] --arms A,B --runs 3 --out <dir>
  *     AC-21. Builds `<dir>/matrix.json` via the pure `buildMatrix()` below: one dispatch
  *     entry per (usable manifest entry) x (arm) x (run), each naming the worktree
- *     definition by ABSOLUTE path, `subagent_type: "general-purpose"` (never the
+ *     definition by ABSOLUTE path — arm A reads `--worktree`, arm B reads `--worktree-b`
+ *     (default: the same worktree), so an A/B compares two revisions of the agent with one
+ *     identical prompt, `subagent_type: "general-purpose"` (never the
  *     installed `pr-reviewer` agent by name — D11's whole point), and the exact flags
  *     `--dry-run --isolated --review-sha <40-hex>`. A manifest entry with no valid
  *     40-hex `review_sha` is skipped by name, never silently dropped. This script never
@@ -172,9 +174,13 @@ async function runPickReviewSha(/** @type {Record<string,string|boolean>} */ opt
  * (no override — each PR routes its own tier default), any other value appends `--thoroughness <n>`
  * to every dispatch in this matrix, uniformly across arms and PRs — one `plan` invocation is one
  * sweep point, run three times (t=0.3, default, 1.0) to draw the recall-vs-wall-clock curve.
- * @param {{ entries: any[], worktree: string, arms: string[], runs: number, thoroughness?: string }} args
+ * Every arm gets the same prompt; only the worktree it reads the agent from differs (`worktreeB`
+ * for arm B, defaulting to `worktree`). The arms used to differ by prompt — arm B ran the
+ * removed `/pr-review --fanout` orchestration — which compared two topologies rather than two
+ * revisions of one reviewer.
+ * @param {{ entries: any[], worktree: string, worktreeB?: string, arms: string[], runs: number, thoroughness?: string }} args
  */
-export function buildMatrix({ entries, worktree, arms, runs, thoroughness }) {
+export function buildMatrix({ entries, worktree, worktreeB, arms, runs, thoroughness }) {
   const usable = entries.filter((e) => /^[0-9a-f]{40}$/.test(e.review_sha || ""));
   const skipped = entries.length - usable.length;
   const thoroughnessFlag = thoroughness && thoroughness !== "default" ? ` --thoroughness ${thoroughness}` : "";
@@ -185,20 +191,16 @@ export function buildMatrix({ entries, worktree, arms, runs, thoroughness }) {
     for (const arm of arms) {
       for (let run = 1; run <= runs; run++) {
         const flags = `--dry-run --isolated --review-sha ${entry.review_sha}${thoroughnessFlag}`;
-        const prompt = arm === "A"
-          ? `Act as the reviewer agent defined at ${worktree}/agents/pr-reviewer.md, read by absolute path. `
-            + `Run as a general-purpose agent — never resolve to the installed reviewer agent by name. `
-            + `Review ${entry.repo}#${entry.number} with flags: ${flags}.`
-          : `Follow ${worktree}/skills/quality/pr-review/SKILL.md section "--fanout", read by absolute path, `
-            + `as the top-level orchestrator. Every worker you dispatch — every finder, lens, verifier, and `
-            + `synthesis step — runs as a general-purpose agent, never the installed reviewer agent by name. `
-            + `Review ${entry.repo}#${entry.number} with flags: ${flags}.`;
+        const armWorktree = arm === "B" && worktreeB ? worktreeB : worktree;
+        const prompt = `Act as the reviewer agent defined at ${armWorktree}/agents/pr-reviewer.md, read by absolute path. `
+          + `Run as a general-purpose agent — never resolve to the installed reviewer agent by name. `
+          + `Review ${entry.repo}#${entry.number} with flags: ${flags}.`;
         dispatches.push({
           pr: { repo: entry.repo, number: entry.number },
           arm,
           run,
           subagent_type: "general-purpose",
-          worktree,
+          worktree: armWorktree,
           flags,
           // The SHA this dispatch's own `--review-sha` flag pins, and the run directory its
           // artifacts land in — `record-meta` reads both to write dispatch-meta.json, so the
@@ -249,13 +251,14 @@ async function runRecordMeta(/** @type {Record<string,string|boolean>} */ opts) 
 async function runPlan(/** @type {Record<string,string|boolean>} */ opts) {
   const manifest = JSON.parse(readFileSync(/** @type {string} */ (opts.manifest), "utf8"));
   const worktree = /** @type {string} */ (opts.worktree);
+  const worktreeB = typeof opts["worktree-b"] === "string" ? opts["worktree-b"] : undefined;
   const arms = String(opts.arms || "A,B").split(",").map((s) => s.trim()).filter(Boolean);
   const runs = Number(opts.runs || 3);
   const outDir = /** @type {string} */ (opts.out);
   if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
 
   const thoroughness = opts.thoroughness !== undefined ? String(opts.thoroughness) : undefined;
-  const { dispatches, skipped } = buildMatrix({ entries: manifest.entries ?? [], worktree, arms, runs, thoroughness });
+  const { dispatches, skipped } = buildMatrix({ entries: manifest.entries ?? [], worktree, worktreeB, arms, runs, thoroughness });
   const matrixPath = join(outDir, "matrix.json");
   writeFileSync(matrixPath, JSON.stringify({ dispatches }, null, 2));
   console.log(
@@ -763,6 +766,13 @@ async function selfTest() {
       dispatches.every((d) => /--dry-run/.test(d.flags) && /--isolated/.test(d.flags) && /--review-sha [0-9a-f]{40}/.test(d.flags)));
     check("buildMatrix never names the installed reviewer agent as a dispatch type (subagent_type ... pr-reviewer)",
       dispatches.every((d) => !/subagent_type\W+pr-reviewer/.test(JSON.stringify(d))));
+    const twoRevs = buildMatrix({ entries, worktree: "/abs/a", worktreeB: "/abs/b", arms: ["A", "B"], runs: 1 }).dispatches;
+    const armA = twoRevs.find((d) => d.arm === "A"), armB = twoRevs.find((d) => d.arm === "B");
+    check("--worktree-b points arm B at a second revision with the same prompt shape as arm A",
+      !!armA && !!armB && armA.prompt.includes("/abs/a/agents/pr-reviewer.md") && armB.prompt.includes("/abs/b/agents/pr-reviewer.md")
+        && armB.worktree === "/abs/b" && armA.prompt.replace("/abs/a", "X") === armB.prompt.replace("/abs/b", "X"));
+    check("no arm's prompt names the removed --fanout orchestration",
+      dispatches.every((d) => !d.prompt.includes("--fanout")));
   }
 
   // buildMatrix thoroughness sweep (A/B round 2/3)
@@ -881,7 +891,7 @@ async function selfTest() {
 function usage() {
   console.error(
     "usage: ab-review.mjs pick-review-sha --manifest <m> [--write]"
-      + " | plan --manifest <m> --worktree <abs> --arms A,B --runs 3 [--thoroughness 0..1|default] --out <dir>"
+      + " | plan --manifest <m> --worktree <abs> [--worktree-b <abs>] --arms A,B --runs 3 [--thoroughness 0..1|default] --out <dir>"
       + " | record-meta --matrix <matrix.json> --index <i> --runs <dir> --tokens <n> --wall-clock-ms <n>"
       + " | shadow-report <dir>"
       + " | score --manifest <m> --runs <dir> --labels <dir> [--out <json>] [--lorekit-out <json>]"
