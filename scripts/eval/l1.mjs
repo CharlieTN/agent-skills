@@ -5287,6 +5287,11 @@ const isPollBlock = (block) =>
     // Shape 3 — an `.includes()` presence check (comment-spine.mjs's `argv.includes("--shape-caps")`,
     // every script's own `--self-test`), which never consumes a following argv slot.
     for (const m of src.matchAll(/\b(?:argv|process\.argv|args)\.includes\("(--[a-z-]+)"\)/g)) boolean.add(m[1]);
+    // Shape 4 — an indexOf lookup whose value is the NEXT slot (validate-judgments.mjs's
+    // `const shapeOnlyIdx = args.indexOf("--shape-only")`, then `args[shapeOnlyIdx + 1]`).
+    for (const m of src.matchAll(/const (\w+) = (?:argv|args)\.indexOf\("(--[a-z-]+)"\);/g)) {
+      if (new RegExp(`\\b(?:argv|args)\\[${m[1]} \\+ 1\\]`).test(src)) takesValue.add(m[2]);
+    }
     return { takesValue, boolean };
   };
 
@@ -5313,6 +5318,7 @@ const isPollBlock = (block) =>
 
         const toks = all.slice(all.indexOf(scriptTok) + 1);
         const positional = [];
+        const flagValues = [];
         const unknownFlags = [];
         const valuelessFlags = [];
         for (let i = 0; i < toks.length; i++) {
@@ -5323,7 +5329,7 @@ const isPollBlock = (block) =>
           if (takesValue.has(t)) {
             const next = toks[i + 1];
             if (!next || next.startsWith("-") || next.startsWith(">")) valuelessFlags.push(t);
-            else i++;
+            else { flagValues.push(next); i++; }
             continue;
           }
           if (!boolean.has(t)) unknownFlags.push(t);
@@ -5340,8 +5346,9 @@ const isPollBlock = (block) =>
         // exits 0 while one argument has silently become another's value.
         s.check(`G43a ${where}: no value-taking flag is written bare (saw: ${valuelessFlags.join(" ") || "none"})`,
           valuelessFlags.length === 0);
+        // `validate-judgments.mjs --shape-only <file>` takes its path as the flag's value.
         s.check(`G43a ${where}: the required input path is passed positionally`,
-          !needsPositional || positional.some((p) => p.replace(/"/g, "").endsWith(".json")));
+          !needsPositional || [...positional, ...flagValues].some((p) => p.replace(/"/g, "").endsWith(".json")));
       }
     }
   }
@@ -5352,7 +5359,7 @@ const isPollBlock = (block) =>
   // ---- G43b: every variable a normative block reads has a binding ----
 
   // Provided by the shell or the environment, never by this pipeline.
-  const SHELL_PROVIDED = new Set(["HOME", "PATH", "ARG", "BASH_REMATCH", "DASH0_EXPOSURE"]);
+  const SHELL_PROVIDED = new Set(["HOME", "PATH", "ARG", "BASH_REMATCH", "DASH0_EXPOSURE", "DASH0_AGENT_ENV"]);
   // Payloads the run constructs in context rather than in shell. Named explicitly so the
   // list stays a decision: anything NOT here must have an assignment that exists.
   const RUN_CONSTRUCTED = new Set([
@@ -9599,7 +9606,7 @@ const isPollBlock = (block) =>
       return next === -1 ? rest : rest.slice(0, next);
     })();
     s.check("G84f the self-check runs validate-judgments.mjs --shape-only before finalize.mjs",
-      /validate-judgments\.mjs" --shape-only <candidates\.json>/.test(selfCheck) && /Before `finalize\.mjs`/.test(selfCheck));
+      /validate-judgments\.mjs" --shape-only \/tmp\/judgments\.json/.test(selfCheck) && /Before `finalize\.mjs`/.test(selfCheck));
     s.check("G84f the self-check is bounded (2 fix-and-rerun rounds) and names what happens after",
       /at most 2 fix-and-rerun rounds/.test(selfCheck) && /A third failure goes to `finalize\.mjs` as\s+is/.test(selfCheck));
     s.check("G84f the self-check forbids changing a verdict/severity/blocking or deleting a candidate to pass",
@@ -9871,10 +9878,13 @@ const isPollBlock = (block) =>
   const pre = (skill.match(/### Worker preamble[\s\S]*?```text\n([\s\S]*?)```/) || ["", ""])[1];
   s.check("G84m the worker preamble tells every worker to read the review packet first",
     /Read the review packet first \(context\.packet\.path\)/.test(pre));
-  const selfCheck = (skill.match(/### Verifier self-check[\s\S]*?```text\n([\s\S]*?)```/) || ["", ""])[1];
-  s.check("G84m the verifier self-check names the severity crosswalk as its one exception",
-    /One named exception: "blocking": true requires severity high or critical/.test(selfCheck)
-      && /Never change verdict, severity, blocking/.test(selfCheck));
+  // The self-check moved from SKILL.md's --fanout section to dispatch-topology.md § Verification
+  // when --fanout was removed; verification now runs in the reviewer's own turn.
+  const dtv = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/rules/dispatch-topology.md"), "utf8");
+  const selfCheck = (dtv.match(/## Verification — in your own context\n([\s\S]*?)\n## /) || ["", ""])[1];
+  s.check("G84m the shape self-check names the severity crosswalk as its one exception",
+    /One exception: `"blocking": true` requires severity `high` or `critical`/.test(selfCheck)
+      && /Never change a verdict, severity, `blocking`/.test(selfCheck));
 }
 
 // ── G84n (A/B round 8 → iteration 5): the default is hybrid, and votes are retired ──

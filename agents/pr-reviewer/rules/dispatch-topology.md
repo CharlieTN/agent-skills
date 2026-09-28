@@ -133,10 +133,10 @@ You are then your own verifier, so take the two steps a separate verifier would,
    ```
 
    Never write against a remembered 60/200-character limit; the renderer enforces what this prints.
-2. Before `finalize.mjs`, run the shape check on the candidates file you wrote:
+2. Before `finalize.mjs`, run the shape check on the judgments file you wrote for it:
 
    ```bash
-   node "$AGENT_SUPPORT/pr-reviewer/scripts/validate-judgments.mjs" --shape-only <candidates.json>
+   node "$AGENT_SUPPORT/pr-reviewer/scripts/validate-judgments.mjs" --shape-only /tmp/judgments.json
    ```
 
    - Exit 0 with `OK`: continue.
