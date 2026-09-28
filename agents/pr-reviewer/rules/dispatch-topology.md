@@ -45,6 +45,9 @@ verifier dispatches (the removed `/pr-review --fanout`), raised every known defe
    so the intent finder runs while you run the other finders.
    Where it cannot, dispatch it first and wait: the wait is 5–6 minutes on a 22-file PR, and it is
    what made the default catch the top defect.
+   On a Dash0 Agent0 Automation, where a dispatch always blocks the turn, run the other finders as
+   a second worker in the same message instead of waiting
+   ([`agent0-runtime.md`](./agent0-runtime.md#phase-d-two-workers-in-one-message-never-expect-a-second-rung)).
 2. Run every other active finder, every lens, and verification in your own context, exactly as
    `in-context` does — including the self-check under *Verification* below.
 3. Before Step 2.5 consolidation, read the intent finder's output file and add its candidates to
