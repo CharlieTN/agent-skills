@@ -38,9 +38,8 @@
 # files instead; this script only has to make the files exist.
 #
 # Requires: networkLevel >= trusted_only (codeload.github.com, github.com).
-# Optional envVars: PIN, REPO, PR_REVIEWER_LOGIN, and for run telemetry
-# PR_REVIEWER_OTLP_ENDPOINT, PR_REVIEWER_OTLP_HEADERS, PR_REVIEWER_TELEMETRY
-# (§ 6 persists those three into env.sh — see rules/run-telemetry.md).
+# Optional envVars: PIN, REPO, PR_REVIEWER_LOGIN. Run-telemetry export settings
+# are never persisted here — see § 6 and rules/run-telemetry.md.
 
 set -uo pipefail
 
@@ -197,18 +196,13 @@ cp "$ROOT/RUN-CONSTRAINTS.md" "$WS/AGENTS.md"
 #    is actually present, and SAY which channels were used, because a run that
 #    reads the wrong one is a run that cannot find the pipeline.
 #
-#    Run telemetry (rules/run-telemetry.md): an automation's envVars reach THIS
-#    script and never the run, so the export settings are written into the same
-#    file, single-quoted, and only when set. review-telemetry.mjs reads them from
-#    it whenever the process has none, so no command has to source it first. The
-#    headers carry a token: the file goes to mode 600 and the value is never
-#    printed.
+#    Run telemetry (rules/run-telemetry.md) is never written to this file: its
+#    headers carry an ingest token, and review-telemetry.mjs reads the export
+#    settings from the run's own environment only. On an Agent0 Automation a
+#    setup script puts them there through $DASH0_AGENT_ENV. An envVar handed to
+#    THIS script reaches no run, so seeing one gets a note — never its value.
 # ---------------------------------------------------------------------------
-# Single-quote a value for a POSIX shell: every ' becomes '\''.
-shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
-
 ENV_FILE="$ROOT/env.sh"
-TELEMETRY_KEYS="PR_REVIEWER_TELEMETRY PR_REVIEWER_OTLP_ENDPOINT PR_REVIEWER_OTLP_HEADERS"
 {
   echo "export PR_REVIEWER_ROOT=$ROOT"
   echo "export PR_REVIEWER_BUNDLE=$BUNDLE"
@@ -217,17 +211,9 @@ TELEMETRY_KEYS="PR_REVIEWER_TELEMETRY PR_REVIEWER_OTLP_ENDPOINT PR_REVIEWER_OTLP
   echo "export AGENT_SUPPORT=$ROOT"
   echo "export PR_REVIEWER_PIN=$PIN"
   echo "export PR_REVIEWER_LOGIN=${PR_REVIEWER_LOGIN:-}"
-  for k in $TELEMETRY_KEYS; do
-    if [ -n "${!k:-}" ]; then echo "export $k=$(shq "${!k}")"; fi
-  done
 } > "$ENV_FILE"
-if [ -n "${PR_REVIEWER_OTLP_HEADERS:-}" ]; then chmod 600 "$ENV_FILE"; fi
-if [ "${PR_REVIEWER_TELEMETRY:-}" = "off" ]; then
-  echo "telemetry: off (PR_REVIEWER_TELEMETRY=off)"
-elif [ -n "${PR_REVIEWER_OTLP_ENDPOINT:-}" ]; then
-  echo "telemetry: export to ${PR_REVIEWER_OTLP_ENDPOINT}, headers $([ -n "${PR_REVIEWER_OTLP_HEADERS:-}" ] && echo "set (not printed)" || echo "none")"
-else
-  echo "telemetry: not exported (no PR_REVIEWER_OTLP_ENDPOINT envVar) — each run still writes its step summary"
+if [ -n "${PR_REVIEWER_OTLP_ENDPOINT:-}${PR_REVIEWER_OTLP_HEADERS:-}${PR_REVIEWER_TELEMETRY:-}" ]; then
+  echo "telemetry: export settings seen here are not written to env.sh — a run exports only when a setup script appended them to \$DASH0_AGENT_ENV (rules/run-telemetry.md)"
 fi
 
 if [ -n "${DASH0_AGENT_ENV:-}" ]; then

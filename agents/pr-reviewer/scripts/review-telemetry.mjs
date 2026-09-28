@@ -41,9 +41,9 @@
 //      its own process telemetry, and a review trace carries repository names, PR URLs and a git
 //      user name that belong in the reviewer's own backend, not the host's.
 //      PR_REVIEWER_TELEMETRY=off wins over everything. The ledger and the summary are written
-//      either way — the breakdown needs no backend. When the process has none of these, `finish`
-//      reads them from the Agent0 installer's env.sh (`withPersistedExport`): an automation's env
-//      vars reach only its setup script, which writes them there.
+//      either way — the breakdown needs no backend. They are read from the process environment
+//      only: on an Agent0 Automation a setup script appends them to $DASH0_AGENT_ENV, and nothing
+//      writes them to a file this script reads (rules/run-telemetry.md § On an Agent0 Automation).
 //   2. A miss is not an error: a step that finds nothing stays status UNSET.
 //   3. An absent attribute is omitted, never a placeholder.
 //   4. Telemetry never fails a review: every CLI command exits 0 (a misuse is a stderr warning),
@@ -199,13 +199,9 @@ export function providerForModel(model) {
   return null;
 }
 
-/** Where the reviewer's Agent0 installer writes the run's variables
- *  (agents/pr-reviewer/scripts/agent0-setup.sh § 6). */
+/** Where the reviewer's Agent0 installer writes the run's paths
+ *  (agents/pr-reviewer/scripts/agent0-setup.sh § 6). Read for host detection only. */
 export const AGENT0_ENV_FILE = "/tmp/workspace/pr-reviewer/env.sh";
-
-/** The export settings that installer persists into AGENT0_ENV_FILE. An Agent0 automation's env
- *  vars reach its setup script and never the run, so the file is the only way they arrive. */
-export const PERSISTED_EXPORT_KEYS = Object.freeze(["PR_REVIEWER_TELEMETRY", "PR_REVIEWER_OTLP_ENDPOINT", "PR_REVIEWER_OTLP_HEADERS"]);
 
 /** @param {NodeJS.ProcessEnv} env @param {(p: string) => boolean} [exists] @returns {string|null} */
 export function detectHarness(env, exists = existsSync) {
@@ -219,98 +215,6 @@ export function detectHarness(env, exists = existsSync) {
   // behaviour switch agent0-host.md owns, so accepting either file changes no behaviour.
   if (exists("/tmp/workspace/agent-skills/env.sh") || exists(AGENT0_ENV_FILE)) return "agent0";
   return null;
-}
-
-/**
- * Read `export KEY=VALUE` assignments for `keys` out of a POSIX shell file, without running it.
- * Understands the quoting agent0-setup.sh writes (single quotes, `'\''` for a quote inside them),
- * plus double quotes and backslash escapes. A later assignment wins, as it does when sourced.
- * @param {string} text @param {readonly string[]} keys @returns {Record<string, string>}
- */
-export function parseEnvFile(text, keys) {
-  const want = new Set(keys);
-  /** @type {Record<string, string>} */
-  const out = {};
-  for (const line of String(text || "").split("\n")) {
-    const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
-    if (m && want.has(m[1])) out[m[1]] = shellWord(m[2]);
-  }
-  return out;
-}
-
-/** The first shell word of `s`, with its quoting removed. @param {string} s @returns {string} */
-function shellWord(s) {
-  let out = "";
-  let i = 0;
-  while (i < s.length) {
-    const c = s[i];
-    if (c === "'") {
-      const end = s.indexOf("'", i + 1);
-      if (end === -1) return out + s.slice(i + 1);
-      out += s.slice(i + 1, end);
-      i = end + 1;
-    } else if (c === '"') {
-      i++;
-      while (i < s.length && s[i] !== '"') {
-        if (s[i] === "\\" && i + 1 < s.length && '"\\$`'.includes(s[i + 1])) { out += s[i + 1]; i += 2; } else { out += s[i]; i++; }
-      }
-      i++;
-    } else if (c === "\\") {
-      if (i + 1 < s.length) out += s[i + 1];
-      i += 2;
-    } else if (c === " " || c === "\t") {
-      return out;
-    } else {
-      out += c;
-      i++;
-    }
-  }
-  return out;
-}
-
-/** The env.sh files to read export settings from, most specific first. @param {NodeJS.ProcessEnv} env */
-export function envFileCandidates(env) {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const list = [
-    env.PR_REVIEWER_ROOT ? join(env.PR_REVIEWER_ROOT, "env.sh") : "",
-    // The installed tree: <root>/pr-reviewer/scripts/ → <root>/env.sh. In a repo checkout this is
-    // agents/env.sh, which does not exist, so it costs one stat.
-    join(here, "..", "..", "env.sh"),
-    AGENT0_ENV_FILE,
-  ];
-  return [...new Set(list.filter(Boolean))];
-}
-
-/** @param {string} p @returns {string|null} */
-function readIfPresent(p) {
-  try { return existsSync(p) ? readFileSync(p, "utf8") : null; } catch { return null; }
-}
-
-/**
- * `env` with the export settings filled in from env.sh where the process has none. A command the
- * model ran without sourcing env.sh — finalize.mjs, execute-write-plan.mjs, `finish` — still exports.
- * The first file that carries any of the keys is used whole. The process always wins, and the
- * endpoint and its headers travel as a pair, so a file's token is never sent to an endpoint the
- * process named.
- * @param {NodeJS.ProcessEnv} env @param {(p: string) => string|null} [read]
- * @param {string[]} [files] @returns {NodeJS.ProcessEnv}
- */
-export function withPersistedExport(env, read = readIfPresent, files = envFileCandidates(env)) {
-  /** @type {Record<string, string>} */
-  let fromFile = {};
-  for (const f of files) {
-    const text = read(f);
-    if (text == null) continue;
-    const vals = parseEnvFile(text, PERSISTED_EXPORT_KEYS);
-    if (Object.keys(vals).length) { fromFile = vals; break; }
-  }
-  const out = { ...env };
-  if (!env.PR_REVIEWER_TELEMETRY && fromFile.PR_REVIEWER_TELEMETRY) out.PR_REVIEWER_TELEMETRY = fromFile.PR_REVIEWER_TELEMETRY;
-  if (!env.PR_REVIEWER_OTLP_ENDPOINT && !env.PR_REVIEWER_OTLP_HEADERS && fromFile.PR_REVIEWER_OTLP_ENDPOINT) {
-    out.PR_REVIEWER_OTLP_ENDPOINT = fromFile.PR_REVIEWER_OTLP_ENDPOINT;
-    if (fromFile.PR_REVIEWER_OTLP_HEADERS) out.PR_REVIEWER_OTLP_HEADERS = fromFile.PR_REVIEWER_OTLP_HEADERS;
-  }
-  return out;
 }
 
 /** @param {NodeJS.ProcessEnv} env @returns {string|null} */
@@ -743,12 +647,11 @@ export function renderSummary(s) {
 
 /**
  * Close the run and export it. Idempotent: a run already exported is not exported twice unless
- * `force`. Never throws. With no `env`, the process environment plus the export settings persisted
- * in env.sh (`withPersistedExport`); an `env` passed explicitly is used exactly as given.
+ * `force`. Never throws.
  * @param {string} runDir @param {{ status?: string, message?: string, attrs?: Record<string, any>,
  *   force?: boolean }} [opts] @param {NodeJS.ProcessEnv} [env]
  */
-export async function finishRun(runDir, opts = {}, env = withPersistedExport(process.env)) {
+export async function finishRun(runDir, opts = {}, env = process.env) {
   try {
     const summaryPath = join(runDir, SUMMARY_FILE);
     if (!opts.force && existsSync(summaryPath)) {
@@ -1122,38 +1025,11 @@ async function selfTest() {
   ok("PR_REVIEWER_OTLP_ENDPOINT wins over the host's OTEL_EXPORTER_OTLP_ENDPOINT",
     exportTarget({ PR_REVIEWER_TELEMETRY: "on", PR_REVIEWER_OTLP_ENDPOINT: "https://mine", OTEL_EXPORTER_OTLP_ENDPOINT: "https://host" }).endpoint === "https://mine");
 
-  // Agent0 host detection and the env.sh fallback (the reviewer-only installer writes only
-  // AGENT0_ENV_FILE, and an automation's env vars reach the run only through it).
+  // Agent0 host detection (the reviewer-only installer writes only AGENT0_ENV_FILE).
   ok("detectHarness: the reviewer-only Agent0 install (pr-reviewer/env.sh) is agent0",
     detectHarness({}, (p) => p === AGENT0_ENV_FILE) === "agent0"
       && detectHarness({}, (p) => p === "/tmp/workspace/agent-skills/env.sh") === "agent0"
       && detectHarness({}, () => false) === null);
-  const envSh = [
-    "export PR_REVIEWER_ROOT=/tmp/workspace/pr-reviewer",
-    "export PR_REVIEWER_OTLP_ENDPOINT='https://ingress.example.com'",
-    "export PR_REVIEWER_OTLP_HEADERS='Authorization=Bearer a'\\''b $x `y`,Dash0-Dataset=default'",
-    'export PR_REVIEWER_TELEMETRY="o\\"n"  # a comment',
-  ].join("\n");
-  const parsedEnv = parseEnvFile(envSh, PERSISTED_EXPORT_KEYS);
-  ok("parseEnvFile: reads the installer's single-quoted form, '\\'' included, and nothing else",
-    parsedEnv.PR_REVIEWER_OTLP_HEADERS === "Authorization=Bearer a'b $x `y`,Dash0-Dataset=default"
-      && parsedEnv.PR_REVIEWER_OTLP_ENDPOINT === "https://ingress.example.com"
-      && parsedEnv.PR_REVIEWER_TELEMETRY === 'o"n' && !("PR_REVIEWER_ROOT" in parsedEnv), JSON.stringify(parsedEnv));
-  const files = (/** @type {Record<string, string>} */ map) => (/** @type {string} */ p) => (p in map ? map[p] : null);
-  const fromFile = withPersistedExport({}, files({ "/b/env.sh": envSh }), ["/a/env.sh", "/b/env.sh"]);
-  ok("withPersistedExport: an empty process takes the endpoint and headers from env.sh",
-    fromFile.PR_REVIEWER_OTLP_ENDPOINT === "https://ingress.example.com" && /Bearer a'b/.test(String(fromFile.PR_REVIEWER_OTLP_HEADERS)));
-  const mine = withPersistedExport({ PR_REVIEWER_OTLP_ENDPOINT: "https://mine" }, files({ "/b/env.sh": envSh }), ["/b/env.sh"]);
-  ok("withPersistedExport: the process wins, and a file's headers never go to the process's endpoint",
-    mine.PR_REVIEWER_OTLP_ENDPOINT === "https://mine" && mine.PR_REVIEWER_OTLP_HEADERS === undefined);
-  ok("withPersistedExport: PR_REVIEWER_TELEMETRY=off from env.sh turns export off",
-    exportTarget(withPersistedExport({}, files({ "/b/env.sh": "export PR_REVIEWER_TELEMETRY=off\nexport PR_REVIEWER_OTLP_ENDPOINT=https://x" }), ["/b/env.sh"])).endpoint === "");
-  ok("withPersistedExport: no env.sh, or one without the keys, changes nothing",
-    withPersistedExport({}, files({ "/a/env.sh": "export PR_REVIEWER_LOGIN=bot" }), ["/a/env.sh", "/missing"]).PR_REVIEWER_OTLP_ENDPOINT === undefined);
-  ok("envFileCandidates: PR_REVIEWER_ROOT first, then the installed tree, then the Agent0 path, deduplicated",
-    envFileCandidates({ PR_REVIEWER_ROOT: "/r" })[0] === join("/r", "env.sh") && envFileCandidates({}).at(-1) === AGENT0_ENV_FILE
-      && new Set(envFileCandidates({ PR_REVIEWER_ROOT: "/tmp/workspace/pr-reviewer" })).size === envFileCandidates({ PR_REVIEWER_ROOT: "/tmp/workspace/pr-reviewer" }).length);
-
   // The ledger on disk, end to end through a real OTLP receiver.
   const dir = mkdtempSync(join(tmpdir(), "review-telemetry-"));
   /** @type {Array<{ path: string, body: any }>} */
@@ -1217,25 +1093,6 @@ async function selfTest() {
     ok("CLI: begin → step → finish writes a summary with the marked step", r2.status === 0
       && cliSummary.steps.some((/** @type {any} */ s) => s.name === "finders" && s.marked === true));
 
-    // CLI: `finish` in a process with no export variables exports from env.sh alone — the Agent0
-    // case, where the automation's env vars reached only the setup script that wrote the file.
-    const agentRoot = join(dir, "agent0-root");
-    mkdirSync(agentRoot, { recursive: true });
-    writeFileSync(join(agentRoot, "env.sh"), `export PR_REVIEWER_OTLP_ENDPOINT='http://127.0.0.1:${port}'\nexport PR_REVIEWER_OTLP_HEADERS='Dash0-Dataset=default'\n`);
-    /** @type {NodeJS.ProcessEnv} */
-    const bare = { ...process.env, PR_REVIEWER_ROOT: agentRoot };
-    for (const k of [...PERSISTED_EXPORT_KEYS, "OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_HEADERS"]) delete bare[k];
-    const envDir = join(dir, "from-env-sh");
-    spawnSync(process.execPath, [self, "begin", "--run-dir", envDir, "--repo", "o/r", "--pr", "4"], { encoding: "utf8", env: bare });
-    const sentBefore = received.length;
-    // Asynchronous on purpose: the receiver runs in THIS process, and spawnSync would block the
-    // event loop that has to answer the child's export.
-    const { execFile } = await import("node:child_process");
-    /** @type {{ status: number, stderr: string }} */
-    const r3 = await new Promise((resolve) => execFile(process.execPath, [self, "finish", "--run-dir", envDir], { encoding: "utf8", env: bare },
-      (err, _stdout, stderr) => resolve({ status: err ? Number(/** @type {any} */ (err).code ?? 1) : 0, stderr: String(stderr) })));
-    ok("CLI: finish with no export variables in the process exports from env.sh",
-      r3.status === 0 && JSON.parse(readFileSync(join(envDir, SUMMARY_FILE), "utf8")).exported === true && received.length > sentBefore, r3.stderr);
     const workerDir = join(dir, "intent");
     mkdirSync(workerDir, { recursive: true });
     const doneAt = Date.now() - 5000;

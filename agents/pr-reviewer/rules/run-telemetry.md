@@ -111,16 +111,20 @@ PR_REVIEWER_OTLP_HEADERS=Authorization=Bearer <token>,Dash0-Dataset=default
 
 ### On an Agent0 Automation
 
-Set the same variables as the automation's `sandbox.envVars`.
-They reach the setup script and never the run, so [`agent0-setup.sh`](../scripts/agent0-setup.sh) writes `PR_REVIEWER_OTLP_ENDPOINT`, `PR_REVIEWER_OTLP_HEADERS` and `PR_REVIEWER_TELEMETRY` into `/tmp/workspace/pr-reviewer/env.sh`, single-quoted, and only when set.
-When the headers are written the file becomes mode 600, and the installer never prints their value.
-`review-telemetry.mjs` reads the three from `env.sh` whenever the process has none of them, so `finalize.mjs`, `execute-write-plan.mjs` and `finish` export even when the command did not source the file.
-The process always wins, and an endpoint and its headers are taken together, never one from each.
+An automation's `sandbox.envVars` reach its setup script and never the run, and the installer does not copy them anywhere: the export headers carry a token, and `review-telemetry.mjs` reads the settings from the run's own environment only.
+Export them to the run from a setup script, through `$DASH0_AGENT_ENV`, in the `export` form the repo's own installers append there — `%q`-quoted, because the headers hold a space:
 
-1. The setup script's text is the install cache key, so edit it (its `REF` line) after changing the variables, or the old `env.sh` stays.
-2. `envVars` are stored in plain text in the automation's definition, readable by anyone who can read the automation.
-   Use an ingest-only token limited to one dataset.
-3. The host must reach the endpoint: a `trusted_only` sandbox reaches only allowlisted hosts.
+```bash
+# In the automation's (or the organization's global) setup script:
+if [ -n "${DASH0_AGENT_ENV:-}" ]; then
+  printf 'export PR_REVIEWER_OTLP_ENDPOINT=%q\n' "https://ingress.eu-west-1.aws.dash0.com" >> "$DASH0_AGENT_ENV"
+  printf 'export PR_REVIEWER_OTLP_HEADERS=%q\n' "Authorization=Bearer <ingest-only token>,Dash0-Dataset=default" >> "$DASH0_AGENT_ENV"
+fi
+```
+
+1. Use an ingest-only token limited to one dataset: the value is visible to the run, and to anyone who can read the setup script.
+2. The host must reach the endpoint: a `trusted_only` sandbox reaches only allowlisted hosts.
+3. When the installer sees these variables in its own environment it prints a note that it did not write them, never their values.
 
 The harness is named `agent0` when either `/tmp/workspace/agent-skills/env.sh` or `/tmp/workspace/pr-reviewer/env.sh` exists; an automation that installs only the reviewer writes the second.
 
