@@ -9177,83 +9177,15 @@ const isPollBlock = (block) =>
   }
 }
 
-// ── G66: pr-reviewer deterministic pipeline, Phase 6 (--fanout) ──
-//
-// D17/AC-17/R9: skills/quality/pr-review/SKILL.md's --fanout orchestration is opt-in and
-// documents the contract that keeps it safe to dispatch — default OFF, a quick-tier route that
-// skips the fan-out, a capability test for sub-agent dispatch that never checks the literal tool
-// name `Task`, a stated concurrency cap, and a fallback (not a silent skip) when no dispatch tool
-// is available. Reproduced here as a standing guard, independent of checks.yaml's own AC-17
-// command, for the same reason G64c/G65a-b/G65e are: the check definition is
-// executor-immutable, but a standing L1 guard catches drift the moment the file changes, without
-// waiting for a Phase-4 checks.yaml run.
+// ── G66: --fanout is removed ──
+// G66a–k guarded `/pr-review --fanout`, the opt-in parallel orchestration (every finder, lens,
+// and verifier batch its own sub-agent). A/B round 8 measured it at ~57 minutes against 9–13 for
+// one context, and the hybrid default kept the one isolation that paid — the intent finder. G66j
+// held four caller skills byte-unchanged vs. main, a property of #205's own diff rather than a
+// standing invariant (#210 retired it). What stands: G66i — `finalize.mjs --dedupe-candidates`
+// stays a documented CLI subcommand — and G66r, which fails the moment any piece of the parallel
+// path comes back without a guard of its own.
 {
-  const SKILL_PATH = join(REPO_ROOT, "skills/quality/pr-review/SKILL.md");
-  s.check("G66a skills/quality/pr-review/SKILL.md exists", existsSync(SKILL_PATH));
-  if (existsSync(SKILL_PATH)) {
-    const text = readFileSync(SKILL_PATH, "utf8");
-    const fanoutSection = (() => {
-      const start = text.indexOf("## `--fanout`");
-      if (start === -1) return "";
-      const rest = text.slice(start);
-      const next = rest.indexOf("\n## ", 1);
-      return next === -1 ? rest : rest.slice(0, next);
-    })();
-
-    s.check("G66a a `## `--fanout`` section exists", fanoutSection.length > 0);
-    s.check("G66a --fanout is named in the frontmatter argument-hint",
-      /argument-hint:.*--fanout/.test(text));
-
-    // Default OFF: stated explicitly, not merely inferable from the flag's absence elsewhere.
-    s.check("G66b --fanout is documented as default OFF / opt-in",
-      /\*\*Default OFF\*\*/.test(fanoutSection) || /default\s+off/i.test(fanoutSection));
-
-    // Quick-tier skip: keyed on the SAME field route-depth.mjs/prepare-review.mjs actually
-    // produce (context.routing.tier), not a re-described concept with no wire to the real field.
-    s.check("G66c the quick-tier skip reads context.routing.tier and names the `quick` tier",
-      /context\.routing\.tier/.test(fanoutSection) && /`quick`/.test(fanoutSection)
-      && /skip/i.test(fanoutSection));
-
-    // Capability test, never a literal `Task` name check — the exact F6 anti-pattern this repo
-    // already removed from `aw`'s own dispatch-availability check (autonomous-workflow CLAUDE.md
-    // v3.25). Assert the disclaiming sentence survives, not just that "Task" appears somewhere.
-    s.check("G66d the capability test explicitly rejects a literal-name (`Task`-only) check",
-      /never\*\*\s*by checking for the literal tool name\s*`Task`/i.test(fanoutSection));
-    s.check("G66d both harness spellings (`Task` and `Agent`) are named",
-      /\bTask\b/.test(fanoutSection) && /\bAgent\b/.test(fanoutSection));
-
-    // Concurrency cap: the named constant AND its stated default, not just the bare word
-    // "concurrency".
-    s.check("G66e PR_REVIEW_MAX_PARALLEL is named with its default of 6",
-      /PR_REVIEW_MAX_PARALLEL/.test(fanoutSection) && /default\s*6\b/i.test(fanoutSection));
-
-    // Fallback, not a skip: the no-dispatch-capability branch must say it FALLS BACK to the
-    // single dispatch and runs it, never that it skips — the same distinction that keeps a
-    // caller from mistaking "ran the cheaper path" for "did not review at all".
-    s.check("G66f the no-dispatch-capability branch is a documented fallback, not a skip",
-      /fallback, not a skip/i.test(fanoutSection));
-    s.check("G66f the fallback states the exact terminal-report sentence a caller reads",
-      /--fanout` requested but no sub-agent dispatch tool is available — ran the single-dispatch `pr-reviewer` review instead/.test(fanoutSection));
-
-    // The default-flip gate from D1 — the numeric bar itself, not just a promise that one
-    // exists, so a later edit cannot silently soften it.
-    s.check("G66g the D1 default-flip gate states recall >= arm A and precision >= arm A - 0.05 at N>=3 over >=8 PRs",
-      /recall/i.test(fanoutSection) && /0\.05/.test(fanoutSection)
-      && /N\s*(≥|>=)\s*3/.test(fanoutSection) && /8/.test(fanoutSection));
-
-    // The six finder names AC-17 requires, reproduced as a standing guard (same rationale as
-    // G65e's manifest-allowlist reproduction). Pinned to the literal one-line finder list, not a
-    // loose "does this word appear anywhere" scan — several of these six are common enough
-    // English words ("quality", "intent", "standards") to appear elsewhere in the section's own
-    // prose even after the actual finder list is edited, which would leave this check unable to
-    // fail on exactly the regression it exists to catch.
-    s.check("G66h finders.md's own six-finder list is named verbatim, in table order",
-      fanoutSection.includes("correctness · consumer-impact · dependency · intent · standards · quality"));
-  }
-
-  // Second witness (independent of finalize.mjs's own --self-test) that the CLI subcommand the
-  // --fanout orchestration's Step d invokes really exists — same pattern as G63c re-deriving
-  // findings-bus.mjs's field set from findings-bus.md rather than trusting the self-test alone.
   const FINALIZE_PATH = join(REPO_ROOT, "agents/pr-reviewer/scripts/finalize.mjs");
   if (existsSync(FINALIZE_PATH)) {
     const finSrc = readFileSync(FINALIZE_PATH, "utf8");
@@ -9262,132 +9194,79 @@ const isPollBlock = (block) =>
     s.check("G66i finalize.mjs's usage string documents --dedupe-candidates", /--dedupe-candidates/.test(finSrc.match(/function usage\(\)[\s\S]*?\n\}/)?.[0] || ""));
   }
 
-  // AC-18, reproduced as a standing guard for the same reason G63d reproduces AC-12: a later
-  // phase editing one of these four caller skills would otherwise only be caught by a
-  // Phase-6-specific checks.yaml run, not by every L1 pass in between.
-  {
-    const AC18_PATHS = [
-      "skills/quality/review-loop", "skills/delivery/create-pr",
-      "skills/quality/polish", "skills/quality/review-changes",
-    ];
-    // Compared against the MERGE-BASE, not origin/main's tip: the property is "this branch did not
-    // edit these skills", and main moving on (#212 edited review-loop on 2026-09-26) is not this
-    // branch's edit. G82 keys its base the same way for the same reason.
-    const mb = spawnSync("git", ["merge-base", "HEAD", "origin/main"], { cwd: REPO_ROOT, encoding: "utf8" });
-    const base = mb.status === 0 ? (mb.stdout || "").trim() : "origin/main";
-    const r = spawnSync("git", ["diff", "--quiet", base, "HEAD", "--", ...AC18_PATHS], { cwd: REPO_ROOT, encoding: "utf8" });
-    s.check("G66j AC-18's caller skills (review-loop/create-pr/polish/review-changes) are byte-unchanged vs. the merge-base with origin/main",
-      r.status === 0, r.status === null ? "git not found" : `git diff ${base.slice(0, 7)} HEAD exit ${r.status}`);
-  }
-
-  // The offline proof of the --fanout glue chain (D17): a raw finder-candidate fixture through
-  // finalize.mjs --dedupe-candidates, a mocked verifier pass, an assembled judgments.json,
-  // validate-judgments.mjs, and finalize.mjs itself — self-tested exactly like every other new
-  // script in this pipeline, so it cannot silently rot unexecuted between the day it was added
-  // and the day someone next reads it.
-  {
-    const GLUE = join(REPO_ROOT, "scripts/eval/fanout-glue.mjs");
-    s.check("G66k scripts/eval/fanout-glue.mjs exists", existsSync(GLUE));
-    if (existsSync(GLUE)) {
-      s.check("G66k fanout-glue.mjs is // @ts-check", /^\/\/ @ts-check/m.test(readFileSync(GLUE, "utf8").split("\n").slice(0, 3).join("\n")));
-      const r = spawnSync(process.execPath, [GLUE, "--self-test"], { encoding: "utf8" });
-      s.check("G66k fanout-glue.mjs --self-test passes (dedupe -> mock-verify -> validate -> finalize, both writers)",
-        r.status === 0, (r.stdout || "").trim().split("\n").slice(-4).join(" | ") || r.stderr?.slice(0, 300));
-    }
-    const TS = join(REPO_ROOT, "agents/pr-reviewer/scripts/tsconfig.json");
-    if (existsSync(TS)) {
-      s.check("G66k tsconfig.json's files[] lists fanout-glue.mjs",
-        readFileSync(TS, "utf8").includes("fanout-glue.mjs"));
-    }
-  }
+  const readIf = (/** @type {string} */ rel) => {
+    const p = join(REPO_ROOT, rel);
+    return existsSync(p) ? readFileSync(p, "utf8") : "";
+  };
+  const skillText = readIf("skills/quality/pr-review/SKILL.md");
+  s.check("G66r pr-review SKILL.md documents no --fanout flag or section", skillText !== "" && !skillText.includes("--fanout"),
+    (skillText.split("\n").find((l) => l.includes("--fanout")) || "").trim().slice(0, 120));
+  const rdSrc = readIf("agents/pr-reviewer/scripts/route-depth.mjs");
+  s.check("G66r route-depth.mjs's resolveBudget returns no parallel topology and reads no fanout input",
+    rdSrc !== "" && !/topology\s*===?\s*"parallel"|:\s*"parallel"|\bi\.fanout\b/.test(rdSrc));
+  const topo = readIf("agents/pr-reviewer/rules/dispatch-topology.md");
+  s.check("G66r dispatch-topology.md names two topologies and has no parallel row",
+    /^## The two topologies$/m.test(topo) && !/^\| `parallel` \|/m.test(topo));
+  const gone = ["agents/pr-reviewer/scripts/plan-dispatch.mjs", "scripts/eval/fanout-glue.mjs"]
+    .filter((rel) => existsSync(join(REPO_ROOT, rel)));
+  const ts = readIf("agents/pr-reviewer/scripts/tsconfig.json");
+  s.check("G66r plan-dispatch.mjs and fanout-glue.mjs are gone, and tsconfig.json lists neither",
+    gone.length === 0 && !/plan-dispatch\.mjs|fanout-glue\.mjs/.test(ts), gone.join(", "));
+  const prep = readIf("agents/pr-reviewer/scripts/prepare-review.mjs");
+  s.check("G66r prepare-review.mjs writes no sharded packet parts",
+    prep !== "" && !/review-packet\.part-|buildPacketParts/.test(prep));
 }
 
-// ── G81: --fanout worker discipline + shape/dedupe/check-shape text
-// (plan feat/pr-reviewer-shrink-fanout-ab, D4/D5/D6/D8, AC-7/AC-9/AC-25) ──
-// G66 above already guards the --fanout section's baseline contract from #205 (default-off,
-// quick-tier skip, capability test, concurrency cap, six-finder list). This block guards the
-// additions layered on top of it in this plan: a worker preamble that keeps every dispatched
-// sub-agent from re-reading the ~245 KB agents/pr-reviewer.md, the second (semantic) dedupe pass
-// wired to the verifier as context, the live shape caps pasted rather than restated as fixed
-// numbers, a --check-shape pre-flight with a one-repair-round contract, the optimality lens's
-// no-heading instruction, and the two arm-C deviations (path-batched verification, a folded
-// standards lens/finder) named and reversed in the text — reproduced here as a standing guard for
-// the same reason G66 reproduces checks.yaml's AC-17: the check definition is executor-immutable,
-// but a standing L1 guard catches drift the moment the file changes.
+// ── G81: the intent worker's discipline, and verification's shape contract
+// (plan feat/pr-reviewer-shrink-fanout-ab, D4/D8, AC-7/AC-9; re-scoped when --fanout was removed) ──
+// G81 guarded the --fanout section's worker preamble and its shape/dedupe steps. The preamble
+// survives for the one sub-agent the hybrid default dispatches — the intent worker — and the shape
+// steps moved to dispatch-topology.md § Verification, where the reviewer, verifying in its own
+// turn, is its own verifier. The --fanout-only checks (semantic dedupe handed to Step e, the
+// optimality lens's card_body, the arm-C batching deviations) retired with the orchestration.
 {
   const SKILL_PATH = join(REPO_ROOT, "skills/quality/pr-review/SKILL.md");
   if (existsSync(SKILL_PATH)) {
     const text = readFileSync(SKILL_PATH, "utf8");
-    const fanoutSection = (() => {
-      const start = text.indexOf("## `--fanout`");
+    const preamble = (() => {
+      const start = text.indexOf("### Worker preamble — the intent worker");
       if (start === -1) return "";
       const rest = text.slice(start);
+      const next = rest.indexOf("\n### ", 1);
+      return next === -1 ? rest : rest.slice(0, next);
+    })();
+    s.check("G81 SKILL.md has a `### Worker preamble — the intent worker` section", preamble.length > 0);
+    s.check("G81 the preamble requires absolute paths", /ABSOLUTE path/.test(preamble));
+    s.check("G81 the preamble forbids reading agents/pr-reviewer.md", /Do NOT read agents\/pr-reviewer\.md/.test(preamble));
+    s.check("G81 the preamble forbids Skill() calls inside the worker", /Do NOT call Skill\(\)/.test(preamble));
+    s.check("G81 the preamble requires write-to-path/return-path-only", /Return ONLY that path/.test(preamble));
+    s.check("G81 Step 2's worker dispatch links the preamble section",
+      text.includes("[worker preamble](#worker-preamble--the-intent-worker)"));
+    // D8: the worker reviews the same historical commit the reviewer does.
+    s.check("G81 the intent worker carries --review-sha through when the flags do",
+      /add\s+`--review-sha <sha> --isolated` when the pass-through flags carry `--review-sha`/.test(text));
+  }
+
+  const TOPO = join(REPO_ROOT, "agents/pr-reviewer/rules/dispatch-topology.md");
+  if (existsSync(TOPO)) {
+    const topo = readFileSync(TOPO, "utf8");
+    const verification = (() => {
+      const start = topo.indexOf("## Verification — in your own context");
+      if (start === -1) return "";
+      const rest = topo.slice(start);
       const next = rest.indexOf("\n## ", 1);
       return next === -1 ? rest : rest.slice(0, next);
     })();
-    s.check("G81 a `## `--fanout`` section exists", fanoutSection.length > 0);
-
-    // AC-7's worker preamble, reproduced as a standing guard.
-    s.check("G81 a worker preamble is documented",
-      /worker preamble/i.test(fanoutSection));
-    s.check("G81 the preamble requires absolute paths",
-      /absolute path/i.test(fanoutSection));
-    s.check("G81 the preamble forbids reading agents/pr-reviewer.md",
-      fanoutSection.includes("agents/pr-reviewer.md") && /do not read agents\/pr-reviewer\.md/i.test(fanoutSection));
-    s.check("G81 the preamble forbids Skill() calls inside a worker",
-      fanoutSection.includes("Skill()"));
-    s.check("G81 the preamble requires write-to-path/return-path-only",
-      /return.*path/i.test(fanoutSection));
-
-    // D5: the semantic dedupe pass is documented, and its _semantic_merged members are an audit
-    // record only — withheld from the verifier and never counted as agreement (rubric-composition.md
-    // ## Dedupe; finding-verifier.md's exclusion of other candidates).
-    s.check("G81 the semantic dedupe pass is documented and _semantic_merged is withheld from the verifier",
-      /semantic/i.test(fanoutSection) && fanoutSection.includes("_semantic_merged")
-        && /never handed to the Step e\s+verifier and never counted as agreement/.test(fanoutSection)
-        && !/_semantic_merged` array as corroboration context/.test(fanoutSection));
-
-    // AC-9's shape-caps paste, reproduced: the live command is present and no hard-coded
-    // 60-char/200-char restatement has crept back in.
-    s.check("G81 verifiers are told to paste the live --shape-caps output",
-      fanoutSection.includes("--shape-caps"));
-    s.check("G81 no hard-coded 60-char/200-char cap restatement",
-      !/(60|200)[- ]char/.test(fanoutSection));
-
-    // D4: the --check-shape pre-flight with its one-repair-round contract. Scoped to Step f's own
-    // subsection — `validate-judgments.mjs` is also named in Step d's `_also_flagged_by` aside, so
-    // comparing indices across the whole section would key on the wrong occurrence.
-    const stepFIdx = fanoutSection.indexOf("### Step f");
-    const stepFSection = stepFIdx === -1 ? "" : fanoutSection.slice(stepFIdx);
-    s.check("G81 the assembly step runs --check-shape before validate-judgments",
-      stepFSection.includes("--check-shape")
-      && stepFSection.includes("node agents/pr-reviewer/scripts/validate-judgments.mjs")
-      && stepFSection.indexOf("--check-shape") < stepFSection.indexOf("node agents/pr-reviewer/scripts/validate-judgments.mjs"));
-    s.check("G81 --check-shape failures get exactly one repair round, not an unbounded loop",
-      /one repair round/i.test(fanoutSection));
-    // A candidate still failing shape after that round is routed by finalize.mjs, never dropped —
-    // a verified blocker must not vanish over a title length.
-    s.check("G81 a still-shape-failing candidate is never dropped (routed by finalize.mjs coerceShape)",
-      /never\s+dropped/i.test(fanoutSection) && fanoutSection.includes("coerceShape()")
-        && !/is dropped\s+the same way a `contradicted` candidate is/.test(fanoutSection));
-
-    // D6: the optimality lens's card_body carries no heading.
-    s.check("G81 the optimality lens instruction states card_body carries no heading",
-      fanoutSection.includes("card_body") && /carries no heading/i.test(fanoutSection));
-
-    // Arm C's two named deviations, reversed in the text: verification batched by path, and the
-    // standards lens folded into the standards finder.
-    // A/B round 8 re-keyed the rule from path to CODE REGION (same path within REGION_LINES, or the
-    // same symbol): a path-only key made one 33-candidate file force 33 verifier batches.
-    s.check("G81 region-batched verification is named and forbidden as an arm-C deviation",
-      /arm-c/i.test(fanoutSection) && /never batch two candidates from one code region/i.test(fanoutSection));
-    s.check("G81 the standards lens and standards finder are stated as two separate dispatches",
-      /standards-conformance.*standards.*(two separate dispatches|never one folded into)/is.test(fanoutSection)
-      || /two separate dispatches/i.test(fanoutSection));
-
-    // D8: --review-sha is passed through, never re-implemented, by this orchestration.
-    s.check("G81 --review-sha pass-through is documented",
-      fanoutSection.includes("--review-sha") && /pass-through/i.test(fanoutSection));
+    s.check("G81 dispatch-topology.md has a `## Verification — in your own context` section", verification.length > 0);
+    // AC-9: the live caps, never a remembered number.
+    s.check("G81 verification reads the live comment-spine.mjs --shape-caps output",
+      /comment-spine\.mjs" --shape-caps/.test(verification));
+    s.check("G81 verification restates no fixed 60-char/200-char cap as the limit to write against",
+      !/(60|200)[- ]char(acter)? (cap|limit)(?! from)/.test(verification.replace("remembered 60/200-character limit", "")));
+    // A candidate still over a cap is routed by finalize.mjs, never dropped — a verified blocker
+    // must not vanish over a title length.
+    s.check("G81 a still-shape-failing candidate is never dropped (finalize.mjs coerceShape routes it)",
+      /is not dropped/.test(verification) && verification.includes("coerceShape()"));
   }
 }
 
@@ -9524,6 +9403,24 @@ const isPollBlock = (block) =>
             && !/subagent_type\W+pr-reviewer/.test(p);
         }));
       rmSync(scratch, { recursive: true, force: true });
+
+      // Arm B reads a second worktree with arm A's prompt; it used to run the removed --fanout.
+      const scratchB = mkdtempSync(join(tmpdir(), "g83-planb-"));
+      const rb = spawnSync(process.execPath, [
+        AB_PATH, "plan", "--manifest", MANIFEST, "--worktree", REPO_ROOT, "--worktree-b", "/abs/baseline-wt",
+        "--arms", "A,B", "--runs", "1", "--out", scratchB,
+      ], { encoding: "utf8" });
+      /** @type {any[]} */
+      let ds = [];
+      try { ds = JSON.parse(readFileSync(join(scratchB, "matrix.json"), "utf8")).dispatches || []; } catch { /* left empty */ }
+      rmSync(scratchB, { recursive: true, force: true });
+      const armA = ds.find((d) => d.arm === "A"), armB = ds.find((d) => d.arm === "B");
+      s.check("G83 --worktree-b points arm B at a second revision with arm A's prompt, and no arm runs the removed --fanout",
+        rb.status === 0 && !!armA && !!armB && armB.prompt.includes("/abs/baseline-wt/agents/pr-reviewer.md")
+          && armA.prompt.includes(`${REPO_ROOT}/agents/pr-reviewer.md`)
+          && armA.prompt.replace(REPO_ROOT, "X") === armB.prompt.replace("/abs/baseline-wt", "X")
+          && ds.every((d) => !String(d.prompt).includes("--fanout")),
+        `exit ${rb.status}, ${ds.length} dispatches`);
     }
   }
 
@@ -9534,6 +9431,7 @@ const isPollBlock = (block) =>
     const ANCHORS = [
       ["names pick-review-sha", /pick-review-sha/],
       ["names ab-review.mjs plan", /ab-review\.mjs plan/],
+      ["names --worktree-b, the second revision arm B reads", /--worktree-b/],
       ["names ab-review.mjs score", /ab-review\.mjs score/],
       ["names general-purpose as the arm dispatch type", /general-purpose/],
       ["states the absolute-path arm rule", /absolute path/i],
@@ -9684,40 +9582,30 @@ const isPollBlock = (block) =>
     }
   }
 
-  // G84f (A/B round 2 item 5): the verifier self-check is WIRED, not only implemented. The
+  // G84f (A/B round 2 item 5): the shape self-check is WIRED, not only implemented. The
   // `--shape-only` CLI existed after 895bbc2 but nothing told a verifier to run it, so it would
   // have caught nothing — the same gap A/B round 1 hit, where the orchestrator hand-trimmed 6 and
-  // 16 verifier bodies. One copy of the instruction (SKILL.md), referenced by dispatch-topology.md
-  // so the single-dispatch path and `--fanout` run the same bounded check.
+  // 16 verifier bodies. With --fanout removed, verification runs in the reviewer's own turn under
+  // both topologies, so the one copy of the instruction lives in dispatch-topology.md § Verification.
   {
-    const SKILL = join(REPO_ROOT, "skills/quality/pr-review/SKILL.md");
     const DT = join(REPO_ROOT, "agents/pr-reviewer/rules/dispatch-topology.md");
     const VJ = join(REPO_ROOT, "agents/pr-reviewer/scripts/validate-judgments.mjs");
-    const skillTxt = existsSync(SKILL) ? readFileSync(SKILL, "utf8") : "";
+    const dtTxt = existsSync(DT) ? readFileSync(DT, "utf8") : "";
     const selfCheck = (() => {
-      const start = skillTxt.indexOf("### Verifier self-check");
+      const start = dtTxt.indexOf("## Verification — in your own context");
       if (start === -1) return "";
-      const rest = skillTxt.slice(start);
-      const next = rest.indexOf("\n### ", 1);
+      const rest = dtTxt.slice(start);
+      const next = rest.indexOf("\n## ", 1);
       return next === -1 ? rest : rest.slice(0, next);
     })();
-    const fanoutStart = skillTxt.indexOf("## `--fanout`");
-    const fanoutEnd = fanoutStart === -1 ? -1 : skillTxt.indexOf("\n## ", fanoutStart + 1);
-    const selfCheckIdx = skillTxt.indexOf("### Verifier self-check");
-    s.check("G84f SKILL.md has a Verifier self-check block inside the --fanout section, after Step e and before Step f",
-      selfCheckIdx > fanoutStart && fanoutStart > -1 && (fanoutEnd === -1 || selfCheckIdx < fanoutEnd)
-        && selfCheckIdx > skillTxt.indexOf("### Step e") && selfCheckIdx < skillTxt.indexOf("### Step f"));
-    s.check("G84f the self-check runs validate-judgments.mjs --shape-only on the verifier's own output path",
-      /node <REPO>\/agents\/pr-reviewer\/scripts\/validate-judgments\.mjs --shape-only <OUT>/.test(selfCheck));
-    s.check("G84f the self-check is bounded (2 fix-and-rerun rounds) and names the unresolved/unavailable returns",
-      /At most 2 fix-and-rerun rounds/.test(selfCheck) && selfCheck.includes("SHAPE-UNRESOLVED:")
-        && selfCheck.includes("SHAPE-CHECK-UNAVAILABLE:"));
+    s.check("G84f the self-check runs validate-judgments.mjs --shape-only before finalize.mjs",
+      /validate-judgments\.mjs" --shape-only <candidates\.json>/.test(selfCheck) && /Before `finalize\.mjs`/.test(selfCheck));
+    s.check("G84f the self-check is bounded (2 fix-and-rerun rounds) and names what happens after",
+      /at most 2 fix-and-rerun rounds/.test(selfCheck) && /A third failure goes to `finalize\.mjs` as\s+is/.test(selfCheck));
     s.check("G84f the self-check forbids changing a verdict/severity/blocking or deleting a candidate to pass",
-      /Never change verdict, severity, blocking/.test(selfCheck) && /never delete a\s+candidate/.test(selfCheck));
-    const dtTxt = existsSync(DT) ? readFileSync(DT, "utf8") : "";
-    s.check("G84f dispatch-topology.md appends the self-check to every verifier dispatch, by reference to SKILL.md",
-      dtTxt.includes("SKILL.md#verifier-self-check--appended-to-every-verifier-dispatch-in-step-e")
-        && dtTxt.includes("--shape-only"));
+      /Never change a verdict, severity, `blocking`/.test(selfCheck) && /never\s+delete a candidate/.test(selfCheck));
+    s.check("G84f the self-check names the severity-crosswalk exception rather than hiding it",
+      /`"blocking": true` requires severity `high` or `critical`/.test(selfCheck));
     const vjTxt = existsSync(VJ) ? readFileSync(VJ, "utf8") : "";
     s.check("G84f validate-judgments.mjs exports validateShapeOnly and its CLI routes --shape-only to it",
       /export function validateShapeOnly\(/.test(vjTxt)
@@ -9730,64 +9618,11 @@ const isPollBlock = (block) =>
       (out || r.stderr || "").split("\n").filter((l) => l.includes("✗")).join(" | "));
   }
 
-  // G84g (A/B round 2 item 6): sub-agent packing. Round 2 measured cost as driven by sub-agent
-  // COUNT (~110-160k base tokens each; 22 at t=0.8, 33 at t=1.0). plan-dispatch.mjs is the one
-  // executable grouping — verifier batches of VERIFY_BATCH_MAX with no two same-path candidates
-  // in one batch, one lens-bundle dispatch for holistic/optimality/measurability, finders and
-  // correctness votes never packed — and the two constants plus the per-band table are stated in
-  // three files, so this holds the prose to the code rather than trusting either to stay put.
-  {
-    const PD = join(REPO_ROOT, "agents/pr-reviewer/scripts/plan-dispatch.mjs");
-    const pdSrc = existsSync(PD) ? readFileSync(PD, "utf8") : "";
-    s.check("G84g plan-dispatch.mjs exists and is // @ts-check",
-      pdSrc !== "" && /^\/\/ @ts-check/m.test(pdSrc.split("\n").slice(0, 3).join("\n")));
-    const tsTxt = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/scripts/tsconfig.json"), "utf8");
-    s.check("G84g tsconfig.json's files[] lists plan-dispatch.mjs", tsTxt.includes('"plan-dispatch.mjs"'));
-    const st = spawnSync(process.execPath, [PD, "--self-test"], { encoding: "utf8" });
-    s.check("G84g plan-dispatch.mjs --self-test passes (partition, path-distinct batches, bundle, packing never costs a dispatch)",
-      st.status === 0 && /^✓ plan-dispatch self-test: all \d+ cases passed$/m.test(st.stdout || ""),
-      (st.stdout || st.stderr || "").split("\n").filter((l) => l.includes("✗")).join(" | "));
-
-    const maxParallel = Number(/export const PR_REVIEW_MAX_PARALLEL = (\d+);/.exec(pdSrc)?.[1]);
-    const batchMax = Number(/export const VERIFY_BATCH_MAX = (\d+);/.exec(pdSrc)?.[1]);
-    const dtTxt = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/rules/dispatch-topology.md"), "utf8");
-    const skTxt = readFileSync(join(REPO_ROOT, "skills/quality/pr-review/SKILL.md"), "utf8");
-    const dtCap = Number(/The concurrency cap for this pipeline is \*\*(\d+)\*\* sub-agent dispatches per message/.exec(dtTxt)?.[1]);
-    const skCap = Number(/`PR_REVIEW_MAX_PARALLEL` — default (\d+)/.exec(skTxt)?.[1]);
-    s.check(`G84g PR_REVIEW_MAX_PARALLEL is one number in plan-dispatch.mjs (${maxParallel}), dispatch-topology.md (${dtCap}), and SKILL.md (${skCap})`,
-      Number.isInteger(maxParallel) && maxParallel === dtCap && maxParallel === skCap);
-    const dtBatch = Number(/\*\*`VERIFY_BATCH_MAX` \((\d+)\)\*\*/.exec(dtTxt)?.[1]);
-    const skBatch = Number(/`VERIFY_BATCH_MAX` \((\d+)\) candidates/.exec(skTxt)?.[1]);
-    s.check(`G84g VERIFY_BATCH_MAX is one number in plan-dispatch.mjs (${batchMax}), dispatch-topology.md (${dtBatch}), and SKILL.md (${skBatch})`,
-      Number.isInteger(batchMax) && batchMax === dtBatch && batchMax === skBatch);
-
-    s.check("G84g dispatch-topology.md bundles holistic/optimality/measurability and keeps standards-conformance out",
-      /\| holistic broad pass, optimality, measurability \| \*\*one lens-bundle dispatch\*\*/.test(dtTxt)
-        && /\| standards-conformance lens \| one, never in the bundle \|/.test(dtTxt));
-    s.check("G84g dispatch-topology.md keeps each finder at one dispatch and states correctness votes are retired",
-      /\| each active finder \| one each \|/.test(dtTxt) && /\| `correctness` votes \| \*\*retired — one pass\*\* \|/.test(dtTxt));
-    s.check("G84g dispatch-topology.md states the queue rules: one message per cap, each unit once, one retry at most",
-      /Send the next message only after every dispatch in the current one has returned/.test(dtTxt)
-        && /Dispatch each unit exactly once/.test(dtTxt) && /never retried a third time/.test(dtTxt));
-    s.check("G84g both paths plan verification with plan-dispatch.mjs --verifier-batches",
-      dtTxt.includes("plan-dispatch.mjs --verifier-batches") && /plan-dispatch\.mjs \\\n\s+--verifier-batches/.test(skTxt));
-    s.check("G84g SKILL.md Step c runs the three lenses in one lens-bundle dispatch",
-      /one\s+lens-bundle dispatch/.test(skTxt) && /\| standards-conformance \| `deep` and `standard` \| its own \|/.test(skTxt));
-
-    // The per-band table is GENERATED: the doc block must equal `--table`'s output line for line.
-    const tbl = spawnSync(process.execPath, [PD, "--table"], { encoding: "utf8" });
-    const want = (tbl.stdout || "").trimEnd().split("\n");
-    const drTxt = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/rules/depth-routing.md"), "utf8");
-    const drLines = drTxt.split("\n");
-    const hdr = drLines.indexOf(want[0]);
-    const got = [];
-    for (let i = hdr; hdr !== -1 && i < drLines.length && drLines[i].startsWith("|"); i++) got.push(drLines[i]);
-    s.check("G84g depth-routing.md § Expected sub-agents per band equals `plan-dispatch.mjs --table`, line for line",
-      tbl.status === 0 && /### Expected sub-agents per band/.test(drTxt) && want.length > 2
-        && JSON.stringify(got) === JSON.stringify(want),
-      hdr === -1 ? "table header not found in depth-routing.md"
-        : `first differing row: ${got.find((l, i) => l !== want[i]) ?? want[got.length] ?? "(length)"}`);
-  }
+  // G84g — RETIRED with --fanout. It held plan-dispatch.mjs (verifier batches, the lens bundle,
+  // PR_REVIEW_MAX_PARALLEL, the generated per-band table) to the prose in three files. The default
+  // review dispatches at most one sub-agent, so there is nothing to pack; depth-routing.md's
+  // two-row table is guarded with the budget itself (G84e) and G66r fails if plan-dispatch.mjs
+  // comes back.
 
   // G84h (A/B round 2 item 7): posted one-liners are counted as NOTES in the headline. A cleared
   // nitpick/question posts inline but earns no FINDINGS row, so six comments at the code sat under
@@ -9995,8 +9830,9 @@ const isPollBlock = (block) =>
     s.check("G84k --shape-caps prints the evidence-note word cap verifiers are held to",
       caps.status === 0 && Boolean(capWords) && (caps.stdout || "").includes(`note is a parenthetical of <= ${capWords} words`));
     const dt2 = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/rules/dispatch-topology.md"), "utf8");
-    s.check("G84k dispatch-topology.md makes an in-context orchestrator read --shape-caps and self-check like a verifier",
-      /The orchestrator is then its own verifier/.test(dt2) && /read `comment-spine\.mjs --shape-caps` once/.test(dt2));
+    s.check("G84k dispatch-topology.md makes the reviewer read --shape-caps and self-check like a verifier",
+      /You are then your own verifier/.test(dt2) && /Read the live shape caps once, before writing/.test(dt2)
+        && /comment-spine\.mjs" --shape-caps/.test(dt2));
   }
 
 
@@ -10041,74 +9877,36 @@ const isPollBlock = (block) =>
       && /Never change verdict, severity, blocking/.test(selfCheck));
 }
 
-// ── G84n (A/B round 8 → iteration 5): the default is hybrid, the fan-out is sharded and capped ──
-// Round 8's first real `--fanout` run found every known defect on sync-tray#72 but projected to
-// ~57 minutes: every worker read the whole packet (8–14 min each), two correctness votes added 49
-// candidates, and a path-only batching key made one 33-candidate file force 33 verifier batches.
-// Rounds 7–8 also showed the isolated intent finder catching the top defect 3 of 3 times. This
-// guards the five changes that follow from those numbers, each against the code, not the prose alone.
+// ── G84n (A/B round 8 → iteration 5): the default is hybrid, and votes are retired ──
+// Rounds 7–8 showed the isolated intent finder catching the top defect on sync-tray#72 3 of 3
+// times, and round 8's fully parallel run (every finder its own sub-agent, since removed) finding
+// every known defect but projecting to ~57 minutes; its two correctness votes added 49 candidates.
+// Guarded against the code, not the prose alone. The sharding, region-batching and verification-cap
+// checks retired with --fanout (G66r fails if any of it returns).
 {
   const RD = join(REPO_ROOT, "agents/pr-reviewer/scripts/route-depth.mjs");
-  const PD = join(REPO_ROOT, "agents/pr-reviewer/scripts/plan-dispatch.mjs");
-  const RP = join(REPO_ROOT, "agents/pr-reviewer/scripts/review-packet.mjs");
-  const PR = join(REPO_ROOT, "agents/pr-reviewer/scripts/prepare-review.mjs");
   const DT = join(REPO_ROOT, "agents/pr-reviewer/rules/dispatch-topology.md");
   const SK = join(REPO_ROOT, "skills/quality/pr-review/SKILL.md");
   const BODY = join(REPO_ROOT, "agents/pr-reviewer.md");
-  const rd = readFileSync(RD, "utf8"), pd = readFileSync(PD, "utf8"), rp = readFileSync(RP, "utf8");
-  const pr = readFileSync(PR, "utf8"), dt = readFileSync(DT, "utf8"), sk = readFileSync(SK, "utf8");
+  const rd = readFileSync(RD, "utf8"), dt = readFileSync(DT, "utf8"), sk = readFileSync(SK, "utf8");
   const body = readFileSync(BODY, "utf8");
   const probe = (/** @type {string} */ code) => spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", cwd: REPO_ROOT });
 
-  // (1) hybrid is the default at t >= 0.4; parallel only through `fanout`.
+  // (1) hybrid is the default at t >= 0.4, and a leftover `fanout` input selects nothing else.
   const topo = probe(`import { resolveBudget } from "./agents/pr-reviewer/scripts/route-depth.mjs";
     const b = (i) => { const r = resolveBudget(i); return [r.topology, r.isolatedFinders.length, r.correctnessVotes]; };
-    console.log(JSON.stringify([b({ thoroughness: 0.3 }), b({ thoroughness: 0.8 }), b({ thoroughness: 1 }), b({ thoroughness: 0.8, fanout: true })]));`);
-  s.check("G84n resolveBudget: in-context below 0.4, hybrid (intent isolated) above it, parallel only with fanout, one correctness pass everywhere",
-    topo.status === 0 && (topo.stdout || "").trim() === JSON.stringify([["in-context", 0, 1], ["hybrid", 1, 1], ["hybrid", 1, 1], ["parallel", 6, 1]]),
+    console.log(JSON.stringify([b({ thoroughness: 0.3 }), b({ thoroughness: 0.8 }), b({ thoroughness: 1 }), b({ thoroughness: 0.8, fanout: true }), b({ thoroughness: 0.8, dispatchAvailable: false })]));`);
+  s.check("G84n resolveBudget: in-context below 0.4 or with no dispatch, hybrid (intent isolated) above it, never parallel, one correctness pass everywhere",
+    topo.status === 0 && (topo.stdout || "").trim() === JSON.stringify([["in-context", 0, 1], ["hybrid", 1, 1], ["hybrid", 1, 1], ["hybrid", 1, 1], ["in-context", 0, 1]]),
     (topo.stdout || topo.stderr || "").trim().slice(0, 200));
   s.check("G84n the hybrid path is wired end to end: the body grammar knows --intent-from, SKILL.md Step 2 sends the intent worker in the same message, dispatch-topology.md says how to wait for it",
     /\| `--intent-from <path>` \|/.test(body)
       && /In \*\*one message\*\*, dispatch both/.test(sk) && sk.includes("--intent-from <that path>")
       && /check every 20 seconds, for at most 10 minutes/.test(dt) && /The review never loses the finder itself/.test(dt));
 
-  // (2) sharded packet parts for the per-file finders.
-  s.check("G84n review-packet.mjs exports the shard contract and prepare-review.mjs writes the parts",
-    /export const SHARD_LINES = \d+;/.test(rp) && /export const SHARD_MAX = \d+;/.test(rp)
-      && /export function buildPacketParts\(/.test(rp) && /buildPacketParts\(packetInput, built\)/.test(pr)
-      && /review-packet\.part-\$\{part\.index\}\.md/.test(pr));
-  const rpt = spawnSync(process.execPath, [RP, "--self-test"], { encoding: "utf8" });
-  s.check("G84n review-packet.mjs --self-test proves every inlined file lands in exactly one part, byte-identical",
-    rpt.status === 0 && /every inlined file is inlined in exactly one part, byte-identical to the full packet/.test(rpt.stdout || ""),
-    (rpt.stdout || rpt.stderr || "").split("\n").filter((l) => l.includes("✗")).join(" | "));
-  const shard = spawnSync(process.execPath, [PD, "--count", "--fanout", "--thoroughness", "0.8", "--packet-lines", "6612", "--candidates", "10"], { encoding: "utf8" });
-  let shardPlan = null; try { shardPlan = JSON.parse(shard.stdout || "null"); } catch { /* reported below */ }
-  s.check("G84n --fanout on a 6,612-line packet shards correctness/consumer-impact/quality into 3 workers each",
-    shardPlan !== null && shardPlan.shards === 3
-      && ["correctness@1", "correctness@3", "consumer-impact@2", "quality@3"].every((id) => shardPlan.phaseD.includes(id))
-      && shardPlan.phaseD.includes("intent") && !shardPlan.phaseD.includes("intent@1"),
-    (shard.stdout || shard.stderr || "").slice(0, 200));
-
-  // (3) region-keyed verifier batches + (4) the verification cap, one number in three files.
-  const pdt = spawnSync(process.execPath, [PD, "--self-test"], { encoding: "utf8" });
-  s.check("G84n plan-dispatch.mjs --self-test proves region batching and the cap",
-    pdt.status === 0 && /10 candidates on ONE path but in 10 distinct regions → 2 batches/.test(pdt.stdout || "")
-      && /the cap keeps the highest severity, then the most corroborated/.test(pdt.stdout || "")
-      && /an over-cap run names the overflow as an anomaly, never silently/.test(pdt.stdout || ""),
-    (pdt.stdout || pdt.stderr || "").split("\n").filter((l) => l.includes("✗")).join(" | "));
-  const cap = Number(/export const VERIFY_CAP = (\d+);/.exec(pd)?.[1]);
-  const region = Number(/export const REGION_LINES = (\d+);/.exec(pd)?.[1]);
-  s.check(`G84n VERIFY_CAP (${cap}) is one number in plan-dispatch.mjs, dispatch-topology.md, and SKILL.md`,
-    Number.isInteger(cap) && dt.includes(`\`VERIFY_CAP\` (${cap})`) && sk.includes(`\`VERIFY_CAP\` (${cap})`));
-  s.check(`G84n REGION_LINES (${region}) is one number in plan-dispatch.mjs, dispatch-topology.md, and SKILL.md`,
-    Number.isInteger(region) && dt.includes(`\`REGION_LINES\` (${region})`) && sk.includes(`\`REGION_LINES\` (${region})`));
-  s.check("G84n both documents route the overflow's anomaly through context.render.RUN_ANOMALY, never a silent drop",
-    /pass its `anomaly` string through `context\.render\.RUN_ANOMALY`/.test(dt) && /never drop it silently/.test(sk));
-
-  // (5) votes retired, stated where the old ladder lived.
-  s.check("G84n votes are retired in route-depth.mjs, dispatch-topology.md, and SKILL.md Step c",
-    /const CORRECTNESS_VOTES = 1;/.test(rd) && /## Diversify then vote \(moved here from the agent body\) — retired/.test(dt)
-      && /never as diversify-then-vote/.test(sk) && !/N = 5 sub-agents/.test(sk));
+  // (2) votes retired, stated where the old ladder lived.
+  s.check("G84n votes are retired in route-depth.mjs and dispatch-topology.md",
+    /const CORRECTNESS_VOTES = 1;/.test(rd) && /## Diversify then vote \(moved here from the agent body\) — retired/.test(dt));
 }
 
 // ── G84o: run telemetry — per-step spans in the shape Dash0's AI Coding Insights reads ──
@@ -10178,65 +9976,55 @@ const isPollBlock = (block) =>
 }
 
 // ── G84p: run telemetry on an Agent0 Automation ──
-// Three gaps kept a real automation run from exporting: its envVars reach only the setup script,
-// and the installer persisted none of the export settings into env.sh; the harness detector knew
-// only the file the repo-level installer writes, not the reviewer-only installer's env.sh; and the
-// bundle did not inline run-telemetry.md, so a run that skips deferred rules marked no steps.
+// An automation's envVars reach only its setup script. The export settings carry an ingest token,
+// so they are never written to env.sh: the run reads them from its own environment, which a setup
+// script sets through $DASH0_AGENT_ENV (run-telemetry.md § On an Agent0 Automation). Two further
+// gaps are guarded: the harness detector must know the reviewer-only installer's env.sh, and the
+// bundle must inline run-telemetry.md so a run that skips deferred rules still marks its steps.
 // Each check EXECUTES the shipped code: the installer's env.sh block in a scratch root, the
-// telemetry parser against the file that block wrote, and the bundle compiler.
+// telemetry self-test, and the bundle compiler.
 {
   const SETUP = join(REPO_ROOT, "agents/pr-reviewer/scripts/agent0-setup.sh");
   const RT = join(REPO_ROOT, "agents/pr-reviewer/scripts/review-telemetry.mjs");
   const setupTxt = readFileSync(SETUP, "utf8");
-  const from = setupTxt.indexOf("shq() {");
+  const from = setupTxt.indexOf('ENV_FILE="$ROOT/env.sh"');
   const to = setupTxt.indexOf('if [ -n "${DASH0_AGENT_ENV:-}" ]');
-  const tricky = "Authorization=Bearer a'b $x `y`,Dash0-Dataset=default";
+  const token = "Authorization=Bearer l1-canary-token,Dash0-Dataset=default";
   const dir = mkdtempSync(join(tmpdir(), "l1-envsh-"));
   let envSh = "";
-  let mode = "";
-  let sourced = "";
-  let parsed = {};
   let installerOut = "";
-  let bareHasOtlp = true;
+  let bareOut = "";
+  let status = -1;
   try {
     writeFileSync(join(dir, "block.sh"), from > 0 && to > from ? setupTxt.slice(from, to) : "exit 3\n");
     const base = { PATH: process.env.PATH || "", ROOT: dir, BUNDLE: join(dir, "b.md"), PIN: "abc1234", PR_REVIEWER_LOGIN: "bot" };
     const r = spawnSync("bash", ["-u", join(dir, "block.sh")], {
-      encoding: "utf8", env: { ...base, PR_REVIEWER_OTLP_ENDPOINT: "https://ingress.example.com", PR_REVIEWER_OTLP_HEADERS: tricky },
+      encoding: "utf8", env: { ...base, PR_REVIEWER_OTLP_ENDPOINT: "https://ingress.example.com", PR_REVIEWER_OTLP_HEADERS: token },
     });
+    status = r.status ?? -1;
     installerOut = `${r.stdout || ""}${r.stderr || ""}`;
-    if (r.status === 0) {
-      envSh = readFileSync(join(dir, "env.sh"), "utf8");
-      mode = (spawnSync("stat", ["-c", "%a", join(dir, "env.sh")], { encoding: "utf8" }).stdout || "").trim();
-      sourced = spawnSync("bash", ["-c", `. "${join(dir, "env.sh")}"; printf '%s' "$PR_REVIEWER_OTLP_HEADERS"`], { encoding: "utf8" }).stdout || "";
-      const p = spawnSync(process.execPath, ["--input-type=module", "-e",
-        `import { parseEnvFile, PERSISTED_EXPORT_KEYS } from ${JSON.stringify(pathToFileURL(RT).href)};
-         import { readFileSync } from "node:fs";
-         process.stdout.write(JSON.stringify(parseEnvFile(readFileSync(${JSON.stringify(join(dir, "env.sh"))}, "utf8"), PERSISTED_EXPORT_KEYS)));`],
-      { encoding: "utf8" });
-      parsed = JSON.parse(p.stdout || "{}");
-    }
+    if (existsSync(join(dir, "env.sh"))) envSh = readFileSync(join(dir, "env.sh"), "utf8");
     const bareDir = join(dir, "bare");
     mkdirSync(bareDir);
-    spawnSync("bash", ["-u", join(dir, "block.sh")], { encoding: "utf8", env: { ...base, ROOT: bareDir } });
-    bareHasOtlp = existsSync(join(bareDir, "env.sh")) ? /OTLP|PR_REVIEWER_TELEMETRY/.test(readFileSync(join(bareDir, "env.sh"), "utf8")) : true;
+    const b = spawnSync("bash", ["-u", join(dir, "block.sh")], { encoding: "utf8", env: { ...base, ROOT: bareDir } });
+    bareOut = `${b.stdout || ""}${b.stderr || ""}`;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-  s.check("G84p the installer persists the export settings into env.sh so bash sourcing and review-telemetry.mjs read the same values",
-    sourced === tricky && parsed.PR_REVIEWER_OTLP_HEADERS === tricky && parsed.PR_REVIEWER_OTLP_ENDPOINT === "https://ingress.example.com",
-    `sourced=${JSON.stringify(sourced)} parsed=${JSON.stringify(parsed)} out=${installerOut.slice(0, 200)}`);
-  s.check("G84p env.sh is mode 600 when it carries headers, the installer never prints them, and unset settings write no line",
-    mode === "600" && !installerOut.includes("Bearer") && bareHasOtlp === false && /PR_REVIEWER_OTLP_HEADERS=/.test(envSh),
-    `mode=${mode} printedToken=${installerOut.includes("Bearer")} bareHasOtlp=${bareHasOtlp}`);
+  s.check("G84p the installer writes the run's paths to env.sh and never the export settings or their token",
+    status === 0 && /export PR_REVIEWER_ROOT=/.test(envSh) && !/OTLP|PR_REVIEWER_TELEMETRY|Bearer/.test(envSh),
+    `status=${status} envSh=${JSON.stringify(envSh.slice(0, 200))}`);
+  s.check("G84p settings handed to the installer get a note, never their values; none gets no note",
+    /not written to env\.sh/.test(installerOut) && !installerOut.includes("l1-canary-token") && !installerOut.includes("ingress.example.com")
+      && !/telemetry:/.test(bareOut),
+    `out=${installerOut.slice(0, 200)} bare=${bareOut.slice(0, 120)}`);
 
+  const rtSrc = readFileSync(RT, "utf8");
   const rtRun = spawnSync(process.execPath, [RT, "--self-test"], { encoding: "utf8" });
   const out = rtRun.stdout || "";
-  s.check("G84p review-telemetry.mjs reads the settings from env.sh when the process has none, and a `finish` exports from it alone",
-    rtRun.status === 0 && /withPersistedExport: an empty process takes the endpoint and headers from env\.sh/.test(out)
-      && /withPersistedExport: the process wins, and a file's headers never go to the process's endpoint/.test(out)
-      && /CLI: finish with no export variables in the process exports from env\.sh/.test(out)
-      && /finishRun\(runDir, opts = \{\}, env = withPersistedExport\(process\.env\)\)/.test(readFileSync(RT, "utf8")),
+  s.check("G84p review-telemetry.mjs reads the export settings from the process environment only (no env-file fallback)",
+    rtRun.status === 0 && /finishRun\(runDir, opts = \{\}, env = process\.env\)/.test(rtSrc)
+      && !/withPersistedExport|parseEnvFile|PERSISTED_EXPORT_KEYS/.test(rtSrc),
     out.split("\n").filter((l) => l.includes("✗")).join(" | "));
   s.check("G84p the reviewer-only Agent0 install (pr-reviewer/env.sh) names the harness agent0",
     /detectHarness: the reviewer-only Agent0 install \(pr-reviewer\/env\.sh\) is agent0/.test(out));
@@ -10253,8 +10041,10 @@ const isPollBlock = (block) =>
   s.check("G84p the Agent0 bundle inlines run-telemetry.md, so a run that skips deferred rules still has the step markers",
     bundle.includes("# Inlined rule — `pr-reviewer/rules/run-telemetry.md`") && bundle.includes("**Never spend a tool call on a marker.**"));
   const rtDoc = readFileSync(join(REPO_ROOT, "agents/pr-reviewer/rules/run-telemetry.md"), "utf8");
-  s.check("G84p run-telemetry.md tells an automation where to set the variables and why they reach the run through env.sh",
-    /### On an Agent0 Automation/.test(rtDoc) && rtDoc.includes("sandbox.envVars") && rtDoc.includes("/tmp/workspace/pr-reviewer/env.sh"));
+  s.check("G84p run-telemetry.md tells an automation to export the settings through $DASH0_AGENT_ENV with an ingest-only token",
+    /### On an Agent0 Automation/.test(rtDoc) && rtDoc.includes("sandbox.envVars")
+      && rtDoc.includes(`printf 'export PR_REVIEWER_OTLP_HEADERS=%q\\n'`) && rtDoc.includes('>> "$DASH0_AGENT_ENV"')
+      && /ingest-only token/.test(rtDoc) && !/writes `PR_REVIEWER_OTLP_ENDPOINT`/.test(rtDoc));
 }
 
 // ── G82: pr-reviewer.md size ratchet + the L2-read sections stay byte-identical to base (D15,
