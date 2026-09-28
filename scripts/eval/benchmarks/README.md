@@ -1,8 +1,11 @@
 # A/B benchmark runbook — reviewer-ab.manifest.json
 
-Compares Arm A (single-dispatch `pr-reviewer` agent) against Arm B (`--fanout`
-orchestration) on the same set of historical PR reviews, at the SAME reviewed
-commit both arms are graded against (D8/D13's `--review-sha` mode).
+Compares two revisions of the single-dispatch `pr-reviewer` agent — Arm A read
+from `--worktree`, Arm B from `--worktree-b` — on the same set of historical PR
+reviews, with one identical prompt, at the SAME reviewed commit both arms are
+graded against (D8/D13's `--review-sha` mode). Arm B used to run the
+`/pr-review --fanout` orchestration; that path is removed, and the round-1
+table below is kept as the record of why.
 
 **This file documents the paid A/B. Do not run the dispatch step (Step 3)
 without explicit authorization** — every other step (`pick-review-sha`,
@@ -53,6 +56,7 @@ commit list (`pulls/{n}/commits`). A PR with no non-author inline comments
 node scripts/eval/ab-review.mjs plan \
   --manifest scripts/eval/benchmarks/reviewer-ab.manifest.json \
   --worktree "$PWD" \
+  --worktree-b /abs/path/to/baseline-worktree \
   --arms A,B \
   --runs 3 \
   --out /path/to/scratch-dir
@@ -60,7 +64,7 @@ node scripts/eval/ab-review.mjs plan \
 
 Writes `<out>/matrix.json`: one dispatch entry per (manifest entry with a
 valid `review_sha`) x (arm) x (run) — 8+ PRs x 2 arms x 3 runs is 48+
-entries. Every entry names the worktree definition by **absolute path**,
+entries. Every entry names its arm's worktree definition by **absolute path**,
 `subagent_type: "general-purpose"` — **never** the installed `pr-reviewer`
 agent by name (dispatching by name resolves the symlinked-installed copy,
 not this worktree's edited one, which is the entire point of an A/B on a
@@ -117,8 +121,8 @@ below 8 PRs x 3 runs per arm with matched data, else `pass` when
 
 ## Rounds 2/3 — the thoroughness sweep
 
-Round 1 (below) compared two **topologies** (single-dispatch vs `--fanout`) at each arm's default
-thoroughness. Rounds 2/3 hold the topology fixed and sweep the **continuous** knob
+Round 1 (below) compared two **topologies** (single-dispatch vs the since-removed `--fanout`) at
+each arm's default thoroughness. Rounds 2/3 hold the topology fixed and sweep the **continuous** knob
 (`agents/pr-reviewer/rules/depth-routing.md § Thoroughness budget`) to draw a recall-vs-wall-clock
 curve instead of a two-point comparison.
 
@@ -141,7 +145,7 @@ Score each point's `matrix.json` independently (Step 3–5 above, one `runs-dir`
 `t`), then plot `t` on the x-axis against each score file's `mean_wall_clock` and `recall` — three
 points is enough to see whether the curve is monotone (thoroughness buys recall at a wall-clock
 cost) or flat past a breakpoint (the budget's own breakpoints, § Thoroughness budget, predict
-roughly where it should bend: `t=0.3` sits below the `0.4` parallel-topology breakpoint — in-context,
+roughly where it should bend: `t=0.3` sits below the `0.4` topology breakpoint — in-context,
 cheap, `votes=1` — while `t=1.0` is the ceiling on every lever at once).
 
 ## Per-arm cost table (measured, PR #205)
@@ -169,10 +173,11 @@ per sub-agent (~110k tokens each), not by the dispatch prompt itself:
   a flag on this dispatch can turn off from inside the repo.
 - The rest is the global rules/memory, the skill and agent listings, and
   tool schemas — likewise harness-loaded, not prompt-controllable.
-- **Controllable:** the worker preamble (`--fanout`'s Worker preamble
-  section) — absolute paths, an explicit read-list, no read of
-  `agents/pr-reviewer.md`, no `Skill()` calls, write-to-path/return-path-only
-  — removes redundant re-derivation inside each worker's own dispatch.
+- **Controllable:** the worker preamble (`skills/quality/pr-review/SKILL.md`
+  § Worker preamble, now used by the hybrid intent worker) — absolute paths,
+  an explicit read-list, no read of `agents/pr-reviewer.md`, no `Skill()`
+  calls, write-to-path/return-path-only — removes redundant re-derivation
+  inside the worker's own dispatch.
 
 ### Launch configurations that remove `CLAUDE.md` from the bill entirely
 

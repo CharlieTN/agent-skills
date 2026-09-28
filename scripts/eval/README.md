@@ -1119,9 +1119,9 @@ done
 
 ## The reviewer A/B quality benchmark
 
-`scripts/eval/benchmarks/README.md` is the runbook for the A/B harness that compares Arm A
-(single-dispatch `pr-reviewer`) against Arm B (`--fanout`) on a fixed set of historical PR
-reviews, graded against the commit each PR was actually reviewed at (`--review-sha`, D8/D13 —
+`scripts/eval/benchmarks/README.md` is the runbook for the A/B harness that compares two
+revisions of the single-dispatch `pr-reviewer` — Arm A from `--worktree`, Arm B from
+`--worktree-b` — on a fixed set of historical PR reviews, graded against the commit each PR was actually reviewed at (`--review-sha`, D8/D13 —
 never the live head, so the labels and the diff describe the same moment). It covers the exact
 commands (`ab-review.mjs pick-review-sha` / `plan` / `score`, `thread-outcomes.mjs --at-sha`), the
 safety contract (every GitHub call against the private benchmark repo is read-only; every dispatch
