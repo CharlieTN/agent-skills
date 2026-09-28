@@ -411,18 +411,15 @@ With `FIX_LINKS=off` supply no `FIX_ALL_URL` and pass no `FIX_URL` in any inline
 ## Step 0.5: Authorship pre-check — set review relation
 
 ```bash
-# /user is NOT repo-scoped, so it 401s under a GitHub App installation token and under a
-# wrapped `gh` that injects a per-call repo-scoped credential — both of which are ordinary
-# hosted-runner setups, not exotic ones. Treat a failure as "identity unknown", never as "".
-ME=$(gh api user --jq .login 2>/dev/null) || ME=""
+# Never /user: it 401s under an App installation token or a per-call repo-scoped `gh` wrapper.
+# GraphQL `viewer` answers for both (`github-access.md § Identity`); a failure is identity unknown.
+ME=$(gh api graphql -f query='{ viewer { login } }' --jq .data.viewer.login 2>/dev/null) || ME=""
 # One call, three values: the author decides the relation, the head branch is the
 # PR-state record's scope (Step 0.7), and headRefOid is folded in here — at zero extra
 # cost — so a HEAD_SHA reading is already available before Step 1 spends anything, which
 # is what Step 0.8's fast zero-delta pre-check needs.
-# EARLY_HEAD_SHA is deliberately a distinct name from the canonical HEAD_SHA that Step 1.2
-# binds from Step 1.1 command A's own response — that naming keeps the "never from a second
-# read" single-source-of-truth invariant intact for the full pipeline (Step 1.2's comment)
-# while still letting Step 0.8 make its call off a value that predates Step 1 entirely.
+# EARLY_HEAD_SHA is deliberately not HEAD_SHA, which Step 1.2 binds from Step 1.1 command A's own
+# response ("never from a second read"); Step 0.8 reads a value that predates Step 1 entirely.
 PR_META=$(gh pr view $PR_NUMBER $GH_REPO_FLAG --json author,headRefName,headRefOid)
 AUTHOR=$(jq -r '.author.login' <<< "$PR_META")
 HEAD_REF=$(jq -r '.headRefName' <<< "$PR_META")
@@ -430,7 +427,9 @@ EARLY_HEAD_SHA=$(jq -r '.headRefOid' <<< "$PR_META")
 
 if [[ -z "$ME" ]]; then
   REVIEW_RELATION="cross"
-elif [[ "$ME" == "$AUTHOR" ]]; then
+# Normalized: an App reads `x[bot]` from viewer but `x` from GraphQL author.login.
+elif [[ "$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's/\[bot\]$//')" == \
+        "$(printf '%s' "$AUTHOR" | tr '[:upper:]' '[:lower:]' | sed 's/\[bot\]$//')" ]]; then
   REVIEW_RELATION="self"
 else
   REVIEW_RELATION="cross"
@@ -709,7 +708,7 @@ carried but the PR has certainly been reviewed before).
 on **every** path above, including `--full` (where Step 1.2b does not read the last two) — an unset
 value is not the same as a bound empty one. `ME` is **not** read in this step: the sticky is matched
 on its marker alone, so prior-run detection keeps working where `/user` is unreachable. Do not
-reintroduce a `.user.login` filter here or call `gh api user` again anywhere in the run — reading
+reintroduce a `.user.login` filter here, and never call `gh api user` anywhere in the run — reading
 `.user.login` **off** a found object is different and required (see `PRIOR_REPORT_AUTHOR`, which
 Step 1.0 consumes).
 
