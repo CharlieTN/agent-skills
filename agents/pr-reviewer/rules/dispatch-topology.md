@@ -129,14 +129,14 @@ You are then your own verifier, so take the two steps a separate verifier would,
    `evidence_anchors`:
 
    ```bash
-   node agents/pr-reviewer/scripts/comment-spine.mjs --shape-caps
+   node "$AGENT_SUPPORT/pr-reviewer/scripts/comment-spine.mjs" --shape-caps
    ```
 
    Never write against a remembered 60/200-character limit; the renderer enforces what this prints.
 2. Before `finalize.mjs`, run the shape check on the candidates file you wrote:
 
    ```bash
-   node agents/pr-reviewer/scripts/validate-judgments.mjs --shape-only <candidates.json>
+   node "$AGENT_SUPPORT/pr-reviewer/scripts/validate-judgments.mjs" --shape-only <candidates.json>
    ```
 
    - Exit 0 with `OK`: continue.

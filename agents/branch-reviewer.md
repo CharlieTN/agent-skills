@@ -249,7 +249,7 @@ executable home. Once Phase E has verified every candidate, assemble the same tw
 Then run:
 
 ```bash
-node agents/pr-reviewer/scripts/finalize.mjs \
+node "$AGENT_SUPPORT/pr-reviewer/scripts/finalize.mjs" \
   --context "$TMP/context.json" --judgments "$TMP/judgments.json" \
   --out-dir "$TMP/finalize" --writer findings-bus --bus-path "$OUT"
 ```
