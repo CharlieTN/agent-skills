@@ -58,6 +58,8 @@
 //   node review-telemetry.mjs attr   --run-dir <dir> [--target run|step] --attr key=value …
 //   node review-telemetry.mjs worker <unit> start|end --run-dir <dir> [--attr key=value …]
 //   node review-telemetry.mjs worker <unit> import --from <worker-dir> [--done <output-file>] --run-dir <dir>
+//        [--wait <s>] [--wait-total <s>]   (poll for --done first; see rules/run-telemetry.md § Sub-agents)
+//   node review-telemetry.mjs dispatch --run-dir <dir>   (the caller's dispatch time, on a run it prepared)
 //   node review-telemetry.mjs finish --run-dir <dir> [--status ok|error] [--message m] [--force]
 //   node review-telemetry.mjs summary --run-dir <dir>
 //   node review-telemetry.mjs --self-test
@@ -143,6 +145,7 @@ export const STEPS = Object.freeze({
   gates: "model",
   finders: "model",
   "intent-wait": "model",
+  "intent-verify": "model",
   lenses: "model",
   consolidate: "model",
   verify: "model",
@@ -156,15 +159,19 @@ const STEP_NAME_RE = /^[a-z][a-z0-9-]{0,39}$/;
 /** The steps the model marks itself, in order, for one run's tier and topology — what
  *  prepare-review.mjs prints so the marker list is in front of the model when it needs it,
  *  instead of in a rule it read before Step 1. `quick` runs no lenses; only `hybrid` waits
- *  for the intent worker; `assert` is Step 4a's pre-write checks between `finalize` and `post`.
+ *  for the intent worker, and does it AFTER verifying its own candidates, so the wait starts as
+ *  late as it can (dispatch-topology.md § Running hybrid); `intent-verify` then verifies only the
+ *  intent candidates the verified pool did not already hold. `assert` is Step 4a's pre-write
+ *  checks between `finalize` and `post`.
  *  `state` is not a step: Step 4c's LoreKit writes happen after `post` has exported the run.
  *  @param {{ tier?: string|null, topology?: string|null }} run @returns {string[]} */
 export function modelSteps({ tier, topology }) {
   return [
     "memory", "gates", "finders",
-    ...(topology === "hybrid" ? ["intent-wait"] : []),
     ...(tier === "quick" ? [] : ["lenses"]),
-    "consolidate", "verify", "judgments", "validate", "assert",
+    "consolidate", "verify",
+    ...(topology === "hybrid" ? ["intent-wait", "intent-verify"] : []),
+    "judgments", "validate", "assert",
   ];
 }
 
@@ -381,6 +388,11 @@ export function buildRun(records, now = nowNs()) {
   const dispatch = sorted.filter((x) => x.r.t === "dispatch" && x.ns < runRec.ns).map((x) => x.ns)
     .reduce((/** @type {bigint|null} */ a, b) => (a === null || b < a ? b : a), null);
   const startNs = dispatch ?? runRec.ns;
+  // A caller that ran `prepare` itself (pr-review SKILL.md § Step 2) dispatches the reviewer AFTER
+  // the run began, so its dispatch record lands inside a gap rather than before the run: the gap
+  // holding it is the agent loading its definition, named `load` as well.
+  const lateDispatches = sorted.filter((x) => x.r.t === "dispatch" && x.ns >= runRec.ns).map((x) => x.ns);
+  const holdsDispatch = (/** @type {bigint} */ a, /** @type {bigint} */ b) => lateDispatches.some((d) => d >= a && d < b);
   const endNs = finish ? finish.ns : now;
 
   /** @type {StepSpan[]} */
@@ -436,7 +448,7 @@ export function buildRun(records, now = nowNs()) {
   let cursor = startNs;
   for (const s of steps) {
     // The first gap of a dispatched run is the agent reading its own definition: name it `load`.
-    const gapName = dispatch !== null && cursor === startNs ? "load" : "unmarked";
+    const gapName = (dispatch !== null && cursor === startNs) || holdsDispatch(cursor, s.startNs) ? "load" : "unmarked";
     if (s.startNs - cursor > GAP_MIN_NS) filled.push({ name: gapName, kind: "model", marked: false, startNs: cursor, endNs: s.startNs, attrs: {}, status: 0 });
     filled.push(s);
     if (s.endNs > cursor) cursor = s.endNs;
@@ -762,6 +774,31 @@ export function dispatchTime(dir, firstSeen) {
   return at;
 }
 
+/** The bound on waiting for a hybrid worker's output, across every `--wait` call of one run. */
+export const WAIT_TOTAL_S = 600;
+const WAIT_POLL_MS = 2000;
+
+/**
+ * Poll for a worker's output file (present and non-empty) for at most `waitS` seconds of this call,
+ * and never past `totalS` seconds summed over this run's earlier waits for the same unit.
+ * @param {string} runDir @param {string} unit @param {string} donePath @param {number} waitS @param {number} totalS @param {number} [pollMs]
+ * @returns {Promise<{ ready: boolean, timedOut: boolean, totalMs: number, totalS: number }>}
+ */
+export async function waitForOutput(runDir, unit, donePath, waitS, totalS, pollMs = WAIT_POLL_MS) {
+  const ready = () => { try { return existsSync(donePath) && statSync(donePath).size > 0; } catch { return false; } };
+  const cap = Number.isFinite(totalS) && totalS > 0 ? totalS : WAIT_TOTAL_S;
+  const prior = readLedger(runDir).filter((r) => r.t === "wait" && r.unit === unit).reduce((a, r) => a + (Number(r.ms) || 0), 0);
+  const budget = Math.max(0, Math.min((Number.isFinite(waitS) && waitS >= 0 ? waitS : cap) * 1000, cap * 1000 - prior));
+  const t0 = Date.now();
+  while (!ready() && Date.now() - t0 < budget) {
+    await new Promise((r) => setTimeout(r, Math.max(1, Math.min(pollMs, budget - (Date.now() - t0)))));
+  }
+  const ms = Date.now() - t0;
+  appendRecord(runDir, { t: "wait", unit, ms });
+  const got = ready();
+  return { ready: got, timedOut: !got && prior + ms >= cap * 1000, totalMs: prior + ms, totalS: cap };
+}
+
 /** @param {string[]} args @returns {string} */
 function gitOut(args) {
   try {
@@ -784,7 +821,7 @@ function typed(v) {
 /** The value-taking flags. `flag(args, "<name>")` below is the one reader, so the flag contract is
  *  visible to L1 G43a (which extracts it from this file) and to a reader alike. */
 const VALUE_FLAGS = ["run-dir", "repo", "pr", "head", "head-ref", "mode", "tier", "thoroughness", "topology",
-  "model", "conversation-id", "harness", "target", "status", "message", "from", "done", "attr"];
+  "model", "conversation-id", "harness", "target", "status", "message", "from", "done", "attr", "wait", "wait-total"];
 
 /** @param {string[]} args @param {string} name @returns {string|undefined} */
 function flag(args, name) {
@@ -801,6 +838,7 @@ function parseCli(args) {
     thoroughness: flag(args, "thoroughness"), topology: flag(args, "topology"), model: flag(args, "model"),
     "conversation-id": flag(args, "conversation-id"), harness: flag(args, "harness"), target: flag(args, "target"),
     status: flag(args, "status"), message: flag(args, "message"), from: flag(args, "from"), done: flag(args, "done"),
+    wait: flag(args, "wait"), "wait-total": flag(args, "wait-total"),
     force: args.includes("--force") ? "true" : undefined,
   };
   /** @type {Record<string, string|number|boolean>} */
@@ -833,7 +871,7 @@ async function main(argv) {
   const { positional, opts, attrBag } = parseCli(argv);
   const cmd = positional[0];
   const runDir = opts["run-dir"] || process.env.PR_REVIEW_RUN_DIR || "";
-  if (!cmd) { warn("no command (begin | step | end | attr | worker | finish | summary)"); return; }
+  if (!cmd) { warn("no command (begin | step | end | attr | worker | dispatch | finish | summary)"); return; }
   if (!runDir) { warn(`${cmd}: no --run-dir and no PR_REVIEW_RUN_DIR`); return; }
   try {
     if (cmd === "begin") {
@@ -856,6 +894,9 @@ async function main(argv) {
       appendRecord(runDir, { t: "step", phase: "start", name, attrs: attrBag });
     } else if (cmd === "end") {
       appendRecord(runDir, { t: "step", phase: "end", ...(positional[1] ? { name: positional[1] } : {}), attrs: attrBag });
+    } else if (cmd === "dispatch") {
+      // The caller's dispatch time on a run it prepared itself: the gap holding it becomes `load`.
+      appendRecord(runDir, { t: "dispatch" });
     } else if (cmd === "attr") {
       appendRecord(runDir, { t: "attr", target: opts.target === "step" ? "step" : "run", attrs: attrBag });
     } else if (cmd === "worker") {
@@ -863,6 +904,26 @@ async function main(argv) {
       const phase = positional[2];
       if (!/^[a-z][a-z0-9@_-]{0,39}$/.test(unit) || !["start", "end", "import"].includes(String(phase))) { warn("usage: worker <unit> start|end|import"); return; }
       if (phase === "import") {
+        // `--wait <s>`: poll for the worker's output first, and record how long this run waited
+        // (`<unit>_wait_ms` on the open step and the run), so a trace shows whether the late read
+        // (dispatch-topology.md § Running hybrid) brought the wait to ~0. The wait accumulates
+        // across calls up to `--wait-total` (default 600 s), so a harness whose shell call times out
+        // sooner re-issues the same command instead of losing the bound.
+        if (opts.wait !== undefined && opts.done) {
+          const waited = await waitForOutput(runDir, unit, opts.done, Number(opts.wait), Number(opts["wait-total"] ?? WAIT_TOTAL_S));
+          const bag = { [`${unit}_wait_ms`]: waited.totalMs, [`${unit}_wait_timed_out`]: waited.timedOut };
+          appendRecord(runDir, { t: "attr", target: "step", attrs: bag });
+          appendRecord(runDir, { t: "attr", target: "run", attrs: bag });
+          const secsWaited = Math.round(waited.totalMs / 100) / 10;
+          if (!waited.ready) {
+            console.log(waited.timedOut
+              ? `${unit}: timed out after ${secsWaited}s — run the ${unit} finder in this context`
+              : `${unit}: not ready after ${secsWaited}s of ${waited.totalS}s — re-run this command`);
+            return;
+          }
+          console.log(`${unit}: ready after ${secsWaited}s wait`);
+          attrBag.wait_ms = waited.totalMs;
+        }
         // A worker that prepared its own context (the hybrid intent worker) kept its own ledger;
         // fold its span — first record to last — into this run as one worker span.
         const from = opts.from || "";
@@ -1193,6 +1254,62 @@ async function selfTest() {
     const bBuilt = /** @type {BuiltRun} */ (buildRun(readLedger(bRun)));
     ok("worker import with only the stamp and the output file still folds the worker in and starts the run at the dispatch",
       bBuilt.workers.length === 1 && bBuilt.steps[0].name === "load" && /starts at the dispatch/.test(imp3.stderr), imp3.stderr);
+    // Caller-prepared hybrid run (pr-review SKILL.md § Step 2): the caller's `prepare` begins the
+    // run, its `dispatch` marks when it sent the reviewer, and the reviewer waits for the intent
+    // file only after verifying its own candidates.
+    const lateLedger = [
+      at(0, { t: "run", run_id: "late", facts }),
+      at(0, { t: "step", phase: "start", name: "prepare" }), at(20, { t: "step", phase: "end" }),
+      at(25, { t: "dispatch" }),
+      at(60, { t: "step", phase: "start", name: "memory" }),
+      at(300, { t: "step", phase: "start", name: "verify" }),
+      at(400, { t: "step", phase: "start", name: "intent-wait" }),
+      at(402, { t: "step", phase: "start", name: "intent-verify" }),
+      at(450, { t: "finish", status: "ok" }),
+    ];
+    const late = /** @type {BuiltRun} */ (buildRun(/** @type {any} */ (lateLedger), t0 + 500n * S));
+    ok("a dispatch after `prepare` names the gap holding it `load`, and the run still starts at prepare",
+      late.startNs === t0 && late.steps.map((x) => x.name).join() === "prepare,load,memory,verify,intent-wait,intent-verify"
+        && late.steps[1].marked === false);
+    const wRun = join(dir, "wait");
+    beginRun(wRun, facts);
+    const wDir = join(wRun, "intent");
+    mkdirSync(wDir, { recursive: true });
+    writeFileSync(join(wDir, "intent.json"), "[]");
+    spawnSync(process.execPath, [self, "step", "intent-wait", "--run-dir", wRun], { encoding: "utf8" });
+    const wNow = spawnSync(process.execPath, [self, "worker", "intent", "import", "--from", wDir, "--done", join(wDir, "intent.json"), "--wait", "30", "--run-dir", wRun], { encoding: "utf8" });
+    const wLedger = readLedger(wRun);
+    const wAttrs = wLedger.filter((r) => r.t === "attr" && r.target === "run").map((r) => r.attrs || {});
+    ok("--wait on an output already there returns at once, prints `ready`, and records intent_wait_ms on the run and the step",
+      /^intent: ready after 0(\.\d)?s wait$/m.test(wNow.stdout) && wAttrs.some((a) => a.intent_wait_ms < 1000 && a.intent_wait_timed_out === false)
+        && wLedger.some((r) => r.t === "attr" && r.target === "step" && typeof r.attrs?.intent_wait_ms === "number")
+        && wLedger.filter((r) => r.t === "worker").length === 2, wNow.stdout + wNow.stderr);
+    const wBuilt = /** @type {BuiltRun} */ (buildRun(readLedger(wRun)));
+    ok("the wait lands on the `intent-wait` step span and the worker span",
+      typeof wBuilt.steps.find((x) => x.name === "intent-wait")?.attrs.intent_wait_ms === "number" && typeof wBuilt.workers[0]?.attrs.wait_ms === "number");
+    const midRun = join(dir, "wait-mid");
+    beginRun(midRun, facts);
+    const midFile = join(midRun, "intent", "intent.json");
+    mkdirSync(dirname(midFile), { recursive: true });
+    setTimeout(() => writeFileSync(midFile, "[]"), 250);
+    const mid = await waitForOutput(midRun, "intent", midFile, 10, 600, 25);
+    ok("waitForOutput returns once the worker's file appears mid-wait, and counts the time waited",
+      mid.ready && !mid.timedOut && mid.totalMs >= 200 && mid.totalMs < 5000, JSON.stringify(mid));
+    const toRun = join(dir, "wait-timeout");
+    beginRun(toRun, facts);
+    const missing = join(toRun, "intent", "intent.json");
+    const firstWait = await waitForOutput(toRun, "intent", missing, 0.2, 0.3, 25);
+    const secondWait = await waitForOutput(toRun, "intent", missing, 0.2, 0.3, 25);
+    ok("the wait accumulates across calls and times out at --wait-total, never past it",
+      !firstWait.ready && !firstWait.timedOut && !secondWait.ready && secondWait.timedOut
+        && secondWait.totalMs >= 300 && secondWait.totalMs < 1500, JSON.stringify([firstWait, secondWait]));
+    const toCli = spawnSync(process.execPath, [self, "worker", "intent", "import", "--from", join(toRun, "intent"), "--done", missing, "--wait", "1", "--wait-total", "0.3", "--run-dir", toRun], { encoding: "utf8" });
+    ok("CLI: a timed-out wait says to run intent in this context, exits 0, and folds no worker in",
+      toCli.status === 0 && /^intent: timed out after [\d.]+s — run the intent finder in this context$/m.test(toCli.stdout)
+        && !readLedger(toRun).some((r) => r.t === "worker"), toCli.stdout + toCli.stderr);
+    const dCli = spawnSync(process.execPath, [self, "dispatch", "--run-dir", toRun], { encoding: "utf8" });
+    ok("CLI: `dispatch` appends the caller's dispatch record", dCli.status === 0 && readLedger(toRun).some((r) => r.t === "dispatch"));
+
     // A second review in a directory whose previous run was exported is exported too.
     const reuse = join(dir, "reuse");
     const firstId = beginRun(reuse, facts);
@@ -1211,7 +1328,7 @@ async function selfTest() {
       !("skipped" in notMine) && "skipped" in (await finishRun(reuse, {}, {})));
     // The marker prepare-review.mjs prints: filled in and run as written, it records the step.
     ok("modelSteps lists intent-wait only for hybrid, lenses except on quick, and never state",
-      modelSteps({ tier: "deep", topology: "hybrid" }).join() === "memory,gates,finders,intent-wait,lenses,consolidate,verify,judgments,validate,assert"
+      modelSteps({ tier: "deep", topology: "hybrid" }).join() === "memory,gates,finders,lenses,consolidate,verify,intent-wait,intent-verify,judgments,validate,assert"
         && !modelSteps({ tier: "standard", topology: "in-context" }).includes("intent-wait")
         && !modelSteps({ tier: "quick", topology: "in-context" }).includes("lenses")
         && modelSteps({ tier: "deep", topology: "hybrid" }).every((n) => n in STEPS));
