@@ -136,8 +136,9 @@ checkout is a narrower review, not a failed one.
 ## Phase D: two workers in one message; never expect a second rung
 
 The topology is [`dispatch-topology.md`](./dispatch-topology.md)'s, read from `context.budget`
-exactly as on any other host: `in-context` below thoroughness 0.4, `hybrid` from 0.4. This host
-changes only how `hybrid` runs. A sub-agent here runs while this run waits on it — the only
+exactly as on any other host: `in-context` below thoroughness 0.4, `hybrid` from 0.4, except a
+small incremental re-review, which is `in-context` (`budget.topologyReason: "small-incremental"`).
+This host changes only how `hybrid` runs. A sub-agent here runs while this run waits on it — the only
 concurrency is several dispatches in one message — so `hybrid`'s "run the other finders while the
 intent finder runs" cannot happen in this context, and dispatching the intent finder alone and
 waiting would add its whole runtime (5–6 minutes on a 22-file PR) in series, against a timeout
@@ -151,7 +152,9 @@ So under `hybrid`, send **exactly two `general` sub-agents in one message**:
 | other finders | every other finder active in `context.budget.finders` — `correctness` and `quality` always, `consumer-impact`, `dependency` and `standards` when the budget turns them on — in one context | `<scratch>/others.json` |
 
 That keeps `hybrid`'s isolation — the intent finder alone, the other finders sharing one context —
-and costs the slower worker's runtime instead of the sum. Everything after Phase D stays in this
+and costs the slower worker's runtime instead of the sum. Both workers read the context this run
+prepared; neither runs `prepare-review.mjs`, and the workspace cleanup stays this run's. Both files
+exist when the message returns, so there is no intent wait to mark here. Everything after Phase D stays in this
 run: read both files, pool their candidates for Step 2.5, run the lenses, and verify every candidate
 here, under [`dispatch-topology.md § Verification — in your own context`](./dispatch-topology.md#verification--in-your-own-context),
 shape self-check included. A candidate is not trusted because a worker raised it.
