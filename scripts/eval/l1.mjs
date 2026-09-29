@@ -4404,7 +4404,7 @@ const isPollBlock = (block) =>
       `undefined helper(s) called but never defined: ${undefined_.join(", ")}`);
   }
   s.check("G38g only the rm disposition uses rm -rf, and worktree uses git worktree remove",
-    /worktree\)\s*git worktree remove/.test(ws) && /\brm\)\s*rm -rf/.test(ws));
+    /worktree\)\s*git (?:-C "\$WORKDIR" )?worktree remove/.test(ws) && /\brm\)\s*rm -rf/.test(ws));
   s.check("G38g workspace.md forbids removing a gw worktree at all",
     /never\*{0,2}\s+removed by this agent|not even with `gw remove`/i.test(ws));
   // The fallback is the point of the rung: `gw` is ergonomics, the local object store is the
@@ -5274,8 +5274,8 @@ const isPollBlock = (block) =>
   const flagContract = (src) => {
     const takesValue = new Set();
     const boolean = new Set();
-    // Shape 1 — a switch over argv (build-impact-graph.mjs).
-    for (const m of src.matchAll(/a === "(--[a-z-]+)"\)\s*flags\.\w+\s*=\s*([^;\n]+)/g)) {
+    // Shape 1 — a switch over argv (build-impact-graph.mjs's `flags.x`, prepare-review.mjs's `opts.x`).
+    for (const m of src.matchAll(/a === "(--[a-z-]+)"\)\s*(?:flags|opts)\.\w+\s*=\s*([^;\n]+)/g)) {
       (/argv\[\+\+i\]/.test(m[2]) ? takesValue : boolean).add(m[1]);
     }
     // Shape 2 — an indexOf lookup helper (fingerprint.mjs's `flag(args, "name")`), which

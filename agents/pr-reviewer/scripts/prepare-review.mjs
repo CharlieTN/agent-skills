@@ -42,8 +42,8 @@
  * narrower review, not a failed one.
  */
 
-import { execFile } from "node:child_process";
-import { writeFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { writeFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, openSync, closeSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -101,6 +101,37 @@ export function run(cmd, args, { timeoutMs = 60000, cwd = process.cwd(), maxBuff
       const timedOut = !!(err && err.killed === true);
       res({ ok: !err, code: err ? (err.code ?? 1) : 0, stdout: stdout ?? "", stderr: stderr ?? "", timedOut });
     });
+  });
+}
+
+/**
+ * Like `run()`, but streams stdout straight into `filePath` instead of buffering it. For binary
+ * payloads (the rung-2 tarball): `run()` decodes stdout as UTF-8, which corrupts every non-UTF-8
+ * byte of a `.tgz`, and buffers it under `maxBuffer`, which a large repo's tarball overflows.
+ * Resolves with `run()`'s result shape; `stdout` is always empty and `bytes` is the file's size.
+ * @param {string} cmd @param {string[]} args @param {string} filePath
+ * @param {{ timeoutMs?: number, cwd?: string, env?: NodeJS.ProcessEnv }} [opts]
+ * @returns {Promise<{ ok: boolean, code: number|string, stdout: string, stderr: string, timedOut: boolean, bytes: number }>}
+ */
+export function runToFile(cmd, args, filePath, { timeoutMs = 60000, cwd = process.cwd(), env } = {}) {
+  return new Promise((res) => {
+    const fd = openSync(filePath, "w");
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    const done = (/** @type {number|string} */ code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      closeSync(fd);
+      const bytes = existsSync(filePath) ? statSync(filePath).size : 0;
+      res({ ok: code === 0 && !timedOut, code, stdout: "", stderr, timedOut, bytes });
+    };
+    const child = spawn(cmd, args, { cwd, env: env || process.env, stdio: ["ignore", fd, "pipe"] });
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, timeoutMs);
+    child.stderr.on("data", (d) => { if (stderr.length < 64 * 1024) stderr += String(d); });
+    child.on("error", (e) => { stderr += String(e.message || e); done(/** @type {any} */ (e).code ?? 1); });
+    child.on("close", (code) => done(code ?? 1));
   });
 }
 
@@ -278,6 +309,28 @@ export function resolveRunMode({ isolated = false, full = false, statePath = nul
     mode: effectiveFull ? "full" : null,
     stateIgnored: !!(isolated && statePath),
   };
+}
+
+/** render-report.mjs's `TIER_FOR_MODE`, inverted: the grammar-field mode a routed tier renders as. */
+const MODE_FOR_TIER = { deep: "full", standard: "incremental", quick: "incremental-quick" };
+
+/**
+ * The context's top-level `mode` — RUN.mode for finalize.mjs — once Phase C has routed.
+ * `resolveRunMode` can only decide the forced-full case at Phase 0; every other run's mode
+ * follows from the routed tier. Without this, a re-review that routing promotes to `deep`
+ * (D4–D6) carried `mode: null`, finalize rendered `"unknown"`, and the render failed closed.
+ * A capability cap (`deep` → `standard` under `diff-only`) keeps `full`: render-report.mjs's
+ * carve-out expects exactly that pair, alongside the RUN_ANOMALY naming the cap.
+ * @param {{ runMode: { mode: string|null }, zeroDelta: boolean, routing: { tier: string, capApplied?: boolean } }} args
+ * @returns {string}
+ */
+export function resolveContextMode({ runMode, zeroDelta, routing }) {
+  if (runMode.mode) return runMode.mode;
+  if (zeroDelta) return "zero-delta";
+  if (routing.capApplied) return "full";
+  const mode = MODE_FOR_TIER[routing.tier];
+  if (!mode) throw new Error(`resolveContextMode: routed tier ${JSON.stringify(routing.tier)} maps to no mode`);
+  return mode;
 }
 
 /**
@@ -708,8 +761,16 @@ const CLONE_TIMEOUT_FLOOR_MS = 300000;
  * temp clone or tarball: on a worktree it leaves a stale entry in the parent
  * repo's `.git/worktrees`, so the review breaks the repo it was reviewing.
  */
-async function materializeWorkspace({ repo, number, headSha, timeoutMs, anomalies, isolated = false }) {
-  const originRepo = await currentRepoSlug();
+async function materializeWorkspace({ repo, number, headSha, timeoutMs, anomalies, isolated = false, repoDir = null }) {
+  // Rung 0's local clone. `--repo-dir` names it explicitly; otherwise it is the process's own cwd,
+  // which is only right when the caller happens to run inside a clone of the PR's repo — a
+  // `review-loop` session started in another repo skipped rung 0 and fell to the network rungs.
+  const cloneCwd = repoDir ? pathResolve(repoDir) : process.cwd();
+  if (repoDir && !existsSync(cloneCwd)) anomalies.push(`workspace --repo-dir ${repoDir} does not exist — rung 0 skipped`);
+  const originRepo = repoDir && !existsSync(cloneCwd) ? null : await currentRepoSlug(cloneCwd);
+  if (repoDir && originRepo && originRepo.toLowerCase() !== repo.toLowerCase()) {
+    anomalies.push(`workspace --repo-dir ${repoDir} is a clone of ${originRepo}, not ${repo} — rung 0 skipped`);
+  }
   const cloneTimeoutMs = Math.max(timeoutMs, CLONE_TIMEOUT_FLOOR_MS);
 
   // A/B round 2 item 1(b): every worktree this ladder can create lands under ONE run-scoped
@@ -730,7 +791,7 @@ async function materializeWorkspace({ repo, number, headSha, timeoutMs, anomalie
     // ANOTHER RUN (arm B) had created, because reuse scanned every worktree registered against
     // the shared repo with no notion of which run made which — breaking `--isolated`'s own
     // independence promise. `runScratchDir` below is this scoping.
-    const existing = await findWorktreeAt(headSha, { isolated, runScratchDir });
+    const existing = await findWorktreeAt(headSha, { isolated, runScratchDir, cwd: cloneCwd });
     if (existing) {
       return {
         dir: existing,
@@ -744,13 +805,13 @@ async function materializeWorkspace({ repo, number, headSha, timeoutMs, anomalie
     const fetched = await run(
       "git",
       [...GIT_CREDENTIAL_ARGS, "fetch", "-q", "origin", `pull/${number}/head`],
-      { timeoutMs, env: GIT_NONINTERACTIVE_ENV },
+      { timeoutMs, cwd: cloneCwd, env: GIT_NONINTERACTIVE_ENV },
     );
     if (fetched.ok) {
       mkdirSync(runScratchDir, { recursive: true });
       const parent = mkdtempSync(join(runScratchDir, "wt-"));
       const dir = join(parent, "w");
-      const added = await run("git", ["worktree", "add", "--detach", dir, headSha], { timeoutMs });
+      const added = await run("git", ["worktree", "add", "--detach", dir, headSha], { timeoutMs, cwd: cloneCwd });
       if (added.ok) {
         return {
           dir,
@@ -800,9 +861,8 @@ async function materializeWorkspace({ repo, number, headSha, timeoutMs, anomalie
   // the clone it falls back from, and the old 120s-floor-less timeout starved it identically.
   const tarDir = mkdtempSync(join(scratchRoot(), "tar-"));
   const tarball = join(tarDir, "head.tgz");
-  const got = await run("gh", ["api", `repos/${repo}/tarball/${headSha}`], { timeoutMs: cloneTimeoutMs });
-  if (got.ok && got.stdout.length > 0) {
-    writeFileSync(tarball, got.stdout, "binary");
+  const got = await runToFile("gh", ["api", `repos/${repo}/tarball/${headSha}`], tarball, { timeoutMs: cloneTimeoutMs });
+  if (got.ok && got.bytes > 0) {
     const untarred = await run("tar", ["-xzf", tarball, "-C", tarDir, "--strip-components", "1"], { timeoutMs });
     if (untarred.ok) {
       return {
@@ -848,9 +908,9 @@ export function isReusableWorktreeDir(dir, { isolated = false, runScratchDir = n
  * worktree is excluded: reviewing inside it would put the review in the tree the
  * user is sitting in, and disposal there is never ours.
  */
-async function findWorktreeAt(sha, { isolated = false, runScratchDir = null } = {}) {
+async function findWorktreeAt(sha, { isolated = false, runScratchDir = null, cwd = process.cwd() } = {}) {
   if (!sha) return null;
-  const r = await run("git", ["worktree", "list", "--porcelain"], { timeoutMs: 10000 });
+  const r = await run("git", ["worktree", "list", "--porcelain"], { timeoutMs: 10000, cwd });
   if (!r.ok) return null;
   let dir = null;
   let head = null;
@@ -877,8 +937,8 @@ async function findWorktreeAt(sha, { isolated = false, runScratchDir = null } = 
   return hit ? hit.dir : null;
 }
 
-async function currentRepoSlug() {
-  const r = await run("git", ["remote", "get-url", "origin"], { timeoutMs: 10000 });
+async function currentRepoSlug(cwd = process.cwd()) {
+  const r = await run("git", ["remote", "get-url", "origin"], { timeoutMs: 10000, cwd });
   if (!r.ok) return null;
   const m = r.stdout.trim().match(/github\.com[:/]([^/]+)\/([^/.]+)(?:\.git)?$/i);
   return m ? `${m[1]}/${m[2]}` : null;
@@ -1132,7 +1192,7 @@ async function prepare(opts) {
   if (opts.workspace && checkoutSha) {
     workspace = opts.workdir
       ? { dir: opts.workdir, worktreeParent: null, depthCapability: "checkout", rung: "caller-supplied", cleanup: "none" }
-      : await materializeWorkspace({ repo, number, headSha: checkoutSha, timeoutMs, anomalies, isolated: runMode.isolated });
+      : await materializeWorkspace({ repo, number, headSha: checkoutSha, timeoutMs, anomalies, isolated: runMode.isolated, repoDir: opts.repoDir || null });
   }
   const tier2Checker = detectTier2Checker(workspace.dir);
   timing.end(); // workspace
@@ -1464,10 +1524,10 @@ async function prepare(opts) {
     isolated: runMode.isolated,
     runMode,
     // finalize.mjs reads a top-level `mode` (RUN.mode for the renderer) — this is that field,
-    // mirrored from runMode.mode rather than a second source of truth. Without it, finalize.mjs's
+    // derived from runMode and the routed tier (resolveContextMode). Without it, finalize.mjs's
     // `context?.mode` fallback silently renders "unknown", which is not a member of
     // render-report.mjs's VALID_MODES and fails closed only at render time, not here.
-    mode: runMode.mode,
+    mode: resolveContextMode({ runMode, zeroDelta, routing }),
 
     // What the caller must still do itself. Stated in the artifact, not only in
     // the docs, so a consumer cannot read a partial context as a complete one.
@@ -1619,7 +1679,7 @@ async function prepare(opts) {
       beginRun(runDir, {
         ...hostFacts(),
         repo, number, head_sha: checkoutSha, head_ref: meta.headRefName || undefined,
-        mode: runMode.mode, tier: routing.tier, thoroughness: budget.effectiveThoroughness, topology: budget.topology,
+        mode: context.mode, tier: routing.tier, thoroughness: budget.effectiveThoroughness, topology: budget.topology,
       }, { ns: startNs });
       /** @type {Record<string, number>} */
       const phaseAttrs = {};
@@ -1796,6 +1856,44 @@ async function selfTest() {
     const r = resolveRunMode({});
     return r.mode === null && r.full === false;
   });
+
+  // ── resolveContextMode (Phase C decides what Phase 0 left undecided) ──
+  const undecided = resolveRunMode({});
+  t("a re-review routed deep (refresh trigger) renders mode full, not null", () =>
+    resolveContextMode({ runMode: undecided, zeroDelta: false, routing: { tier: "deep", capApplied: false } }) === "full");
+  t("a re-review routed standard renders mode incremental", () =>
+    resolveContextMode({ runMode: undecided, zeroDelta: false, routing: { tier: "standard" } }) === "incremental");
+  t("a re-review routed quick renders mode incremental-quick", () =>
+    resolveContextMode({ runMode: undecided, zeroDelta: false, routing: { tier: "quick" } }) === "incremental-quick");
+  t("a zero-delta re-review renders mode zero-delta", () =>
+    resolveContextMode({ runMode: undecided, zeroDelta: true, routing: { tier: "quick" } }) === "zero-delta");
+  t("a deep run capped to standard under diff-only keeps mode full (render-report's carve-out pair)", () =>
+    resolveContextMode({ runMode: undecided, zeroDelta: false, routing: { tier: "standard", capApplied: true } }) === "full");
+  t("--full wins over the routed tier", () =>
+    resolveContextMode({ runMode: resolveRunMode({ full: true }), zeroDelta: false, routing: { tier: "standard" } }) === "full");
+  t("every mode resolveContextMode emits is one render-report.mjs accepts", () => {
+    const valid = new Set(["full", "incremental", "incremental-quick", "zero-delta"]);
+    return ["deep", "standard", "quick"].every((tier) => valid.has(resolveContextMode({ runMode: undecided, zeroDelta: false, routing: { tier } })));
+  });
+  t("an unknown routed tier throws instead of rendering an invalid mode", () => {
+    try { resolveContextMode({ runMode: undecided, zeroDelta: false, routing: { tier: "bogus" } }); return false; } catch { return true; }
+  });
+
+  // ── runToFile (rung 2: a binary tarball must reach disk byte-for-byte) ──
+  {
+    const dir = mkdtempSync(join(tmpdir(), "prep-selftest-"));
+    const out = join(dir, "bin.dat");
+    // Every byte value, including the ones UTF-8 decoding rewrites (0x80–0xff).
+    const script = "process.stdout.write(Buffer.from(Array.from({length:256},(_, i)=>i)))";
+    const r = await runToFile(process.execPath, ["-e", script], out, { timeoutMs: 10000 });
+    const bytes = readFileSync(out);
+    t("runToFile streams binary stdout to disk unmodified (all 256 byte values)", () =>
+      r.ok && r.bytes === 256 && bytes.length === 256 && bytes.every((b, i) => b === i));
+    const big = await runToFile(process.execPath, ["-e", "process.stdout.write(Buffer.alloc(80*1024*1024))"], join(dir, "big.dat"), { timeoutMs: 30000 });
+    t("runToFile has no maxBuffer ceiling (80 MB, above run()'s 64 MB)", () => big.ok && big.bytes === 80 * 1024 * 1024);
+    const failed = await runToFile(process.execPath, ["-e", "process.stderr.write('nope'); process.exit(3)"], join(dir, "f.dat"), { timeoutMs: 10000 });
+    t("runToFile reports a non-zero exit and its stderr", () => !failed.ok && failed.code === 3 && failed.stderr.includes("nope"));
+  }
 
   // ── resolvePriorRun (pipeline.md § --isolated item 1: no fallback-rung leak) ──
   t("resolvePriorRun: isolated is null/false even when a real sticky footer is present", () => {
@@ -2134,6 +2232,7 @@ async function main(argv) {
     else if (a === "--repo") opts.repo = argv[++i];
     else if (a === "--out") opts.out = argv[++i];
     else if (a === "--workdir") opts.workdir = argv[++i];
+    else if (a === "--repo-dir") opts.repoDir = argv[++i]; // rung 0's local clone of the PR repo, when the cwd is not one
     else if (a === "--reviewer-login") opts.reviewerLogin = argv[++i];
     else if (a === "--no-workspace") opts.workspace = false;
     else if (a === "--no-impact") opts.impact = false;
