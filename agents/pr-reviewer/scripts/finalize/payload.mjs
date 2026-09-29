@@ -87,6 +87,26 @@ function unwrapMarkdownLinks(s) {
   return s.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
 }
 
+/** Leading ATX heading hashes, blockquote `>`s, and list bullets (`-`/`*`/`+`/`1.`/`1)`), repeated. */
+const LEADING_BLOCK_MARKER_RE = /^(?:#{1,6}(?=\s|$)|>|[-*+](?=\s)|\d{1,9}[.)](?=\s))\s*/;
+/** A line that is nothing but HTML comments. */
+const HTML_COMMENT_ONLY_RE = /^(?:<!--[\s\S]*?-->\s*)+$/;
+
+/**
+ * One line with its leading markdown block markers removed; "" for a line that is only an HTML
+ * comment or only markers, so the caller skips it.
+ * @param {string} line
+ */
+function stripBlockMarkers(line) {
+  let l = line.trim();
+  if (HTML_COMMENT_ONLY_RE.test(l)) return "";
+  for (let prev = ""; prev !== l; ) {
+    prev = l;
+    l = l.replace(LEADING_BLOCK_MARKER_RE, "").trim();
+  }
+  return l;
+}
+
 /**
  * The first non-empty line, then its first sentence if one is found before the line ends —
  * matching pr-reviewer.md's own "take its first sentence (or its suggestion:/issue: line)" prose.
@@ -100,7 +120,10 @@ function unwrapMarkdownLinks(s) {
  * @param {string} s
  */
 function firstSentenceOrLine(s) {
-  const firstLine = String(s).split(/\r?\n/).find((l) => l.trim() !== "") || "";
+  // A thread root's first line can be pure markup: Cursor opens with `### <title>`, other bots with
+  // an HTML-comment marker such as `<!-- DESCRIPTION START -->`. The open-threads row is plain text,
+  // so leading block markers are stripped and a comment-only (or marker-only) line is skipped.
+  const firstLine = String(s).split(/\r?\n/).map(stripBlockMarkers).find((l) => l !== "") || "";
   TERMINAL_PUNCT_RE.lastIndex = 0;
   const m = TERMINAL_PUNCT_RE.exec(firstLine);
   return (m ? firstLine.slice(0, m.index + m[0].length) : firstLine).trim();
@@ -385,6 +408,15 @@ async function selfTest() {
     const multiLine = normalizeAsk("issue: this breaks auth (blocking)\n\nSecond paragraph with more detail.\nThird line.");
     check("normalizeAsk collapses a multi-line/multi-paragraph body to a single line",
       !multiLine.includes("\n") && multiLine === "this breaks auth");
+    // dash0#20655: Cursor's thread body opens with an ATX heading, which rendered as "— ### Older save…".
+    const heading = normalizeAsk("### Older save can hide a confirmed title\n\nDetails follow here.");
+    check("normalizeAsk strips a leading ATX heading marker", heading === "Older save can hide a confirmed title", heading);
+    const quoted = normalizeAsk("> - quoted bullet ask. More text.");
+    check("normalizeAsk strips blockquote and list-bullet markers", quoted === "quoted bullet ask.", quoted);
+    const commented = normalizeAsk("<!-- DESCRIPTION START -->\n\n## Real ask here\nmore");
+    check("normalizeAsk skips an HTML-comment-only line and a heading on the next", commented === "Real ask here", commented);
+    const bold = normalizeAsk("**Bold title** stays intact.");
+    check("normalizeAsk leaves a leading bold span (not a bullet) to the ** strip", bold === "Bold title stays intact.", bold);
     const withLink = normalizeAsk("suggestion: see [the docs](https://example.com/x) for context.");
     check("normalizeAsk unwraps a markdown link rather than leaving one (which assertPlain rejects)",
       !/\[[^\]]*\]\([^)]*\)/.test(withLink) && withLink === "see the docs for context.");
