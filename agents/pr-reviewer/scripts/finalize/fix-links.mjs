@@ -55,6 +55,16 @@ export function fixAllPrompt({ prUrl, login, openCount, stickyCommentId }) {
 }
 
 /**
+ * One GitHub identity, whichever endpoint spelled it: `app/x`, `x[bot]`, and `X` are the same
+ * App. The same semantics as prepare-review.mjs's `normalizeLogin` (asserted equal by the
+ * self-test) — kept local so this pure module does not import prepare-review.mjs.
+ * @param {unknown} login
+ */
+export function normalizeLogin(login) {
+  return String(login || "").trim().toLowerCase().replace(/^app\//, "").replace(/\[bot\]$/, "");
+}
+
+/**
  * Open findings authored by this reviewer: this run's claim findings plus still-open threads
  * whose root author is `login`, deduplicated by `path:line`. A routing input only.
  *
@@ -63,9 +73,10 @@ export function fixAllPrompt({ prUrl, login, openCount, stickyCommentId }) {
 export function openFindingCount(inline, threads, login) {
   const keys = new Set();
   for (const f of inline || []) if (CLAIM_PREFIXES.has(f.prefix)) keys.add(`${f.path}:${f.line}`);
-  if (login) {
+  const me = normalizeLogin(login);
+  if (me) {
     for (const t of threads || []) {
-      if (!t.is_resolved && t.author === login) keys.add(`${t.path}:${t.line}`);
+      if (!t.is_resolved && normalizeLogin(t.author) === me) keys.add(`${t.path}:${t.line}`);
     }
   }
   return keys.size;
@@ -145,6 +156,13 @@ async function selfTest() {
     threads: [{ is_resolved: false, author: "bot", path: "x.ts", line: 2 }, { is_resolved: false, author: "human", path: "y.ts", line: 2 }] }).fixAllUrl !== null);
   check("a human's open thread alone does not", applyFixLinks({ settings: resolveFixLinks({}), prUrl: PR, login: "bot", inline: [],
     threads: [{ is_resolved: false, author: "human", path: "y.ts", line: 2 }] }).fixAllUrl === null);
+  const botThread = [{ is_resolved: false, author: "dash0-dev", path: "a", line: 1 }];
+  check("a thread by `x` counts for login `x[bot]`", openFindingCount([], botThread, "dash0-dev[bot]") === 1);
+  check("a thread by `x[bot]` counts for login `x`", openFindingCount([], [{ ...botThread[0], author: "dash0-dev[bot]" }], "dash0-dev") === 1);
+  check("normalization does not merge distinct logins", openFindingCount([], botThread, "mthines") === 0);
+  const { normalizeLogin: canonical } = await import("../prepare-review.mjs");
+  check("normalizeLogin matches prepare-review.mjs's", ["app/dash0-dev", "dash0-dev[bot]", " Dash0-Dev ", "mthines", "", null]
+    .every((v) => normalizeLogin(v) === canonical(v)));
   check("a caller-supplied FIX_ALL_URL is kept", applyFixLinks({ settings: resolveFixLinks({}), prUrl: PR, login: "bot", inline: [], existingFixAll: "https://app.dash0.com/x" }).fixAllUrl === "https://app.dash0.com/x");
 
   if (failed > 0) {
