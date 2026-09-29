@@ -278,12 +278,15 @@ export async function executeWritePlan(writePlan, opts = {}) {
 
   if (writePlan.sticky_upsert) {
     const su = writePlan.sticky_upsert;
+    // `-F` (`--field`), never `-f`: only `--field` reads `@<path>` as a file. `-f`/`--raw-field` sends
+    // the literal string `@/…/report-body.md`, so every sticky write would replace the report with its
+    // own path.
     const args = su.comment_id
-      ? ["api", `repos/${repo}/issues/comments/${su.comment_id}`, "-X", "PATCH", "-f", `body=@${su.body_path}`]
-      : ["api", `repos/${repo}/issues/${writePlan.pr_number}/comments`, "-f", `body=@${su.body_path}`];
+      ? ["api", `repos/${repo}/issues/comments/${su.comment_id}`, "-X", "PATCH", "-F", `body=@${su.body_path}`]
+      : ["api", `repos/${repo}/issues/${writePlan.pr_number}/comments`, "-F", `body=@${su.body_path}`];
     const r = await runner("gh", args);
     if (!r.ok && su.pointer_body_path) {
-      const rp = await runner("gh", ["api", `repos/${repo}/issues/${writePlan.pr_number}/comments`, "-f", `body=@${su.pointer_body_path}`]);
+      const rp = await runner("gh", ["api", `repos/${repo}/issues/${writePlan.pr_number}/comments`, "-F", `body=@${su.pointer_body_path}`]);
       executed.push({ kind: "sticky.upsert", degraded: true, ok: rp.ok });
     } else {
       executed.push({ kind: "sticky.upsert", degraded: false, ok: r.ok });
@@ -518,6 +521,26 @@ async function selfTest() {
     const result = await executeWritePlan(writePlan, { runner: spy });
     check("empty inline comments -> no review.create in executed[]", !result.executed.some((/** @type {any} */ e) => e.kind === "review.create"));
     check("empty inline comments -> no review POST call was made", !calls.some((c) => c.args.some((/** @type {string} */ a) => a.includes("/reviews"))));
+    // `gh api -f body=@<path>` posts the literal path; only `-F` reads the file.
+    const sticky = calls.find((c) => c.args.includes("body=@/tmp/body.md"));
+    check("sticky.upsert reads its body file with -F, never sends the path as text with -f",
+      sticky?.args[sticky.args.indexOf("body=@/tmp/body.md") - 1] === "-F");
+  }
+
+  // The degraded pointer post reads its file the same way.
+  {
+    /** @type {Array<{ cmd: string, args: string[] }>} */
+    const calls = [];
+    // Only the sticky PATCH fails (403), so the executor falls back to the pointer post.
+    const runner = async (/** @type {string} */ cmd, /** @type {string[]} */ args) => {
+      calls.push({ cmd, args });
+      return args.includes("body=@/tmp/body.md") ? { ok: false, stdout: "", stderr: "HTTP 403" } : { ok: true, stdout: "{}", stderr: "" };
+    };
+    await executeWritePlan({ repo: "owner/repo", pr_number: 1,
+      sticky_upsert: { comment_id: 7, body_path: "/tmp/body.md", pointer_body_path: "/tmp/pointer.md" } }, { runner });
+    const pointer = calls.find((c) => c.args.includes("body=@/tmp/pointer.md"));
+    check("the degraded pointer post reads its body file with -F",
+      pointer?.args[pointer.args.indexOf("body=@/tmp/pointer.md") - 1] === "-F");
   }
 
   // review.create posts via --input (a real JSON array on disk), never `-f comments=<json>` —
