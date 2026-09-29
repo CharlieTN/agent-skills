@@ -222,6 +222,27 @@ export function priorShaFromBody(body) {
  * creates a fresh report instead of rewriting the one that exists.
  * `last` is defensive: there must only ever be one.
  */
+/**
+ * The jq projection the issue-comments fetch applies. It flattens the author to a STRING
+ * (`user: .user.login`), so a matched sticky carries `user: "<login>"`, not `user: { login }`.
+ * Exported so the self-test builds its fixtures from the same projection the fetch uses.
+ */
+export const ISSUE_COMMENTS_JQ = ".[] | {id: .id, user: .user.login, body: .body, html_url: .html_url, created_at: .created_at}";
+
+/**
+ * The login of whoever posted a matched sticky, or null.
+ * Accepts both shapes: the flattened string the `ISSUE_COMMENTS_JQ` fetch emits, and the raw
+ * API object (`{ login }`). Reading only `user.login` made the prior-report-author rung dead,
+ * because the fetch never produces that shape.
+ * @param {{ user?: string | { login?: string } | null } | null | undefined} sticky
+ * @returns {string|null}
+ */
+export function stickyAuthorLogin(sticky) {
+  const u = sticky?.user;
+  if (typeof u === "string") return u || null;
+  return u?.login ?? null;
+}
+
 export function findSticky(comments) {
   const hits = (comments || []).filter((c) => String(c.body || "").includes(REPORT_MARKER));
   if (hits.length) return { ...hits[hits.length - 1], kind: "report", duplicates: hits.length - 1 };
@@ -1185,7 +1206,7 @@ async function prepare(opts) {
         `repos/${owner}/${name}/issues/${number}/comments`,
         "--paginate",
         "--jq",
-        ".[] | {id: .id, user: .user.login, body: .body, html_url: .html_url, created_at: .created_at}",
+        ISSUE_COMMENTS_JQ,
       ],
       timeoutMs,
     ),
@@ -1287,7 +1308,7 @@ async function prepare(opts) {
   const suppliedLogin = opts.reviewerLogin || process.env.PR_REVIEWER_LOGIN || "";
   const { me, identitySource } = resolveReviewerIdentity({
     suppliedLogin, fromFlag: Boolean(opts.reviewerLogin), stateBotLogin: state.botLogin ?? null,
-    stickyAuthorLogin: runMode.isolated ? null : (sticky?.user?.login ?? null),
+    stickyAuthorLogin: runMode.isolated ? null : stickyAuthorLogin(sticky),
   });
   const authorLogin = meta.author?.login || "";
   const reviewRelation = me ? (normalizeLogin(me) === normalizeLogin(authorLogin) ? "self" : "cross") : "cross";
@@ -2298,6 +2319,23 @@ async function selfTest() {
       && f.me === "state-bot[bot]" && f.identitySource === "state-record"
       && g.me === "mthines" && g.identitySource === "--reviewer-login"
       && h.me === "" && h.identitySource === "unknown";
+  });
+  t("identity wiring: a sticky shaped by the real issue-comments projection yields prior-report-author", () => {
+    // Mirror ISSUE_COMMENTS_JQ exactly — the fetch flattens the author to a string.
+    const fields = [...ISSUE_COMMENTS_JQ.matchAll(/(\w+): \.([\w.]+)/g)].map((m) => [m[1], m[2]]);
+    const flattensUser = fields.some(([k, v]) => k === "user" && v === "user.login");
+    const row = (id, login, body) => {
+      const src = { id, user: { login }, body, html_url: `https://github.com/o/r/pull/1#issuecomment-${id}`, created_at: "2026-09-29T00:00:00Z" };
+      return Object.fromEntries(fields.map(([k, v]) => [k, v.split(".").reduce((o, key) => o?.[key], src)]));
+    };
+    const comments = [row(1, "someone", "hello"), row(2, "dash0-dev[bot]", `${REPORT_MARKER}\n### report`)];
+    const sticky = findSticky(comments);
+    const login = stickyAuthorLogin(sticky);
+    const r = resolveReviewerIdentity({ suppliedLogin: "", fromFlag: false, stateBotLogin: null, stickyAuthorLogin: login });
+    return flattensUser && typeof comments[1].user === "string" && sticky?.id === 2
+      && r.identitySource === "prior-report-author" && r.me === "dash0-dev[bot]"
+      && stickyAuthorLogin({ user: { login: "x[bot]" } }) === "x[bot]"
+      && stickyAuthorLogin(null) === null && stickyAuthorLogin({ user: "" }) === null;
   });
   t("readStateFile: an unparseable file degrades to the safe default rather than throwing", () => {
     const p = join(tmpdir(), `prr-state-bad-${process.pid}.json`);
