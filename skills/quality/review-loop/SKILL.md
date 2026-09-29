@@ -471,7 +471,9 @@ while ITERATION < CAP:
         # <dispatch> is the harness's sub-agent dispatch tool — Task, Agent, or
         # another spelling; Step 0 resolved which one. pr-reviewer is an AGENT,
         # so never Skill("pr-reviewer").
-        # REVIEWER_ROUTE == "named": the call above, unchanged.
+        # REVIEWER_ROUTE == "named": the call above, sent the way /pr-review sends it —
+        # with the intent worker in the same message, a dispatch stamp, and
+        # --repo-dir when a local clone exists. See "Sub-step A — the named dispatch".
         # REVIEWER_ROUTE == "agent0" (Step 0 row 2, or row 4 after the install):
         # AGENT0 == 1 (rules/agent0-runtime.md): subagent_type="general" with the
         # short bundle-pointing prompt from that rule — never pr-reviewer, and
@@ -564,6 +566,25 @@ if STOP_REASON in ("cap-reached", "no-progress"):
         CI_STATE = read check state   # never report a state you have not read at head
     if unresolved_thread_count() > 0 or CI_STATE == "red":   # CI_STATE stays "unread" under --no-ci
         report: <STOP_REASON>; surface remaining blockers/flags AND any red check
+```
+
+### Sub-step A — the named dispatch
+
+On `REVIEWER_ROUTE == "named"`, dispatch `pr-reviewer` exactly as the `pr-review` skill's Step 2 does, and never as a bare single call.
+That step owns the procedure: load the `pr-review` skill and follow it, never restate it.
+It adds three things a bare `<dispatch>(subagent_type="pr-reviewer", …)` loses:
+
+1. **The intent worker, in the same message.** The dispatched reviewer holds no dispatch tool, so a bare call runs a `hybrid` budget's intent finder in-context — the setting A/B rounds 7–8 measured missing the highest-severity defect.
+2. **A dispatch stamp** (`dispatched_at` in the intent scratch dir). The reviewer's run telemetry starts the trace there, so the time the agent spends loading its definition is a `load` step instead of an unexplained gap before `prepare`.
+3. **`--repo-dir <path>`, when a local clone of the PR's repository exists** and this session's cwd is not one — this loop is often run from another checkout. Pass the clone's path (the session's own checkout when its `origin` is the PR's repo, or a clone the user named). Without it, the reviewer's workspace rung 0 is skipped and it clones over the network; one observed run fell through to a failed tarball and restarted.
+
+```text
+# RIGHT — one message, both dispatches, as /pr-review Step 2 sends them
+<dispatch>(subagent_type="pr-reviewer", prompt="<PR-URL> --intent-from <dir>/intent.json --repo-dir <clone>")
+<dispatch>(subagent_type="general-purpose", prompt="<worker preamble> … act as the intent finder … write <dir>/intent.json")
+
+# WRONG — a bare call: intent runs in-context, no load step, no local clone
+<dispatch>(subagent_type="pr-reviewer", prompt="<PR-URL>")
 ```
 
 ### Sub-step A — external-review mode
