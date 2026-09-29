@@ -37,6 +37,7 @@
  *        [--timeout-ms N] [--quiet] [--pin-head <sha>] [--isolated] [--full]
  *        [--state <file>] [--effort high] [--thoroughness 0..1] [--no-threads]
  *        [--review-sha <sha>]
+ *   node prepare-review.mjs --cleanup <context.json>
  *   node prepare-review.mjs --self-test
  *
  * Exit codes: 0 ok · 1 unrecoverable (no PR reference resolved, metadata
@@ -45,8 +46,8 @@
  * narrower review, not a failed one.
  */
 
-import { execFile, spawn } from "node:child_process";
-import { writeFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, openSync, closeSync, statSync, rmSync } from "node:fs";
+import { execFile, execFileSync, spawn } from "node:child_process";
+import { writeFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, openSync, closeSync, statSync, rmSync, rmdirSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -969,6 +970,45 @@ export async function localAuthoredDelta({ dirs, from, to, baseSha, prFiles, prF
   return { ok: false, reason: lastReason };
 }
 
+/**
+ * Dispose of a context's workspace by the method its `workspace.cleanup` names — the scripted form
+ * of workspace.md § Cleanup, so the process that ran prepare can release what prepare made.
+ * Whoever ran prepare owns this call: under `/pr-review` and `review-loop` that is the CALLER (it
+ * prepares once for the reviewer and the intent worker), never the reviewer it hands `--context`
+ * to. `none` is left alone; `worktree` goes through `git worktree remove` (an `rm -rf` leaves a stale
+ * `.git/worktrees` entry in the repo under review); `rm` is `rm -rf`. A `worktree`/`rm` directory
+ * outside the scratch root is refused, never deleted: a context that names one was not written by
+ * this script. Idempotent — a directory already gone is success.
+ * @param {{ dir?: string|null, worktreeParent?: string|null, cleanup?: string }} ws
+ * @returns {{ ok: boolean, action: string, message: string }}
+ */
+export function cleanupWorkspace(ws) {
+  const action = String(ws?.cleanup || "none");
+  const dir = ws?.dir ? pathResolve(ws.dir) : "";
+  if (action === "none" || !dir) return { ok: true, action: "none", message: "nothing to clean (cleanup: none)" };
+  if (action !== "worktree" && action !== "rm") return { ok: false, action, message: `unknown cleanup ${JSON.stringify(action)} — refused` };
+  const roots = [tmpdir()];
+  try { roots.push(realpathSync(tmpdir())); } catch { /* keep the unresolved form */ }
+  const inScratch = dir.includes("/.pr-reviewer-scratch/") || roots.some((r) => dir.startsWith(`${r}/`));
+  if (!inScratch) return { ok: false, action, message: `${dir} is outside the scratch root — refused, nothing deleted` };
+  if (!existsSync(dir)) return { ok: true, action, message: `${dir} already gone` };
+  try {
+    if (action === "worktree") {
+      execFileSync("git", ["-C", dir, "worktree", "remove", "--force", dir], { stdio: ["ignore", "ignore", "pipe"], timeout: 60000 });
+      // workspace.md: `git worktree add` refused an existing path, so the parent is a mkdtemp dir
+      // holding only the worktree, and its `run-*` parent holds only that. rmdir, never rm -rf.
+      for (const d of [ws.worktreeParent, ws.worktreeParent ? dirname(ws.worktreeParent) : null]) {
+        if (d && /\/(wt-[^/]+|run-[^/]+)$/.test(d)) { try { rmdirSync(d); } catch { /* not empty: leave it */ } }
+      }
+    } else {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  } catch (e) {
+    return { ok: false, action, message: `${action} cleanup of ${dir} failed: ${String(/** @type {any} */ (e)?.stderr || /** @type {any} */ (e)?.message || e).trim().slice(0, 200)}` };
+  }
+  return { ok: !existsSync(dir), action, message: existsSync(dir) ? `${dir} still exists after ${action}` : `removed ${dir} (${action})` };
+}
+
 async function materializeWorkspace({ repo, number, headSha, timeoutMs, anomalies, isolated = false, repoDir = null }) {
   // Rung 0's local clone. `--repo-dir` names it explicitly; otherwise it is the process's own cwd,
   // which is only right when the caller happens to run inside a clone of the PR's repo — a
@@ -1756,7 +1796,9 @@ async function prepare(opts) {
   // "in-context"` and logs RUN_ANOMALY when that downgrades it
   // (dispatch-topology.md § Reading a budget into dispatch).
   const thoroughnessOverride = opts.thoroughness === "" ? undefined : Number(opts.thoroughness);
+  const contextMode = resolveContextMode({ runMode, zeroDelta, routing });
   const budget = resolveBudget({
+    runMode: contextMode, // a small incremental re-review skips the intent worker (route-depth.mjs SMALL_INCREMENTAL_MODES)
     thoroughness: thoroughnessOverride,
     routedTier: routing.tier,
     shape: (deltaShape && deltaShape.shapes) || [],
@@ -1787,7 +1829,7 @@ async function prepare(opts) {
     // derived from runMode and the routed tier (resolveContextMode). Without it, finalize.mjs's
     // `context?.mode` fallback silently renders "unknown", which is not a member of
     // render-report.mjs's VALID_MODES and fails closed only at render time, not here.
-    mode: resolveContextMode({ runMode, zeroDelta, routing }),
+    mode: contextMode,
 
     // What the caller must still do itself. Stated in the artifact, not only in
     // the docs, so a consumer cannot read a partial context as a complete one.
@@ -2750,6 +2792,43 @@ async function selfTest() {
     return isReusableWorktreeDir("/anything", { isolated: true, runScratchDir: null }) === false;
   });
 
+  // The caller that ran prepare owns the workspace (pr-review SKILL.md § Step 2): the scripted
+  // cleanup removes a worktree through git, an rm-rung dir with rm -rf, leaves `none`, and refuses
+  // a directory outside the scratch root.
+  t("cleanupWorkspace removes a worktree through git, leaving no .git/worktrees entry, and is idempotent", () => {
+    const base = mkdtempSync(join(tmpdir(), "prr-cleanup-"));
+    try {
+      const repo = join(base, "repo");
+      mkdirSync(repo);
+      const g = (/** @type {string[]} */ a, cwd = repo) => execFileSync("git", a, { cwd, stdio: ["ignore", "pipe", "ignore"], encoding: "utf8" });
+      g(["init", "-q"]); writeFileSync(join(repo, "f"), "x");
+      g(["-c", "user.email=t@t", "-c", "user.name=t", "add", "f"]);
+      g(["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", "c"]);
+      const parent = join(base, ".pr-reviewer-scratch", "run-1", "wt-a");
+      mkdirSync(parent, { recursive: true });
+      const dir = join(parent, "w");
+      g(["worktree", "add", "-q", "--detach", dir]);
+      const r = cleanupWorkspace({ dir, worktreeParent: parent, cleanup: "worktree" });
+      const again = cleanupWorkspace({ dir, worktreeParent: parent, cleanup: "worktree" });
+      return r.ok && !existsSync(dir) && !existsSync(parent) && !g(["worktree", "list"]).includes(dir) && again.ok;
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+  t("cleanupWorkspace rm-rfs an rm-rung dir, leaves cleanup:none alone, and refuses a dir outside the scratch root", () => {
+    const base = mkdtempSync(join(tmpdir(), "prr-cleanup-"));
+    try {
+      const clone = join(base, "clone-x"); mkdirSync(join(clone, "sub"), { recursive: true }); writeFileSync(join(clone, "sub", "f"), "x");
+      const kept = join(base, "user-worktree"); mkdirSync(kept);
+      const rm = cleanupWorkspace({ dir: clone, cleanup: "rm" });
+      const none = cleanupWorkspace({ dir: kept, cleanup: "none" });
+      const outside = cleanupWorkspace({ dir: "/definitely/not/scratch/w", cleanup: "rm" });
+      return rm.ok && !existsSync(clone) && none.ok && existsSync(kept) && !outside.ok && /outside the scratch root/.test(outside.message);
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+  t("budget reads the context's run mode: a small incremental re-review is in-context", () => {
+    const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
+    return /const budget = resolveBudget\(\{\n\s+runMode: contextMode,/.test(src) && /mode: contextMode,/.test(src);
+  });
+
   // Every case's name is echoed on PASS too, not only on failure — this is the one self-test
   // in the pipeline a standing L1 guard (or a checks.yaml AC) greps for a case NAME in the
   // OUTPUT rather than only in the source, so a silent-on-success run would read as though
@@ -2780,6 +2859,18 @@ async function selfTest() {
 
 async function main(argv) {
   if (argv[0] === "--self-test") return selfTest();
+  if (argv[0] === "--cleanup") {
+    // The caller that ran prepare releases the workspace once every agent it handed the context to
+    // has returned (pr-review SKILL.md § Step 2). Exit 1 on a refusal or a failed removal.
+    let ws;
+    try { ws = JSON.parse(readFileSync(argv[1] || "", "utf8")).workspace; } catch (e) {
+      process.stderr.write(`cleanup: cannot read ${JSON.stringify(argv[1] || "")}: ${String(/** @type {any} */ (e)?.message || e)}\n`);
+      process.exit(2);
+    }
+    const r = cleanupWorkspace(ws);
+    process.stderr.write(`cleanup: ${r.message}\n`);
+    process.exit(r.ok ? 0 : 1);
+  }
 
   const opts = {
     pr: "",
