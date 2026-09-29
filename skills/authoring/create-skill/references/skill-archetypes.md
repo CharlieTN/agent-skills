@@ -99,7 +99,7 @@ description makes it clear.
 ## A3 — Slash command (sequential workflow)
 
 **Examples in this repo:** `resolve-conflicts`, `pr-review`,
-`review-changes` — each a single `SKILL.md`, no `rules/`, `references/`,
+`polish` — each a single `SKILL.md`, no `rules/`, `references/`,
 or `templates/` directory.
 
 **Shape:**
@@ -131,8 +131,7 @@ controls timing.
 
 ## A4 — Workflow companion
 
-**Examples in this repo:** `aw-create-plan`, `aw-create-walkthrough`,
-`aw-review-quality-gate`.
+**Examples in this repo:** `aw-create-plan`, `aw-create-walkthrough`.
 
 **Shape:**
 
@@ -166,7 +165,7 @@ explicitly.
 
 ## A5 — Orchestrator (multi-phase)
 
-**Examples in this repo:** `autonomous-workflow`, `batch-linear-tickets`.
+**Examples in this repo:** `autonomous-workflow`, `review-loop`.
 
 **Shape:**
 

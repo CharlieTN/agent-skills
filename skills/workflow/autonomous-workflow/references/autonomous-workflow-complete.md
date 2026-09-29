@@ -885,7 +885,7 @@ Skill("review-loop", "<pr-url> --critical --no-ci --no-preview-run")
 Skill("aw-create-walkthrough")
 → Wrote .agent/feat-dark-mode-toggle/walkthrough.md
 → Captured: change narrative, testing summary, screenshots placeholder,
-            review-changes advisory notes
+            review-loop advisory notes
 ```
 
 ### Create PR
@@ -902,7 +902,7 @@ Skill("create-pr")
 **Progress Log entries:**
 
 ```markdown
-- [2026-04-29T10:42:01Z] Phase 6: review-changes() — no blocking findings
+- [2026-04-29T10:42:01Z] Phase 6: review-loop — converged, no blocking findings
 - [2026-04-29T10:42:18Z] Phase 6: aw-create-walkthrough() — walkthrough.md written
 - [2026-04-29T10:42:44Z] Phase 6: create-pr() — draft PR #123 opened
 ```
@@ -999,7 +999,7 @@ After PR is merged, run: `gw remove feat/dark-mode-toggle`
 - ✅ Phase 3: Implementation self-reviewed
 - ✅ Phase 4: Tests passing (1 iteration)
 - ✅ Phase 5: Documentation validated, `docs update` invoked
-- ✅ Phase 6: `review-changes` + `aw-create-walkthrough` + `create-pr` invoked
+- ✅ Phase 6: `aw-create-walkthrough` + `create-pr` + `review-loop` invoked
 - ✅ Phase 7: `ci-auto-fix` invoked — all checks green
 
 **Result:** Complete, production-ready feature delivered autonomously!
