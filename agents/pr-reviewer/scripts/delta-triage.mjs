@@ -229,6 +229,7 @@ export async function resolveIntactDelta({ compareFiles, prFiles, readLocal, rea
  * Cumulative churn lines (D4) from the churn compare's per-file `{filename, lines}` rows. A
  * trusted list sums over the PR's files; an untrusted one (truncated or polluted) is replaced by
  * the local-git authored delta's lines, else read as OVER the refresh threshold — never guessed.
+ * Either replacement returns an anomaly naming the route and the reason.
  * @param {{perFile: {filename: string, lines?: number}[], prFiles: PrFile[], readLocal: () => Promise<LocalDeltaResult>}} input
  * @returns {Promise<{lines: number, anomaly: string|null}>}
  */
@@ -236,7 +237,9 @@ export async function resolveChurnLines({ perFile, prFiles, readLocal }) {
   const trust = compareTrust(/** @type {PrFile[]} */ (perFile), prFiles);
   if (trust.trusted) return { lines: prChurnLines(perFile, prFiles), anomaly: null };
   const local = await readLocal();
-  if (local.ok) return { lines: deltaCounts(local.files).deltaLines, anomaly: null };
+  if (local.ok) {
+    return { lines: deltaCounts(local.files).deltaLines, anomaly: `cumulative-churn compare untrusted (${trust.reason}) — churn computed from local git (authored commits since the last full pass, over the PR's files)` };
+  }
   return { lines: FULL_REFRESH_DELTA + 1, anomaly: `cumulative-churn compare untrusted (${trust.reason}) and local git unavailable (${local.reason}) — treated as over the refresh threshold` };
 }
 
@@ -414,7 +417,9 @@ async function selfTest() {
     churnTrunc.lines === FULL_REFRESH_DELTA + 1 && /untrusted/.test(churnTrunc.anomaly || ""));
   const churnLocal = await resolveChurnLines({ perFile: [{ filename: "CODEOWNERS.bak", lines: 900 }, { filename: "agent0/store.ts", lines: 5 }], prFiles: pr20655,
     readLocal: async () => ({ ok: true, files: authored }) });
-  ok("resolveChurnLines: polluted list uses the local-git authored lines", churnLocal.lines === 70 && churnLocal.anomaly === null);
+  ok("resolveChurnLines: polluted list uses the local-git authored lines and names the route and the reason",
+    churnLocal.lines === 70 && /cumulative-churn compare untrusted \(.*outside the PR's own diff.*\) — churn computed from local git/.test(churnLocal.anomaly || ""),
+    String(churnLocal.anomaly));
 
   console.log(`${fails.length === 0 ? "✓" : "✗"} delta-triage self-test: ${fails.length === 0 ? "all checks passed" : `${fails.length} failed`}`);
   for (const f of fails) console.log(`    ✗ ${f}`);
