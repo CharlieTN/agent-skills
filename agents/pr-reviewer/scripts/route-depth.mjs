@@ -239,6 +239,15 @@ const T_TOOLCALLS_2 = 0.95;
  *  minutes against 9–13 for one context, so there is no parallel topology. */
 export const HYBRID_ISOLATED_FINDERS = Object.freeze(["intent"]);
 
+/** Run modes on which a `standard`/`quick` re-review skips the isolated intent worker. UNMEASURED:
+ *  the A/B evidence for `hybrid` is one deep, 22-file, full review (sync-tray#72); no A/B round
+ *  ever ran an incremental re-review, so this default is a cost call, not a measured one. On
+ *  dash0#20655 the reviewer idled ~125 s waiting for the worker — a worker that also re-ran the
+ *  whole prepare — on a delta far smaller than the review that justified it. An explicit
+ *  `--thoroughness` or `--effort high` still gets `hybrid`; only the defaulted budget changes. */
+export const SMALL_INCREMENTAL_MODES = Object.freeze(["incremental", "incremental-quick", "zero-delta"]);
+const SMALL_INCREMENTAL_TIERS = new Set(["standard", "quick"]);
+
 /** @param {string[]} shape @param {string} band */
 function highStakesReason(shape, band) {
   const hit = (shape ?? []).find((s) => HIGH_STAKES_SHAPES.has(s));
@@ -251,6 +260,7 @@ function highStakesReason(shape, band) {
  *   thoroughness?: number, routedTier?: "deep"|"standard"|"quick",
  *   shape?: string[], band?: string, depthCapability?: string,
  *   dispatchAvailable?: boolean, effortHigh?: boolean, changedFiles?: number,
+ *   runMode?: string,
  * }} ResolveBudgetInput
  * @typedef {{
  *   effectiveThoroughness: number, requestedThoroughness: number,
@@ -259,6 +269,7 @@ function highStakesReason(shape, band) {
  *     "consumer-impact": boolean, dependency: boolean, standards: boolean},
  *   finderScope: {"consumer-impact": "none"|"delta"|"all", standards: "none"|"delta"|"all"},
  *   correctnessVotes: 1, topology: "in-context"|"hybrid", isolatedFinders: string[],
+ *   topologyReason: "below-breakpoint"|"no-dispatch"|"small-incremental"|"hybrid",
  *   maxVerificationTier: 1|2|3, holisticEscalationCap: number,
  *   optimalityLens: boolean, measurabilityLens: boolean, holisticBroadPass: boolean,
  *   toolCallMultiplier: 1|1.5|2, toolCalls: number|null,
@@ -327,8 +338,17 @@ export function resolveBudget(i = {}) {
   /** @type {1|1.5|2} */
   const toolCallMultiplier = t >= T_TOOLCALLS_2 ? 2 : t >= T_TOOLCALLS_1_5 ? 1.5 : 1;
 
+  // A small incremental re-review (a `standard`/`quick` tier on a non-full run mode) with a
+  // DEFAULTED thoroughness skips the worker — see SMALL_INCREMENTAL_MODES for why, and that it is
+  // unmeasured. An explicit override is a deliberate ask and keeps the breakpoint's answer.
+  const defaulted = !i.effortHigh && (i.thoroughness === undefined || i.thoroughness === null);
+  const smallIncremental = defaulted && SMALL_INCREMENTAL_MODES.includes(String(i.runMode))
+    && SMALL_INCREMENTAL_TIERS.has(String(i.routedTier));
+  /** @type {"below-breakpoint"|"no-dispatch"|"small-incremental"|"hybrid"} */
+  const topologyReason = !dispatchAvailable ? "no-dispatch" : t < T_TOPOLOGY ? "below-breakpoint"
+    : smallIncremental ? "small-incremental" : "hybrid";
   /** @type {"in-context"|"hybrid"} */
-  const topology = !dispatchAvailable || t < T_TOPOLOGY ? "in-context" : "hybrid";
+  const topology = topologyReason === "hybrid" ? "hybrid" : "in-context";
   const isolatedFinders = topology === "hybrid" ? [...HYBRID_ISOLATED_FINDERS] : [];
 
   return {
@@ -351,6 +371,7 @@ export function resolveBudget(i = {}) {
     },
     correctnessVotes: CORRECTNESS_VOTES,
     topology,
+    topologyReason,
     isolatedFinders,
     maxVerificationTier: t >= T_VERIFY_TIER_3 ? 3 : t >= T_VERIFY_TIER_2 ? 2 : 1,
     holisticEscalationCap: Math.round(10 * t),
@@ -553,6 +574,29 @@ function selfTest() {
       && top.topology === "hybrid" && noDispatch.topology === "in-context" && noDispatch.isolatedFinders.length === 0
       && [low, hyb, top].every((b) => b.correctnessVotes === 1)) passed++;
     else fails.push(`topology/isolatedFinders/votes drifted: ${JSON.stringify({ low: low.topology, hyb: [hyb.topology, hyb.isolatedFinders], top: top.topology, noDispatch: noDispatch.topology })}`);
+  }
+
+  // ---- resolveBudget: a small incremental re-review skips the intent worker (unmeasured default) ----
+  total++;
+  {
+    const inc = (/** @type {any} */ x) => resolveBudget({ dispatchAvailable: true, ...x });
+    const incStd = inc({ routedTier: "standard", runMode: "incremental" });
+    const incQuick = inc({ routedTier: "quick", runMode: "incremental-quick" });
+    const zero = inc({ routedTier: "quick", runMode: "zero-delta" });
+    const fullStd = inc({ routedTier: "standard", runMode: "full" });
+    const incDeep = inc({ routedTier: "deep", runMode: "incremental" });
+    const incStdAsked = inc({ routedTier: "standard", runMode: "incremental", thoroughness: 0.8 });
+    const incStdEffort = inc({ routedTier: "standard", runMode: "incremental", effortHigh: true });
+    const noMode = inc({ routedTier: "standard" });
+    const ok = incStd.topology === "in-context" && incStd.topologyReason === "small-incremental" && incStd.isolatedFinders.length === 0
+      && incQuick.topology === "in-context" && zero.topology === "in-context"
+      && fullStd.topology === "hybrid" && incDeep.topology === "hybrid" && noMode.topology === "hybrid"
+      && incStdAsked.topology === "hybrid" && incStdEffort.topology === "hybrid"
+      // only the topology moves: every other lever of the small-incremental budget is unchanged
+      && incStd.measurabilityLens === noMode.measurabilityLens && incStd.maxVerificationTier === noMode.maxVerificationTier
+      && JSON.stringify(incStd.finders) === JSON.stringify(noMode.finders);
+    if (ok) passed++;
+    else fails.push(`small-incremental topology drifted: ${JSON.stringify({ incStd: [incStd.topology, incStd.topologyReason], incQuick: incQuick.topology, zero: zero.topology, fullStd: fullStd.topology, incDeep: incDeep.topology, asked: incStdAsked.topology, effort: incStdEffort.topology, noMode: noMode.topology })}`);
   }
 
   // ---- resolveBudget: monotonicity — for any t1 < t2, budget(t2) is a

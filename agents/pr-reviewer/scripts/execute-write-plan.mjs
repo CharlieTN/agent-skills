@@ -285,7 +285,17 @@ export async function executeWritePlan(writePlan, opts = {}) {
       ? ["api", `repos/${repo}/issues/comments/${su.comment_id}`, "-X", "PATCH", "-F", `body=@${su.body_path}`]
       : ["api", `repos/${repo}/issues/${writePlan.pr_number}/comments`, "-F", `body=@${su.body_path}`];
     const r = await runner("gh", args);
-    if (!r.ok && su.pointer_body_path) {
+    // A `comment_id` from the state record is a cache, never an authority: the comment it names may
+    // have been deleted. A 404 on the PATCH therefore recreates the FULL report with a POST — posting
+    // the pointer there would leave the PR with no report at all. Any other PATCH failure (403, 5xx),
+    // or a failed recreate, keeps the pointer fallback below.
+    const deleted = !r.ok && su.comment_id && /\b404\b|Not Found/i.test(`${r.stderr || ""}\n${r.stdout || ""}`);
+    const rc = deleted
+      ? await runner("gh", ["api", `repos/${repo}/issues/${writePlan.pr_number}/comments`, "-F", `body=@${su.body_path}`])
+      : null;
+    if (rc?.ok) {
+      executed.push({ kind: "sticky.upsert", recreated: true, degraded: false, ok: true });
+    } else if (!r.ok && su.pointer_body_path) {
       const rp = await runner("gh", ["api", `repos/${repo}/issues/${writePlan.pr_number}/comments`, "-F", `body=@${su.pointer_body_path}`]);
       executed.push({ kind: "sticky.upsert", degraded: true, ok: rp.ok });
     } else {
@@ -541,6 +551,35 @@ async function selfTest() {
     const pointer = calls.find((c) => c.args.includes("body=@/tmp/pointer.md"));
     check("the degraded pointer post reads its body file with -F",
       pointer?.args[pointer.args.indexOf("body=@/tmp/pointer.md") - 1] === "-F");
+  }
+
+  // A deleted sticky (the PATCH 404s on a state-record comment_id) is RECREATED with the full
+  // report body, never replaced by the pointer. A non-404 PATCH failure still posts the pointer.
+  for (const [label, stderr, expectRecreate] of /** @type {Array<[string, string, boolean]>} */ ([
+    ["a 404 on the sticky PATCH", "HTTP 404: Not Found", true],
+    ["a 403 on the sticky PATCH", "HTTP 403: Forbidden", false],
+  ])) {
+    /** @type {Array<{ cmd: string, args: string[] }>} */
+    const calls = [];
+    const runner = async (/** @type {string} */ cmd, /** @type {string[]} */ args) => {
+      calls.push({ cmd, args });
+      return args.includes("PATCH") ? { ok: false, stdout: "", stderr } : { ok: true, stdout: "{}", stderr: "" };
+    };
+    const res = await executeWritePlan({ repo: "owner/repo", pr_number: 1,
+      sticky_upsert: { comment_id: 7, body_path: "/tmp/body.md", pointer_body_path: "/tmp/pointer.md" } }, { runner });
+    const stickyCalls = calls.filter((c) => c.args.some((a) => a.includes("issues/")));
+    const second = stickyCalls[1];
+    const pointerPosted = calls.some((c) => c.args.includes("body=@/tmp/pointer.md"));
+    const step = (res.executed || []).find((/** @type {any} */ e) => e.kind === "sticky.upsert");
+    if (expectRecreate) {
+      check(`${label} recreates the report with a POST of the FULL body`,
+        Boolean(second) && !second.args.includes("PATCH")
+          && second.args[1] === "repos/owner/repo/issues/1/comments" && second.args.includes("body=@/tmp/body.md"));
+      check(`${label} posts no pointer`, !pointerPosted);
+      check(`${label} records the step as recreated`, step?.recreated === true && step?.ok === true);
+    } else {
+      check(`${label} still falls back to the pointer`, pointerPosted && !step?.recreated);
+    }
   }
 
   // review.create posts via --input (a real JSON array on disk), never `-f comments=<json>` —

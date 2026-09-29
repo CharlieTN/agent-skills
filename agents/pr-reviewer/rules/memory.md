@@ -117,7 +117,7 @@ zero calls against it. If you change where the read happens, change both files i
 
 ```text
 # 1. The knowledge + hotspot records for this repo. Tag-filtered, not just kind/host.
-mcp__lorekit__memory_list    scope="repo::{owner}/{repo}"  tags=["codebase-knowledge"]  kind=signal  host=reviewer  limit=50
+mcp__lorekit__memory_list    scope="repo::{owner}/{repo}"  tags=["codebase-knowledge"]  kind=signal  host=reviewer  limit=50  view="summary"
 
 # 2. A targeted search on the symbols the impact graph says changed.
 mcp__lorekit__memory_search  q="<symbol> <symbol> <symbol>"  scopes=["repo::{owner}/{repo}"]  limit=25
@@ -129,7 +129,21 @@ mcp__lorekit__memory_search  q="<symbol> <symbol> <symbol>"  scopes=["repo::{own
 
 Relevance rules are **not** read here. They have their own tag-filtered pair of calls at Step 1.0 ([`comment-relevance-memory.md § When to read`](../../shared/rules/comment-relevance-memory.md#when-to-read)), and the untagged call was silently duplicating that read while crowding out the records it was itself for. Do not add a call here to fetch them.
 
-Two calls, matching the two the agent already makes for lessons — pointed at better data, not added on top.
+**Call 1 is summary-only, and matched keys are expanded.**
+A full page of 50 knowledge records was about 101 KB on dash0#20655, which overflowed the tool output and left the model paging through a saved file for records the diff mostly does not touch.
+`view="summary"` returns each key with a 200-character preview, and a key is the match: `knowledge::<symbol>@<path>` and `hotspot::<path>` name exactly what the match table below looks up.
+Expand a matched key with `mcp__lorekit__memory_read` only when call 2 did not already return its full value, at most **5** per run, highest `blast_radius` first. Those reads are drawn from the agent's shared `MEMORY_READ_BUDGET` pool (spent first, before Step 1.2d), never an extra allowance.
+
+```text
+# correct: the page is keys; only what matches the impact graph is read in full
+mcp__lorekit__memory_list  scope="repo::{owner}/{repo}"  tags=["codebase-knowledge"]  kind=signal  host=reviewer  limit=50  view="summary"
+mcp__lorekit__memory_read  scope="repo::{owner}/{repo}"  key="knowledge::retryRequest@src/api/client.ts"
+
+# incorrect: every record's full value, to use two of them
+mcp__lorekit__memory_list  scope="repo::{owner}/{repo}"  tags=["codebase-knowledge"]  kind=signal  host=reviewer  limit=50
+```
+
+Two list/search calls, matching the two the agent already makes for lessons — pointed at better data, not added on top.
 On a repo whose `repo::` scope exceeds the `memory_list` page, the search is what finds the record for a symbol that is not in the top 50; neither call alone is sufficient.
 
 ### The read budget is fixed, and it is these two calls
@@ -138,7 +152,7 @@ On a repo whose `repo::` scope exceeds the `memory_list` page, the search is wha
 
 | Rule | Value |
 | --- | --- |
-| calls per run | exactly **2** — the `memory_list` above and the `memory_search` above |
+| calls per run | exactly **2** — the `memory_list` above and the `memory_search` above — plus at most **5** `memory_read` expansions from the shared `MEMORY_READ_BUDGET` pool |
 | `memory_list` page | `limit=50`, **one page** |
 | `memory_search` page | `limit=25`, **one page** |
 | symbols in the search query | the **top 10** changed symbols by `blast_radius`, from `impact.json` |

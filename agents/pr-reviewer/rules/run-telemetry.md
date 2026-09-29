@@ -12,7 +12,7 @@ This rule gives every run a per-step breakdown, and exports it as a trace in the
 | `prepare` | `prepare-review.mjs` | Starts the run; backdated to the script's own start. Each internal phase (`fetch`, `resolve`, `workspace`, `classify-shape`, `impact-graph`, `packet`, `standards`, `triage-routing`) is a child span with its own start and end. |
 | `finalize` | `finalize.mjs` | Adds the outcome (verdict, candidates, confirmed, posted inline) to the run; **finishes and exports the run under `--dry-run`** when it renders. A finalize that fails to render is an ERROR step and leaves the run open, so the re-run that succeeds is the one exported. |
 | `post` | `execute-write-plan.mjs` | A real run's last step; finishes and exports the run. |
-| `load` | `worker intent import` | Hybrid runs only: the caller's dispatch stamp starts the run, so the time the agent spends reading its definition and rules before `prepare` is a `load` step instead of missing from the trace. |
+| `load` | `worker intent import`, or the caller's `dispatch` | The gap in which the agent reads its definition and rules. A dispatch stamp before `prepare` starts the run there; when the caller ran `prepare` itself (`/pr-review`, `review-loop`), `review-telemetry.mjs dispatch` records the dispatch after it, and the gap holding that record is `load`. |
 
 The ledger is `telemetry.jsonl` next to `context.json` — `context.telemetry.runDir`.
 Read it once, right after `prepare-review.mjs` wrote the context:
@@ -25,7 +25,7 @@ TELEMETRY="$AGENT_SUPPORT/pr-reviewer/scripts/review-telemetry.mjs"
 Most harnesses start a fresh shell for every tool call, so these variables do not survive to the next command.
 Write the two literal paths into every marker instead of relying on them; the examples below use the variables only for brevity.
 
-`prepare-review.mjs --no-telemetry` starts no run; the hybrid intent worker uses it, because its preparation is part of the reviewer's run, not a run of its own.
+Under `/pr-review` and `review-loop` the caller runs `prepare-review.mjs` once and hands the reviewer `--context`, so the run and its `prepare` step begin in the caller; the reviewer marks its steps into the same ledger. The intent worker runs no prepare at all. `prepare-review.mjs --no-telemetry` starts no run, for a caller that must not.
 
 ## What you mark: the model steps
 
@@ -33,20 +33,27 @@ Everything between `prepare` and `finalize` is model time, and only you know whe
 Mark a step when it starts; a step ends when the next one starts.
 A gap nobody marked is exported as `unmarked`, so the steps always add up to the run.
 
+`prepare-review.mjs` prints the marker for this run on its `markers` line, with both absolute paths filled in, followed by the steps this run's tier and topology will take.
+The same two values are in the context as `telemetry.markers.command` and `telemetry.markers.steps`.
+Copy the command from there rather than rebuilding it.
+On dash0#20655 a deep run that read this rule before Step 1 marked `memory`, `gates`, `finders`, and `judgments`, and never marked `lenses`, `consolidate`, or `verify`, although all three ran.
+
 | Step | Starts at |
 | --- | --- |
 | `memory` | Step 0.7 / Step 1.0 memory reads |
 | `gates` | Step 1.8 |
 | `finders` | Phase D, the first finder |
-| `intent-wait` | hybrid only: waiting for `--intent-from` |
 | `lenses` | Step 2.4, the holistic broad pass |
 | `consolidate` | Step 2.5 |
-| `verify` | Step 2.6b |
+| `verify` | Step 2.6b, your own candidates |
+| `intent-wait` | hybrid only: after `verify`, waiting for the intent file; `--wait` records the wait as `intent_wait_ms` |
+| `intent-verify` | hybrid only: deduping and verifying the intent candidates the verified pool did not already hold |
 | `judgments` | writing `judgments.json` |
 | `validate` | the `validate-judgments.mjs` command — it closes `judgments`, so that step gets a tool-call count too |
-| `state` | Step 4c / 4d memory writes |
+| `assert` | Step 4a's pre-write assertions, after `finalize` and before `post`; not under `--dry-run`, where `finalize` has already exported the run |
 
-A step that does not run this time — `memory` and `state` when memory is skipped, `intent-wait` outside `hybrid` — gets no marker.
+A step that does not run this time — `memory` when memory is skipped, `intent-wait` and `intent-verify` outside `hybrid`, `lenses` on `quick` — gets no marker.
+Step 4c and 4d's LoreKit writes are not a step: they run after `post` has already exported the run, so a marker there records nothing.
 
 **Never spend a tool call on a marker.**
 A turn costs 13–16 seconds; ten markers issued on their own would add two minutes to the run they measure.
@@ -77,14 +84,15 @@ Attach a count to the open step with `--attr`, for example `--attr candidates=14
 Keys are prefixed `pr_review.` automatically, so a marker can never overwrite a `gen_ai.*` or VCS attribute.
 
 **Sub-agents.**
-In the hybrid default, fold the intent worker in when you read its file, on the same command.
+In the hybrid default, fold the intent worker in when you read its file, on the same command, after `verify`.
+With `--wait <s>` it first polls for the file (every 2 s, 10 minutes in total across calls), prints `intent: ready after <s>s wait`, `intent: not ready … re-run this command`, or `intent: timed out …`, and records the wait as `intent_wait_ms` on the `intent-wait` step, the worker span, and the root — `pr_review.intent_wait_ms` is the number that says whether reading late brought the wait to ~0.
 It prints one stderr line saying what it folded in.
 When the caller left a dispatch stamp in the worker's directory (`dispatched_at`, or the `-<unix seconds>` suffix `/pr-review` puts on it), the run and the worker both start at the dispatch.
 A delivered worker also tells `finalize.mjs` that the intent finder was isolated, so `--no-dispatch` does not report it as having run in-context:
 
 ```bash
 INTENT_FROM="/the/path/passed/as/--intent-from/intent.json"
-node "$TELEMETRY" worker intent import --from "$(dirname "$INTENT_FROM")" --done "$INTENT_FROM" --run-dir "$RUN_DIR"; cat "$INTENT_FROM"
+node "$TELEMETRY" step intent-wait --attr tool_calls_so_far=41 --run-dir "$RUN_DIR"; node "$TELEMETRY" worker intent import --from "$(dirname "$INTENT_FROM")" --done "$INTENT_FROM" --wait 540 --run-dir "$RUN_DIR"; cat "$INTENT_FROM"
 ```
 
 **Stopping early.**

@@ -150,8 +150,20 @@ Rung 0 is skipped — not failed — unless both of these hold. Fall through to 
 
 | Precondition | Check |
 | --- | --- |
-| the current directory is a clone of the PR's repo | the origin remote resolves to `$RESOLVED_REPO` |
+| the clone directory is a clone of the PR's repo | its origin remote resolves to `$RESOLVED_REPO` |
 | the PR's head is fetchable into it | `git "${GIT_CRED[@]}" fetch origin "pull/$PR_NUMBER/head"` exits 0 |
+
+The clone directory is `--repo-dir <path>` when the run was given one, and the current directory otherwise.
+A caller whose own session sits in a different repository — `review-loop` started from another checkout is the common case — must pass `--repo-dir`, or rung 0 is skipped and the run pays for a network clone of a repository that is already on disk.
+A `--repo-dir` that does not exist, or whose origin is a different repository, skips rung 0 with an anomaly naming why; it never fails the run.
+
+```bash
+# correct — the session runs in agent-skills, the PR is dash0hq/dash0, a clone exists locally
+node prepare-review.mjs --pr https://github.com/dash0hq/dash0/pull/20655 --repo-dir ~/Workspace/dash0.git/main --out ctx.json
+
+# incorrect — the cwd is not a clone of dash0hq/dash0, so rung 0 is skipped
+node prepare-review.mjs --pr https://github.com/dash0hq/dash0/pull/20655 --out ctx.json
+```
 
 Fetch the **`pull/<n>/head` ref**, not `$HEAD_REF`. A fork PR's head branch does not exist on `origin`, and `git fetch origin <branch>` fails for exactly the PRs where a local clone is most useful — so branch-fetching would silently restrict rung 0 to same-repo PRs.
 
@@ -338,7 +350,8 @@ Dispose of `$WORKDIR` at the end of the run, including on the error paths, **by 
 cleanup() {
   case "$WORKDIR_CLEANUP" in
     none)     : ;;                                            # the user's worktree; leave it
-    worktree) git worktree remove --force "$WORKDIR"          # ours, but git owns the bookkeeping
+    worktree) git -C "$WORKDIR" worktree remove --force "$WORKDIR"   # ours, but git owns the bookkeeping;
+                                                              # -C: the cwd may be another repo (--repo-dir)
               rmdir "$WORKTREE_PARENT" ;;                     # …and the temp dir holding it
     rm)       rm -rf "$WORKDIR" ;;                            # a temp clone or tarball
   esac

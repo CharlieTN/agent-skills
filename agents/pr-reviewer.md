@@ -105,7 +105,7 @@ guarantee in *REPORT_BODY format (the sticky comment)* below is void for that ru
 - Stop and report a BLOCKED result if the inline review sub-pipeline fails twice.
 - Tool-call budget: **30** calls for ≤ 10 changed files, **60** for 11–30, **100** for > 30, times the thoroughness multiplier — read `budget.toolCalls` off `context.json` ([`depth-routing.md`](./pr-reviewer/rules/depth-routing.md#thoroughness-budget)). `--full` on a large PR always uses the top band.
 - Memory-call budget, **inside** that total and scaled to the same bands: **1** `memory_read` for the PR-state record (Step 0.7) + **1** `memory_write` for it (Step 4c) + **4** `memory_list` calls (Step 1.0) + the **2** impact-keyed knowledge calls (Step 1.2a — one `memory_list`, one `memory_search`) + **1** `memory_search` (Step 1.2c) + a shared **`MEMORY_READ_BUDGET`** of **5 / 10 / 15** `memory_read` records (batched via `refs`) — so **14** of 30, **19** of 60, or **24** of 100. The two state calls are fixed cost, not part of `MEMORY_READ_BUDGET`, and must never be traded against it: the state read is what makes the run incremental at all, and the state write is what makes the *next* run incremental.
-- **Step 4d's writes sit outside that budget**, capped by their own rule (`memory.md § Write budget`: ≤ 10 knowledge, one hotspot per file with a confirmed finding, `deep` tier only for knowledge) — a read budget spent is this run's context, a write skipped is every future run's memory, so a run that trims 4d to stay under a read cap has optimised the wrong side of the ledger. `MEMORY_READ_BUDGET` is a **single pool spanning both read sites**, Step 1.2d (lesson bodies) and Step 2.7b (relevance bodies, per `comment-relevance-memory.md § Read`): 1.2d spends at most **half** of it, rounded down, so a lesson-heavy shortlist can never starve the relevance verdicts that decide what gets posted, and 2.7b may spend the whole remainder; decrement the pool as calls are made and stop at zero at either site. The reads trade call count for context — the four lists are summary-only (~15 KB for a typical fan-out instead of ~110 KB), and only shortlisted entries are ever expanded, so a review that matches nothing spends 5 calls and ~15 KB rather than 5 calls and ~110 KB.
+- **Step 4d's writes sit outside that budget**, capped by their own rule (`memory.md § Write budget`: ≤ 10 knowledge, one hotspot per file with a confirmed finding, `deep` tier only for knowledge) — a read budget spent is this run's context, a write skipped is every future run's memory, so a run that trims 4d to stay under a read cap has optimised the wrong side of the ledger. `MEMORY_READ_BUDGET` is **one pool spanning three read sites**: Step 1.2a (knowledge expansions, ≤ 5, spent first), Step 1.2d (lesson bodies, at most **half** of the pool, rounded down, so a lesson-heavy shortlist can never starve the relevance verdicts that decide what gets posted), and Step 2.7b (relevance bodies, per `comment-relevance-memory.md § Read`, the whole remainder); decrement it as calls are made and stop at zero at any site. The reads trade call count for context — the four lists are summary-only (~15 KB for a typical fan-out instead of ~110 KB), and only shortlisted entries are ever expanded, so a review that matches nothing spends ~15 KB, not ~110 KB.
 - If the budget is exhausted, stop, report partial results, and say so **loudly**: the terminal report and the review body must both carry `⚠️ Partial review — tool budget exhausted after <N> calls; <M> of <T> files scanned.` In the review body this goes in the `PARTIAL_BANNER` slot of the Step 4 templates (see *REPORT_BODY format (the sticky comment)*), never as free prose. Never present a budget-truncated run as a complete review.
 - Never post a GitHub review that was not produced from fully consolidated results.
 
@@ -296,7 +296,9 @@ Examine the **raw arguments** verbatim. Do not paraphrase.
 | `--measurable-strict` | Force the measurability lens to strict for this run. Strict is already the default, so this re-asserts the bar (`missing` on a new failure mode is an `issue:`, `unlinked` is a `suggestion:`) only when the repo set `measurable: advisory`. Also settable as `measurable: strict` in the review config |
 | `--measurable-advisory` | Opt the measurability lens down to advisory for this run, so no measurability finding reaches `FAIL_REASONS` (`missing` → `suggestion:`, `unlinked` → aggregated `nitpick:`). Also settable as `measurable: advisory` in the review config |
 | `--skip-gates` | Skip Gates 1–5, run inline review (Gate 6) only |
-| `--intent-from <path>` | `/pr-review` runs the intent finder as its own sub-agent: skip it here; merge `<path>`'s candidates before Step 2.5 ([`dispatch-topology.md`](./pr-reviewer/rules/dispatch-topology.md#the-two-topologies)) |
+| `--repo-dir <p>` | Rung 0's local clone; forward to `prepare-review.mjs` |
+| `--context <path>` | The caller already ran `prepare-review.mjs`: skip it, read `<path>` as the context, and never clean up its workspace — the caller does ([`dispatch-topology.md`](./pr-reviewer/rules/dispatch-topology.md#the-two-topologies)) |
+| `--intent-from <path>` | `/pr-review` runs the intent finder as its own sub-agent: skip it here; read `<path>` only after verifying your own candidates at Step 2.6b, then verify its new ones (same link) |
 | `--with a,b,c` | Up to 3 additional review lenses |
 | `--no-fix-links` | Suppress the "Fix with Agent0" buttons for this run. They render by default everywhere (`agents/shared/rules/agent0-fix-links.md`); this is the per-run opt-out and beats every other signal. |
 | `--fix-links` | Force the buttons on for this run, overriding an `agent0_fix_links: false` in the review config. Rarely needed — they are already on by default. |
@@ -400,7 +402,7 @@ Resolve `AGENT0_FIX_LINKS`, `AGENT0_ENVIRONMENT`, and `AGENT0_ORG` per `review-c
   - **Omit the slot** when `OPEN_FINDING_COUNT` is 0 AND CI has no red/failed check — green **or** merely pending-only — including a Gate-1-only WARN (description vs. code) with clean CI and no findings: that gate is about the human-authored PR description, not something an autonomous code-fix run can act on. Also omit it when `OPEN_FINDING_COUNT` is non-zero but **neither** `{bot_login}` **nor** a prior sticky id is available: with no way to name the author, `/pr-fix` would fall back to its own author resolution and could apply a third party's comments.
 - **Fix this (inline).** When shaping an inline `issue:` / `suggestion:` finding (Step 2.8/2.9 — a **separate tool call from Step 4a**, so shell state including `$AGENT_MD` is gone; re-resolve it fresh here with the same `resolve()` idiom Step 1.2 uses for `CLASSIFY`, and re-check `[ -f "$BUILD_LINK" ]` fresh too — skip the button for this one finding, not the rest of the review, on a miss), pass the deep link as the payload's `FIX_URL` and let `render-comment.mjs` build the button (theme-aware markup, host validation and alt text all live in `comment-spine.mjs`'s `fixButton()`; never hand-write the markup), built with **the same `--env <env>` and `--org <slug>` resolved above** — `node "$BUILD_LINK" --env <env> [--org <org>] --source fix-this "<fix-this prompt>"` (`--source` is mandatory and is `fix-this` here, always — `agent0-fix-links.md § Click attribution`; never the bare relative path — see the Fix-all bullet's note; a bare path silently resolves against whatever the shell's cwd is, which during a cross-repo dispatch is the *reviewed* repo, not this one) — and the fix-this prompt template, filled with the PR URL, `{bot_login}`, and this finding's own `path:line`. The finding's **body plays no part in the URL** — no lead line, no quoted text — so the link is stable across a § Hard caps prose trim. Skip the button when `{bot_login}` is unresolved (the inline template has no comment-permalink fallback: a comment cannot link to itself), and skip it for `nitpick` / `question` / `praise`. **This is the same `<env>` and the same `<org>` as the Fix-all bullet above, both resolved once per run — never re-resolved or defaulted per finding.** Carry them as the literal values the run resolved: this is a separate tool call, so `$AGENT0_ENVIRONMENT` and `$AGENT0_ORG` no longer exist in this shell, and interpolating a name that is now empty is how a `development` repo's inline buttons silently went back to `app.dash0.com`. When the run resolved no org, the `--org` argument is absent from the command entirely — never `--org ""` and never a guessed slug.
 
-  This bullet never named `--env` at all prior to one fix, and never resolved the script path via `$AGENT_MD` prior to a second: a Fix-this button had no path to `development` regardless of what the run resolved for Fix-all, and even a correctly-resolved `<env>` could not reach a `production`/`development` decision if the bare-path invocation silently failed or fabricated output instead of using the script's own host map. Both were observed live: an inline Fix-this button on `mthines/lorekit#601` read `app.dash0.com` right after the `--env` gap was fixed, and the **Fix-all report button on `mthines/lorekit#318`** still read `app.dash0.com` hours after *both* fixes had merged, on a "no MCP tool access" dispatch that rebased the PR across repos — exactly the shape of dispatch where a bare relative path stops resolving to this repo's checkout.
+  **`finalize.mjs` builds both placements itself** (`finalize/fix-links.mjs`), on by default and from the same inputs this section names: `--no-fix-links` / `--fix-links` passed to it, `agent0_*` read by `prepare-review.mjs` into `context.agent0`, `reviewerLogin`, and the prior sticky id. Build a link by hand only for what it does not cover — the CI-only Fix-all variant, passed as `context.render.FIX_ALL_URL`; a supplied `fix_url` / `FIX_ALL_URL` is never overwritten. A run that skipped the manual build posted no buttons and nothing noticed (`mthines/agent-skills#213`).
 
 With `FIX_LINKS=off` supply no `FIX_ALL_URL` and pass no `FIX_URL` in any inline payload. **One flag governs both placements**: there is no per-placement opt-out, so the *flag* can never produce a report offering *Fix all* above findings with no *Fix this* — one of the inconsistencies this replaces.
 
@@ -475,12 +477,8 @@ them is most of what this step now is:
 | **What happened on the previous run?** — baseline SHA, run-mode history, open threads, deferred findings, anchorless diagnostics | The **PR-state record** in LoreKit (below) |
 | **Where does the report live?** | The **sticky comment** on GitHub, located by its marker (Step 4a) |
 
-The state used to travel *inside* the sticky's body: a `<!-- PR_REVIEWER_LEDGER … -->` block
-plus five sections re-parsed out of rendered Markdown on the next run. That coupled the
-reviewer's memory to its own presentation — a heading rename lost the delta baseline, a run
-that could not write the comment lost every deferred finding with it, and recovering the
-baseline took three fetch ladders and three fallback rungs. State now lives in a store built
-for state, and the comment carries only what a human reads.
+State once rode inside the sticky's body and was re-parsed from rendered Markdown, so a heading
+rename lost the baseline; it now lives in a store built for state.
 
 ### The PR-state record
 
@@ -666,6 +664,8 @@ INCR_RUNS_SINCE_FULL=$(jq -r '
   | if $i == null then ($all | length) else (($all | length) - 1 - $i) end' <<< "$PR_STATE")
 ```
 
+Save `$PR_STATE` to a file and pass it as `prepare-review.mjs --state <file>`, or it routes a re-review as a first run.
+
 `PRIOR_SHA` is both the delta-triage baseline and the provenance of everything carried — one
 variable for both, now bound in every mode. `PRIOR_SHA_SHORT` (`${PRIOR_SHA:0:7}`) is what the
 `(carried from …)` suffix renders in every mode, so it can no longer degrade to `(carried from )`;
@@ -714,7 +714,7 @@ Step 1.0 consumes).
 
 ### What no longer happens here
 
-Retired deliberately, not lost: the `<!-- PR_REVIEWER_LEDGER … -->` body block and `DEGRADED_LEDGER`'s reduction ladder (the record holds the history now, written whatever the sticky does — Step 4c); the `pulls/{n}/reviews` legacy-report/pointer-ledger fetches and the `PRIOR_REVIEW` / `PRIOR_BODY` / `LEDGER_SOURCE` / `POINTER_LEDGER_BODY` names (one store, nothing left to re-parse); `PRIOR_REVIEW_SHA` (the record supplies the provenance SHA in every mode, so `PRIOR_SHA` no longer needs blanking under `--full`); `PRIOR_BLOCKING_FINGERPRINTS` (Step 4b has one posting condition); and `PRIOR_RUN_STATE_UNKNOWN` (`STATE_STATUS` + `STICKY_READ_FAILED` say it directly).
+Retired deliberately, not lost: the `<!-- PR_REVIEWER_LEDGER … -->` body block and `DEGRADED_LEDGER`'s reduction ladder (the record holds the history, written whatever the sticky does); the `pulls/{n}/reviews` legacy-report/pointer-ledger fetches and the `PRIOR_REVIEW` / `PRIOR_BODY` / `LEDGER_SOURCE` / `POINTER_LEDGER_BODY` names; `PRIOR_REVIEW_SHA` (the record supplies the SHA in every mode); `PRIOR_BLOCKING_FINGERPRINTS`; and `PRIOR_RUN_STATE_UNKNOWN` (`STATE_STATUS` + `STICKY_READ_FAILED` say it).
 
 ---
 
@@ -1075,7 +1075,7 @@ The `<D> suppressions, <P> promotions` figures are NOT announced here: they come
 **Mechanical home:** `prepare-review.mjs`'s `prepare()` (Step "fetch") issues the five calls below
 concurrently, in one `Promise.all`, binding `context.meta` / `context.headSha` / `context.baseSha` /
 `context.reviews` / `context.issueComments`. `node "$AGENT_SUPPORT/pr-reviewer/scripts/prepare-review.mjs"
---pr <ref> --out ctx.json` performs this step (and every mechanical step through "Bind `DEPTH_TIER`"
+--pr <ref> --out ctx.json` (never under `--context`) performs this step (and every mechanical step through "Bind `DEPTH_TIER`"
 below) in one call. The manual form below is the literal fallback contract — a change to one
 requires the same change to the other:
 
@@ -1131,7 +1131,7 @@ a stale `.git/worktrees` entry, breaking the repo the review was reviewing:
 ```bash
 trap 'case "$WORKDIR_CLEANUP" in
         none)     : ;;
-        worktree) git worktree remove --force "$WORKDIR"; rmdir "$WORKTREE_PARENT" ;;
+        worktree) git -C "$WORKDIR" worktree remove --force "$WORKDIR"; rmdir "$WORKTREE_PARENT" ;;
         rm)       rm -rf "$WORKDIR" ;;
       esac' EXIT
 ```
@@ -1247,7 +1247,7 @@ tool call:
 ```text
 # 1. Knowledge + hotspot records for this repo — the tag makes the page selective; relevance
 #    rules share the kind/host, so a kind/host filter alone mixes the two buckets.
-mcp__lorekit__memory_list:   scope="repo::{owner}/{repo}" tags=["codebase-knowledge"] kind="signal" host="reviewer" limit=50
+mcp__lorekit__memory_list:   scope="repo::{owner}/{repo}" tags=["codebase-knowledge"] kind="signal" host="reviewer" limit=50 view="summary"
 
 # 2. A targeted search on the top 10 changed symbols by blast radius, from impact.json.
 #    memory_search takes `q` + `scopes` (array), NOT `query` + `scope`.
@@ -1264,25 +1264,24 @@ from a repository that learned nothing.
 
 ### 1.2b Delta triage and depth routing (Phase C)
 
-Two halves with different scopes, and confusing them is how a `full` run ends up unrouted:
+Two halves with different scopes (confusing them leaves a `full` run unrouted):
 
 - **Delta triage** (through *Tier rules* below) — **incremental modes only**, skipped when
   `RUN_MODE == "full"`. `PRIOR_SHA` and `HEAD_SHA` must both be set.
 - **Depth routing** (*Bind `DEPTH_TIER`*) — **every mode, always**, including `full` and the
   zero-delta short-circuit. It is what binds the tier the whole review is priced and reported at.
 
-**Mechanical home for everything through *Bind `DEPTH_TIER`*:** `prepare-review.mjs` computes the
-divergence pre-check, the delta shape classification, the cumulative-churn state (via
-`delta-triage.mjs`'s `churnState()`), and `routeDepth()` (`route-depth.mjs`) internally, binding the
-result on `context.routing` (`{tier, triggers, override, sizeExcluded, capApplied, why}`) and
-`context.deltaLines` / `context.shape`. The manual contract below is the fallback and the literal
-spec those functions implement.
+**Mechanical home through *Bind `DEPTH_TIER`*:** `prepare-review.mjs` computes the divergence
+pre-check, delta shape, cumulative churn (`delta-triage.mjs`), and `routeDepth()`, binding
+`context.routing` (`{tier, triggers, override, sizeExcluded, capApplied, why}`), `context.deltaLines`
+(the delta's count when incremental), `context.deltaRoute`, and `context.shape`. The manual contract
+below is the fallback.
 
 #### Divergence pre-check — never trust `compare/<PRIOR>...<HEAD>` blind
 
-`compare/PRIOR_SHA...HEAD_SHA` is an authored delta only while branch history is intact. A rebase,
-force-push, or merge-commit head sweeps in unrelated base noise (observed: 300 files on a 1-commit
-change) — routine, not exceptional. Fetch the **summary fields first, never the full body**:
+`compare/PRIOR_SHA...HEAD_SHA` is an authored delta only while history is intact. A rebase or
+force-push sweeps in base noise (observed: 300 files on a 1-commit change). Fetch the **summary
+fields first, never the full body**:
 
 ```bash
 COMPARE_META=$(gh api repos/$RESOLVED_REPO/compare/$PRIOR_SHA...$HEAD_SHA \
@@ -1306,11 +1305,16 @@ jq '.files' <<< "$DELTA_JSON" > /tmp/pr-delta.json
 DELTA_SOURCE="compare"
 ```
 
+A list of ≥ 300 rows (GitHub's cap), with a file absent from `/tmp/pr-files.json`, or over a
+range with a merge commit or more commits than listed (250 cap) is untrusted — never filter it.
+Recompute from a local checkout: files of `git log --no-merges PRIOR..HEAD --not BASE` plus
+each merge's `--remerge-diff`, ∩ the PR's files, then `git diff PRIOR HEAD --` them; else the
+blob route below. Churn: same rule (`resolveIntactDelta()` / `resolveChurnLines()`).
+
 **Diverged history** (anything else) — substitute the rebase-immune **blob-SHA authored delta**:
 
 ```bash
-# The PR's files at the live head already carry their blob SHAs (/tmp/pr-files.json, Step 1.2).
-# One recursive tree read at PRIOR_SHA gives the same files' blobs as last reviewed.
+# /tmp/pr-files.json (Step 1.2) carries head blob SHAs; one tree read at PRIOR_SHA gives the prior ones.
 gh api "repos/$RESOLVED_REPO/git/trees/$PRIOR_SHA?recursive=1" \
   --jq '[.tree[] | select(.type == "blob") | {path, sha}]' > /tmp/tree-prior.json
 
@@ -1325,14 +1329,14 @@ NEW_FILES=$(jq '[.[] | select(.status == "added")] | length' /tmp/pr-delta.json)
 DELTA_SOURCE="blob-diff (compare $COMPARE_STATUS, behind_by $BEHIND_BY)"
 ```
 
-Deliberate consequence: per-file line counts come from the PR-level patch, so `DELTA_LINES`
-over-counts toward `full` — the safe direction. A **zero authored delta** means the push was a
-rebase/amend/base-merge with no authored change; take the zero-delta short-circuit below. The
-pipeline is non-deterministic across passes, so a finding on unchanged code in a later run is
-expected and not a duplicate — **never write "expect no new findings" into any dispatch**.
+Per-file counts come from the PR-level patch, so `DELTA_LINES` over-counts toward `full` — the
+safe direction. A **zero authored delta** means the push was a
+rebase/amend/base-merge with no authored change; take the zero-delta short-circuit below. Passes
+are non-deterministic, so a finding on unchanged code later is not a duplicate — **never write
+"expect no new findings" into any dispatch**.
 
-If `/tmp/pr-files.json` rows are missing `sha`, or the tree read is truncated, upgrade
-`RUN_MODE = "full"` and announce why — never trust the diverged compare.
+If `/tmp/pr-files.json` rows lack `sha`, or the tree read is truncated, upgrade `RUN_MODE = "full"`
+and say why — never trust the diverged compare.
 
 #### Delta shape classification
 
@@ -1341,19 +1345,17 @@ DELTA_SHAPE_JSON=$(node "$CLASSIFY" /tmp/pr-delta.json $EXTRA_HS)
 ```
 
 Bind `DELTA_SHAPES`, `DELTA_RISKY_SHAPES`, `HIGH_STAKES_FILES` (`.high_stakes_files`), and
-`DELTA_PROPAGATION`. On failure, degrade as Step 1.2 does, and treat `HIGH_STAKES_FILES` as unknown
-(upgrades to `full` below — the safe direction).
+`DELTA_PROPAGATION`. On failure, degrade as Step 1.2 does; an unknown `HIGH_STAKES_FILES` upgrades
+to `full` (the safe direction).
 
 #### Cumulative churn since the last full pass
 
 `FULL_REFRESH_DELTA` (150) and `FULL_REFRESH_RUNS` (3) are owned by the scripts, not restated here —
 `delta-triage.mjs` and `route-depth.mjs` export them, and `route-depth.mjs`'s self-test asserts both
 against `depth-routing.md`'s stated numbers. `prepare-review.mjs` computes `CUM_DELTA_LINES` via
-`churnState()` automatically, applying the same divergence rule as above (a non-`ahead` cumulative
-compare reads as **over** the threshold, never a guessed authored-line count), and feeds it into
-`routeDepth()`. Manual fallback only: read the constants from the scripts rather than hardcoding
-them, then apply `churnState()`'s own rule to `LAST_FULL_SHA`/`HEAD_SHA`'s compare summary to bind
-`CUM_DELTA_LINES`.
+`churnState()` with the same divergence rule as above (a non-`ahead` cumulative compare reads as
+**over** the threshold, never guessed) and feeds it into `routeDepth()`. Manual fallback: read the
+constants from the scripts and apply `churnState()`'s rule to the `LAST_FULL_SHA` compare.
 
 **Upgrade rules — any one condition forces `RUN_MODE = "full"`:**
 - `DELTA_LINES > 100`
@@ -1539,8 +1541,8 @@ Step 3 Quality Gate block so a truncated shortlist is visible rather than silent
 against this run's **raw findings**, which don't exist until Step 2 — so that fetch belongs to Step
 2.7b (`comment-relevance-memory.md § Read`), once there is something verified to match; fetching it
 here would mean fetching everything blind. A failed `memory_read` is a non-blocking miss (drop the
-entry, do not flip `LOREKIT_CONNECTED`, carry on). `mcp__lorekit__memory_read` has exactly **two**
-call sites in this agent — this step and Step 2.7b — never invoke it elsewhere.
+entry, do not flip `LOREKIT_CONNECTED`, carry on). `mcp__lorekit__memory_read` has exactly **three**
+call sites in this agent — Step 1.2a (≤ 5 knowledge expansions), this step, and Step 2.7b — all from the one pool.
 
 ### 1.2e Apply `reviewer-lessons`
 

@@ -30,69 +30,87 @@ and in what grouping* is prescribed here.
 | Topology | When | Sub-agents | Why |
 | --- | --- | --- | --- |
 | `in-context` | `t < 0.4`, or no dispatch capability | none | A quick review is cheaper than one dispatch's base cost. |
-| `hybrid` | **the default at `t ≥ 0.4`** | the intent finder only (`budget.isolatedFinders`) | A/B rounds 7–8 on sync-tray#72: isolated, the intent finder flagged the highest-severity agreed defect in 3 of 3 runs, in 5–6 minutes each; in one context with the other finders, the default setting had missed it in 4 of 4 rounds. |
+| `in-context` | a small incremental re-review: run mode `incremental`, `incremental-quick`, or `zero-delta`, tier `standard` or `quick`, thoroughness **defaulted** (`budget.topologyReason: "small-incremental"`) | none | **Unmeasured.** The A/B evidence in the next row is one deep, full, 22-file review; no A/B round ran an incremental re-review. On dash0#20655 the reviewer idled ~125 s waiting for the worker. An explicit `--thoroughness` or `--effort high` keeps `hybrid`. |
+| `hybrid` | **the default at `t ≥ 0.4`**, except the row above | the intent finder only (`budget.isolatedFinders`) | A/B rounds 7–8 on sync-tray#72: isolated, the intent finder flagged the highest-severity agreed defect in 3 of 3 runs, in 5–6 minutes each; in one context with the other finders, the default setting had missed it in 4 of 4 rounds. |
 
 There is no third, fully parallel topology.
 In A/B round 8 every finder as its own sub-agent, sharded per file group and followed by batched
 verifier dispatches (the removed `/pr-review --fanout`), raised every known defect but projected to
 ~57 minutes against 9–13 for one context; the hybrid split kept the one finder whose isolation paid.
 
-**Running `hybrid`:**
+**Running `hybrid`.** Read the intent candidates as late as possible: the worker runs 5–6 minutes
+on a 22-file PR, and every minute of your own work done before you read its file is a minute you do
+not wait. Your own candidates never wait on the intent worker's.
 
-1. At the start of Phase D, dispatch the intent finder with the worker preamble, the full review
-   packet, and an output path.
+1. At the start of Phase D, dispatch the intent finder with the worker preamble, the review packet,
+   and an output path.
    Where the dispatch tool can return before the sub-agent finishes (a background option), use it,
    so the intent finder runs while you run the other finders.
-   Where it cannot, dispatch it first and wait: the wait is 5–6 minutes on a 22-file PR, and it is
-   what made the default catch the top defect.
+   Where it cannot, dispatch it first and wait: the wait is what made the default catch the top
+   defect.
    On a Dash0 Agent0 Automation, where a dispatch always blocks the turn, run the other finders as
    a second worker in the same message instead of waiting
    ([`agent0-runtime.md`](./agent0-runtime.md#phase-d-two-workers-in-one-message-never-expect-a-second-rung)).
-2. Run every other active finder, every lens, and verification in your own context, exactly as
-   `in-context` does — including the self-check under *Verification* below.
-3. Before Step 2.5 consolidation, read the intent finder's output file and add its candidates to
-   the pool.
-   An intent candidate is verified in your context like any other; it is not trusted because it
-   came from a sub-agent.
+2. Run every other active finder, every lens, Step 2.5 consolidation, and Step 2.6b verification of
+   **your own** candidates in your own context, exactly as `in-context` does — including the
+   self-check under *Verification* below.
+3. Only then read the intent finder's output file.
+   Dedupe its candidates against the verified pool by Step 2.5's rules
+   ([`rubric-composition.md § Dedupe`](../../shared/rules/rubric-composition.md#dedupe), the
+   semantic pass included — `finalize.mjs --dedupe-candidates` over the pool plus the intent
+   candidates), and verify only the intent candidates that remain, each in your context like any
+   other; none is trusted because it came from a sub-agent.
+   An intent candidate merged with a verified one takes that verdict and is not verified again.
 4. If the dispatch returned no readable output file, retry it once, and never a third time.
    A second failure is a `RUN_ANOMALY` naming the unit — and the intent finder then runs in-context,
    so the review never loses the finder itself.
 
 **Running `hybrid` when the reviewer holds no dispatch tool.**
 `/pr-review` dispatches this agent as a sub-agent, and a sub-agent cannot dispatch another, so on
-that path the caller orchestrates the split: it sends this agent and the intent worker in one
-message, and passes `--intent-from <path>` naming the file the intent worker writes
+that path the caller orchestrates the split: it runs `prepare-review.mjs` once, dispatches the
+intent worker only when `context.budget.topology` is `hybrid`, sends it and this agent in one
+message, and passes `--context <path>` and `--intent-from <path>`
 ([`skills/quality/pr-review/SKILL.md` § Step 2](../../../skills/quality/pr-review/SKILL.md#step-2-dispatch-the-agent)).
+With `--context <path>`, skip your own `prepare-review.mjs` and read `<path>` wherever the pipeline
+reads the context; the caller ran prepare, so the caller owns the workspace cleanup, never you.
 With `--intent-from <path>`:
 
 1. Do not run the intent finder in this context.
-2. Run every other finder, lens, and gate as usual.
-3. Before Step 2.5, read `<path>`.
-   If it does not exist yet, wait for it — check every 20 seconds, for at most 10 minutes.
-   On the command that reads it, fold the worker into this run's telemetry with
-   `review-telemetry.mjs worker intent import --from <dir of path> --done <path>`
+2. Run every other finder, lens, and gate, then Step 2.5 and Step 2.6b over your own candidates.
+3. Then wait for `<path>` and fold the worker into this run's telemetry on one command, marking the
+   wait as its own step:
+
+   ```bash
+   node "$TELEMETRY" step intent-wait --attr tool_calls_so_far=<N> --run-dir "$RUN_DIR"; node "$TELEMETRY" worker intent import --from "$(dirname "$INTENT_FROM")" --done "$INTENT_FROM" --wait 540 --run-dir "$RUN_DIR"; cat "$INTENT_FROM"
+   ```
+
+   It prints `intent: ready after <s>s wait` once the file exists and is non-empty, polling every 2
+   seconds, for at most 10 minutes in total, and records the time as `intent_wait_ms`
    ([`run-telemetry.md`](./run-telemetry.md#what-you-mark-the-model-steps)).
-4. If it never appears or does not parse, run the intent finder in this context and add
-   `intent worker returned no readable candidates — ran intent in-context` to `RUN_ANOMALY` through
-   `context.render.RUN_ANOMALY`.
+   Give the shell call a 600000 ms timeout; where the harness caps it lower, pass `--wait` under the
+   cap and re-issue the command on `intent: not ready` — the 10 minutes are counted across calls.
+4. On `intent: timed out`, or a file that does not parse, run the intent finder in this context and
+   add `intent worker returned no readable candidates — ran intent in-context` to `RUN_ANOMALY`
+   through `context.render.RUN_ANOMALY`.
    The review never loses the finder itself.
-5. Verify its candidates here like any others.
-   Line numbers from the worker cite its own checkout of the head; a head that moved in between shows
-   up as a line-validity failure, never as a trusted finding.
+5. Otherwise mark `intent-verify`, then dedupe and verify its candidates as in step 3 above.
+   The worker read the same context and workspace you did, so its line numbers cite your head; a
+   line that fails line validity is dropped, never trusted.
 
 ```text
-# correct (hybrid, background-capable harness)
+# correct (hybrid): the intent file is read after your own verification
 dispatch intent (background) → run correctness, consumer-impact, dependency, standards, quality,
-lenses in-context → read intent's file → verify every candidate in-context → finalize
+lenses → consolidate → verify own candidates → read intent's file → dedupe → verify new intent
+candidates → finalize
 
-# incorrect: waiting on a background intent dispatch before starting the other finders
-dispatch intent → wait → run the other finders       # serialises what was meant to overlap
+# incorrect: reading the intent file before Step 2.5 — the reviewer idles until the worker ends
+dispatch intent → other finders → wait for intent → consolidate → verify   # ~125 s idle on dash0#20655
 ```
 
 ## Reading a budget into dispatch
 
 Bind the budget once, right after `DEPTH_TIER` — `resolveBudget({ thoroughness, routedTier:
-DEPTH_TIER, shape: DELTA_SHAPES, dispatchAvailable: <Task held?> })` — and every downstream step
+DEPTH_TIER, runMode: RUN_MODE, shape: DELTA_SHAPES, dispatchAvailable: <Task held?> })` — and every downstream step
 reads it, never re-derives it:
 
 - **`budget.finders`** — which of the six finders are active at all (`correctness`, `intent`,

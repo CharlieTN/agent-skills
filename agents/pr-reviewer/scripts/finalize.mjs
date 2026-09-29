@@ -45,6 +45,7 @@ import {
   buildOptimalityCard,
 } from "./finalize/payload.mjs";
 import { renderComment } from "./render-comment.mjs";
+import { resolveFixLinks, applyFixLinks } from "./finalize/fix-links.mjs";
 import { TITLE_MAX, PROSE_MAX, UNVERIFIED_MAX, EVIDENCE_REFS_MAX, SHA7, sentenceCount } from "./comment-spine.mjs";
 import { toFindingsBusRecords } from "./finalize/findings-bus.mjs";
 import { buildWritePlan } from "./finalize/write-plan.mjs";
@@ -57,6 +58,7 @@ const FINALIZE_SELF_TESTS = [
   "finalize/dedupe.mjs", "finalize/thresholds.mjs", "finalize/suppression.mjs",
   "finalize/placement.mjs", "finalize/line-validity.mjs", "finalize/gates.mjs",
   "finalize/payload.mjs", "finalize/findings-bus.mjs", "finalize/write-plan.mjs",
+  "finalize/fix-links.mjs",
 ];
 
 // render-report.mjs's SHA7 check requires RUN.sha/RUN.prior_sha to be EXACTLY 7 lowercase hex
@@ -570,10 +572,16 @@ export function finalizeReview({ context, judgments, profile = "balanced", flatO
 
   const tier = context?.routing?.tier;
   const depth = context?.workspace?.depthCapability || context?.depthCapability;
+  // prepare-review.mjs emits the prior SHA NESTED, as `context.priorRun.priorSha` (full 40-char);
+  // reading only the top-level `context.priorSha` (the AC-11 fixtures' shape, kept as the fallback)
+  // left RUN.prior_sha unset on every real incremental re-review, and render-report.mjs failed
+  // closed with "RUN.prior_sha is required when RUN.mode is incremental" (mthines/agent-skills#213).
+  // Normalised through sha7() like runSha, since the renderer requires exactly 7 lowercase hex.
+  const priorShaRaw = context?.priorSha ?? context?.priorRun?.priorSha;
   const run = {
     mode: context?.mode || "unknown",
     sha: runSha,
-    ...(context?.priorSha ? { prior_sha: context.priorSha } : {}),
+    ...(priorShaRaw ? { prior_sha: sha7(priorShaRaw) } : {}),
     // A SEVENTH field-bridging gap, the same class as headSha above and found the same way (a real
     // prepare-review.mjs context, not a hand-crafted fixture): prepare-review.mjs's context carries
     // this as `deltaLines` (camelCase — see prepare-review.mjs's own context object and CLI summary
@@ -793,14 +801,14 @@ function parseArgs(argv) {
   const opts = { writer: "github" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--self-test" || a === "--replay-fixtures" || a === "--dry-run" || a === "--skip-gates" || a === "--no-dispatch") { opts[a.slice(2)] = true; continue; }
+    if (a === "--self-test" || a === "--replay-fixtures" || a === "--dry-run" || a === "--skip-gates" || a === "--no-dispatch" || a === "--no-fix-links" || a === "--fix-links") { opts[a.slice(2)] = true; continue; }
     if (a.startsWith("--")) { opts[a.slice(2)] = argv[i + 1]; i++; continue; }
   }
   return opts;
 }
 
 function usage() {
-  console.error("usage: finalize.mjs --context <ctx.json> --judgments <j.json> [--config <review.yaml>] --out-dir <dir> [--writer github|findings-bus] [--bus-path <file>] [--dry-run] [--no-dispatch] [--skip-gates] [--self-test] [--replay-fixtures]\n"
+  console.error("usage: finalize.mjs --context <ctx.json> --judgments <j.json> [--config <review.yaml>] --out-dir <dir> [--writer github|findings-bus] [--bus-path <file>] [--dry-run] [--no-dispatch] [--skip-gates] [--no-fix-links] [--fix-links] [--self-test] [--replay-fixtures]\n"
     + "   or: finalize.mjs --dedupe-candidates <candidates.json> [--out <file>]\n"
     + "   or: finalize.mjs --check-shape <judgments.json>");
 }
@@ -1074,6 +1082,14 @@ async function selfTest() {
     const both = buildAutoRunAnomaly({ capApplied: true, depthCapability: "diff-only", contextAnomalies: ["a", "b", "c"] });
     check("buildAutoRunAnomaly combines the cap note and the anomaly count when both apply",
       typeof both === "string" && both.includes("diff-only") && both.includes("3 prepare-time anomalies"));
+    // The trace records the topology that ran, not the one budgeted at prepare time.
+    check("a hybrid budget whose intent worker never delivered is recorded as in-context",
+      effectiveTopology({ budget: { topology: "hybrid" } }) === "in-context"
+        && effectiveTopology({ budget: { topology: "hybrid" }, dispatchUnavailable: true }) === "in-context");
+    check("a hybrid budget with a delivered intent worker stays hybrid; in-context stays in-context",
+      effectiveTopology({ budget: { topology: "hybrid" }, intentIsolated: true }) === "hybrid"
+        && effectiveTopology({ budget: { topology: "in-context" } }) === "in-context"
+        && effectiveTopology({}) === undefined);
     // A/B iteration 2: --no-dispatch renders dispatch-topology.md's line from the budget.
     const noDispatch = buildAutoRunAnomaly({ capApplied: false, contextAnomalies: [], noDispatchAt: 0.8 });
     check("the no-dispatch line names the intent finder it could not isolate, with the effective thoroughness",
@@ -1775,6 +1791,66 @@ async function selfTest() {
         && !reportBody.includes("[the retry doc](https://example.com/retry)"));
     }
 
+    // Fix-with-Agent0 buttons are built by main() itself, on by default (finalize/fix-links.mjs).
+    // Before this, only a caller that hand-built every link got buttons, and nothing noticed when
+    // one did not (mthines/agent-skills#213).
+    if (existsSync(join(outDir, "report-body.md"))) {
+      check("default run, no login: Fix all falls back to the prior sticky's permalink",
+        readFileSync(join(outDir, "report-body.md"), "utf8").includes(
+          "utm_source=pr-reviewer-fix-all")
+        && readFileSync(join(outDir, "report-body.md"), "utf8").includes(encodeURIComponent("pull/205#issuecomment-555")));
+    }
+    {
+      const fxDir = join(e2eDir, "fix-links");
+      rmSync(fxDir, { recursive: true, force: true });
+      mkdirSync(fxDir, { recursive: true });
+      const fxContextPath = join(fxDir, "context.json");
+      writeFileSync(fxContextPath, JSON.stringify({ ...e2eContext, reviewerLogin: "rev-bot" }, null, 2));
+      const spawnFx = (/** @type {string} */ name, /** @type {string[]} */ extra) => {
+        const d = join(fxDir, name);
+        const rr = spawnSync(process.execPath, [join(HERE, "finalize.mjs"), "--context", fxContextPath,
+          "--judgments", judgmentsPath, "--out-dir", d, "--dry-run", ...extra], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+        const plan = existsSync(join(d, "write-plan.json")) ? JSON.parse(readFileSync(join(d, "write-plan.json"), "utf8")) : null;
+        const report = existsSync(join(d, "report-body.md")) ? readFileSync(join(d, "report-body.md"), "utf8") : "";
+        return { status: rr.status, plan, report };
+      };
+      const on = spawnFx("on", []);
+      check("default run with a login: the inline claim carries a Fix this button scoped to its path:line",
+        on.status === 0 && Boolean(on.plan?.review_create?.comments?.[0]?.body.includes("utm_source=pr-reviewer-fix-this"))
+        && Boolean(on.plan?.review_create?.comments?.[0]?.body.includes(encodeURIComponent("src/api/client.ts:88"))));
+      check("default run with a login: Fix all names the reviewer's login",
+        on.report.includes(encodeURIComponent("/pr-fix https://github.com/o/r/pull/205 rev-bot")));
+      const off = spawnFx("off", ["--no-fix-links"]);
+      check("--no-fix-links builds neither placement",
+        off.status === 0 && !off.report.includes("goto/agent0")
+        && !off.plan?.review_create?.comments?.some((/** @type {any} */ c) => c.body.includes("goto/agent0")));
+      writeFileSync(fxContextPath, JSON.stringify({ ...e2eContext, reviewerLogin: "rev-bot", agent0: { fixLinks: false, environment: null, org: null } }, null, 2));
+      const cfgOff = spawnFx("cfg-off", []);
+      check("agent0_fix_links: false in the review config builds neither placement",
+        cfgOff.status === 0 && !cfgOff.report.includes("goto/agent0"));
+    }
+
+    // An incremental re-review with a prepare-review-SHAPED context: the prior SHA lives only at
+    // `priorRun.priorSha` (full 40-char), never at a top-level `priorSha`. Before the fix the
+    // renderer failed closed on a missing RUN.prior_sha and no report rendered (#213).
+    {
+      const incDir = join(e2eDir, "incremental-nested-prior");
+      rmSync(incDir, { recursive: true, force: true });
+      mkdirSync(incDir, { recursive: true });
+      const incContextPath = join(incDir, "context.json");
+      writeFileSync(incContextPath, JSON.stringify({
+        ...e2eContext, mode: "incremental", routing: { tier: "standard" },
+        priorRun: { ...e2eContext.priorRun, priorSha: "1A2B3C4D5E6F7a8b9c0d1e2f3a4b5c6d7e8f9a0b" },
+      }, null, 2));
+      const ri = spawnSync(process.execPath, [join(HERE, "finalize.mjs"), "--context", incContextPath,
+        "--judgments", judgmentsPath, "--out-dir", join(incDir, "out"), "--dry-run"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+      const incReport = existsSync(join(incDir, "out", "report-body.md")) ? readFileSync(join(incDir, "out", "report-body.md"), "utf8") : "";
+      check("incremental context with priorRun.priorSha only (prepare-review's shape) exits 0 and renders report-body.md",
+        ri.status === 0 && incReport.length > 0, (ri.stderr || "").trim().slice(0, 300));
+      check("the nested 40-char prior sha reaches the report as its sha7 form",
+        incReport.includes("delta since `1a2b3c4`"));
+    }
+
     // D8/D9 (plan feat/pr-reviewer-shrink-fanout-ab, AC-17): a HISTORICAL context.json (the
     // context.historical block prepare-review.mjs's --review-sha attaches) must refuse a real
     // finalize.mjs run unless --dry-run is also passed, and once it is, the write-plan.json it
@@ -1933,6 +2009,21 @@ async function selfTest() {
   console.log("\n✓ finalize self-test: all checks passed");
 }
 
+/**
+ * The topology this run actually ran, for the trace. prepare-review.mjs records the BUDGET's
+ * topology when the run begins, before anyone knows whether an intent worker will arrive: a
+ * `hybrid` budget whose intent finder never came back as its own worker (no caller dispatched
+ * one, or the reviewer held no dispatch tool) ran that finder in-context, and the trace said
+ * `hybrid` anyway.
+ * @param {any} context
+ * @returns {string|undefined}
+ */
+export function effectiveTopology(context) {
+  const budgeted = context?.budget?.topology;
+  if (budgeted === "hybrid" && context?.intentIsolated !== true) return "in-context";
+  return budgeted;
+}
+
 /** When this process started — the `finalize` step span's start (review-telemetry.mjs). */
 const PROCESS_START_NS = BigInt(Date.now()) * 1_000_000n;
 
@@ -1942,7 +2033,7 @@ const PROCESS_START_NS = BigInt(Date.now()) * 1_000_000n;
  * trace. A context with no ledger (built by an older prepare-review.mjs, or `--no-telemetry`)
  * records nothing. Never throws: telemetry never fails a review.
  * @param {string} contextPath @param {any} result @param {any} judgments
- * @param {{ dryRun: boolean, failed: boolean }} how
+ * @param {{ dryRun: boolean, failed: boolean, topology?: string }} how
  * @returns {Promise<string|null>} the run dir, when a ledger exists
  */
 async function recordFinalizeTelemetry(contextPath, result, judgments, how) {
@@ -1962,6 +2053,7 @@ async function recordFinalizeTelemetry(contextPath, result, judgments, how) {
         posted_inline: Array.isArray(result?.inline) ? result.inline.length : undefined,
         deferred: Array.isArray(result?.deferred) ? result.deferred.length : undefined,
         dry_run: how.dryRun,
+        topology: how.topology,
       },
     });
     // A failed render is a failed STEP, not a finished run: every A/B arm that hit one fixed its
@@ -2105,6 +2197,25 @@ async function main() {
     return;
   }
 
+  // Fix-with-Agent0 buttons: built here on every GitHub-writer run, on by default
+  // (agent0-fix-links.md § Opt-in). A link the caller already supplied is kept.
+  const fixSettings = resolveFixLinks({
+    noFixLinks: Boolean(opts["no-fix-links"]), fixLinks: Boolean(opts["fix-links"]), config: context?.agent0 ?? null,
+  });
+  try {
+    const fx = applyFixLinks({
+      settings: fixSettings, prUrl: context?.target?.url ?? null, login: context?.reviewerLogin ?? null,
+      inline: result.inline, threads: context?.threads ?? [], stickyCommentId: context?.priorRun?.stickyCommentId ?? null,
+      existingFixAll: result.payload?.FIX_ALL_URL ?? null,
+    });
+    if (fx.fixAllUrl && result.payload) result.payload.FIX_ALL_URL = fx.fixAllUrl;
+    console.log(`finalize: fix links ${fixSettings.on ? `on (${fixSettings.reason}, ${fixSettings.env})` : `off (${fixSettings.reason})`}`
+      + ` — fix-all ${fx.fixAllUrl ? "built" : "omitted"}, fix-this ${fx.fixThis}${fx.skipped && fixSettings.on ? ` · ${fx.skipped}` : ""}`);
+  } catch (e) {
+    // A malformed agent0_org throws in buildLink: report it, never render a link to the wrong org.
+    console.error(`finalize: fix links not built — ${/** @type {Error} */ (e).message}`);
+  }
+
   // Render the sticky report body with the SAME renderer --replay-fixtures spawns — this is where
   // "finalize.mjs renders with zero manual edits" becomes literally true for a live run: the seven
   // field-bridging gaps a prior dry-run needed hand patches for (context.mode, headSha, deltaLines,
@@ -2182,7 +2293,7 @@ async function main() {
     historical: context?.historical || null,
     isolated: Boolean(context?.isolated),
   });
-  const telemetryRunDir = await recordFinalizeTelemetry(/** @type {string} */ (opts.context), result, judgments, { dryRun: isDryRun, failed: renderFailed });
+  const telemetryRunDir = await recordFinalizeTelemetry(/** @type {string} */ (opts.context), result, judgments, { dryRun: isDryRun, failed: renderFailed, topology: effectiveTopology(context) });
   // execute-write-plan.mjs records the `post` step and exports the trace; this is how it finds
   // the ledger. Absent when no ledger exists.
   if (telemetryRunDir && !isDryRun) writePlan.telemetry_run_dir = telemetryRunDir;

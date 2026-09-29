@@ -32,8 +32,12 @@
  *
  * Usage
  *   node prepare-review.mjs --pr <url|owner/repo#n|n> [--repo owner/repo]
- *        [--out <file>] [--workdir <dir>] [--reviewer-login <login>]
- *        [--no-workspace] [--no-impact] [--timeout-ms N] [--quiet]
+ *        [--out <file>] [--workdir <dir>] [--repo-dir <dir>] [--reviewer-login <login>]
+ *        [--no-workspace] [--no-impact] [--no-telemetry] [--inline-payloads]
+ *        [--timeout-ms N] [--quiet] [--pin-head <sha>] [--isolated] [--full]
+ *        [--state <file>] [--effort high] [--thoroughness 0..1] [--no-threads]
+ *        [--review-sha <sha>]
+ *   node prepare-review.mjs --cleanup <context.json>
  *   node prepare-review.mjs --self-test
  *
  * Exit codes: 0 ok · 1 unrecoverable (no PR reference resolved, metadata
@@ -42,13 +46,13 @@
  * narrower review, not a failed one.
  */
 
-import { execFile } from "node:child_process";
-import { writeFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync } from "node:fs";
+import { execFile, execFileSync, spawn } from "node:child_process";
+import { writeFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, openSync, closeSync, statSync, rmSync, rmdirSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Timing, beginRun, appendRecord, hostFacts, ledgerPath } from "./review-telemetry.mjs";
-import { classifyDivergence, blobDelta, deltaCounts, churnState, FULL_REFRESH_DELTA } from "./delta-triage.mjs";
+import { Timing, beginRun, appendRecord, hostFacts, ledgerPath, markerCommand, modelSteps } from "./review-telemetry.mjs";
+import { classifyDivergence, blobDelta, deltaCounts, churnState, resolveIntactDelta, resolveChurnLines, compareHistory, authoredPrPaths, parseLocalDiff, prFilesCompleteness, FULL_REFRESH_DELTA } from "./delta-triage.mjs";
 import { routeDepth, resolveBudget } from "./route-depth.mjs";
 import { buildReviewPacket, consumersByFile } from "./review-packet.mjs";
 import { discoverStandards, trivialSkip } from "./discover-standards.mjs";
@@ -101,6 +105,37 @@ export function run(cmd, args, { timeoutMs = 60000, cwd = process.cwd(), maxBuff
       const timedOut = !!(err && err.killed === true);
       res({ ok: !err, code: err ? (err.code ?? 1) : 0, stdout: stdout ?? "", stderr: stderr ?? "", timedOut });
     });
+  });
+}
+
+/**
+ * Like `run()`, but streams stdout straight into `filePath` instead of buffering it. For binary
+ * payloads (the rung-2 tarball): `run()` decodes stdout as UTF-8, which corrupts every non-UTF-8
+ * byte of a `.tgz`, and buffers it under `maxBuffer`, which a large repo's tarball overflows.
+ * Resolves with `run()`'s result shape; `stdout` is always empty and `bytes` is the file's size.
+ * @param {string} cmd @param {string[]} args @param {string} filePath
+ * @param {{ timeoutMs?: number, cwd?: string, env?: NodeJS.ProcessEnv }} [opts]
+ * @returns {Promise<{ ok: boolean, code: number|string, stdout: string, stderr: string, timedOut: boolean, bytes: number }>}
+ */
+export function runToFile(cmd, args, filePath, { timeoutMs = 60000, cwd = process.cwd(), env } = {}) {
+  return new Promise((res) => {
+    const fd = openSync(filePath, "w");
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    const done = (/** @type {number|string} */ code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      closeSync(fd);
+      const bytes = existsSync(filePath) ? statSync(filePath).size : 0;
+      res({ ok: code === 0 && !timedOut, code, stdout: "", stderr, timedOut, bytes });
+    };
+    const child = spawn(cmd, args, { cwd, env: env || process.env, stdio: ["ignore", fd, "pipe"] });
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, timeoutMs);
+    child.stderr.on("data", (d) => { if (stderr.length < 64 * 1024) stderr += String(d); });
+    child.on("error", (e) => { stderr += String(e.message || e); done(/** @type {any} */ (e).code ?? 1); });
+    child.on("close", (code) => done(code ?? 1));
   });
 }
 
@@ -180,6 +215,27 @@ export function priorShaFromBody(body) {
 }
 
 /**
+ * The jq projection the issue-comments fetch applies. It flattens the author to a STRING
+ * (`user: .user.login`), so a matched sticky carries `user: "<login>"`, not `user: { login }`.
+ * Exported so the self-test builds its fixtures from the same projection the fetch uses.
+ */
+export const ISSUE_COMMENTS_JQ = ".[] | {id: .id, user: .user.login, body: .body, html_url: .html_url, created_at: .created_at}";
+
+/**
+ * The login of whoever posted a matched sticky, or null.
+ * Accepts both shapes: the flattened string the `ISSUE_COMMENTS_JQ` fetch emits, and the raw
+ * API object (`{ login }`). Reading only `user.login` made the prior-report-author rung dead,
+ * because the fetch never produces that shape.
+ * @param {{ user?: string | { login?: string } | null } | null | undefined} sticky
+ * @returns {string|null}
+ */
+export function stickyAuthorLogin(sticky) {
+  const u = sticky?.user;
+  if (typeof u === "string") return u || null;
+  return u?.login ?? null;
+}
+
+/**
  * Find the sticky report among the issue comments.
  *
  * Matched by MARKER ONLY, never by author login. The marker is the identity;
@@ -256,6 +312,41 @@ export function isGithubLogin(s) {
 }
 
 /**
+ * The exact input `prepare()` hands `resolveReviewerIdentity`, built in one place so the self-test
+ * exercises the real call site rather than a hand-assembled copy of it. Under `--isolated` the
+ * sticky is never read as prior-run state, so its author is `null`.
+ * @param {{ opts: { reviewerLogin?: string }, state: { botLogin?: string|null }, sticky: any, isolated: boolean, env?: Record<string, string|undefined> }} input
+ * @returns {{ suppliedLogin: string, fromFlag: boolean, stateBotLogin: string|null, stickyAuthorLogin: string|null }}
+ */
+export function identityInputs({ opts, state, sticky, isolated, env = process.env }) {
+  return {
+    suppliedLogin: opts.reviewerLogin || env.PR_REVIEWER_LOGIN || "",
+    fromFlag: Boolean(opts.reviewerLogin),
+    stateBotLogin: state.botLogin ?? null,
+    stickyAuthorLogin: isolated ? null : stickyAuthorLogin(sticky),
+  };
+}
+
+/**
+ * The reviewer identity, first match wins: a valid supplied login (`--reviewer-login`, then
+ * PR_REVIEWER_LOGIN), then the state record's `bot_login` (pr-reviewer.md's identity ladder),
+ * then the matched prior sticky's author login (the GitHub fallback rung — `ISSUE_COMMENTS_JQ`
+ * flattens it to `user: "<login>"`, read via `stickyAuthorLogin`; whoever posted the
+ * report is the reviewer, so a re-review with no `--state` still knows itself and still builds
+ * Fix-this buttons), else unknown. A supplied login always outranks the record, and the record
+ * outranks the sticky's author. The caller passes `null` for the sticky author under `--isolated`,
+ * where the sticky is never read as prior-run state.
+ * @param {{ suppliedLogin: string, fromFlag: boolean, stateBotLogin: string|null, stickyAuthorLogin?: string|null }} input
+ * @returns {{ me: string, identitySource: string }}
+ */
+export function resolveReviewerIdentity({ suppliedLogin, fromFlag, stateBotLogin, stickyAuthorLogin = null }) {
+  if (isGithubLogin(suppliedLogin)) return { me: suppliedLogin, identitySource: fromFlag ? "--reviewer-login" : "PR_REVIEWER_LOGIN" };
+  if (isGithubLogin(stateBotLogin)) return { me: /** @type {string} */ (stateBotLogin), identitySource: "state-record" };
+  if (isGithubLogin(stickyAuthorLogin)) return { me: /** @type {string} */ (stickyAuthorLogin), identitySource: "prior-report-author" };
+  return { me: "", identitySource: "unknown" };
+}
+
+/**
  * `--isolated` run-mode resolution (R3, D10, D13, AC-5). Isolated repeat
  * runs (the A/B harness, the shadow run) need first-run semantics on every
  * invocation — no LoreKit state-record read, `--full` forced, so a run's
@@ -280,6 +371,28 @@ export function resolveRunMode({ isolated = false, full = false, statePath = nul
   };
 }
 
+/** render-report.mjs's `TIER_FOR_MODE`, inverted: the grammar-field mode a routed tier renders as. */
+const MODE_FOR_TIER = { deep: "full", standard: "incremental", quick: "incremental-quick" };
+
+/**
+ * The context's top-level `mode` — RUN.mode for finalize.mjs — once Phase C has routed.
+ * `resolveRunMode` can only decide the forced-full case at Phase 0; every other run's mode
+ * follows from the routed tier. Without this, a re-review that routing promotes to `deep`
+ * (D4–D6) carried `mode: null`, finalize rendered `"unknown"`, and the render failed closed.
+ * A capability cap (`deep` → `standard` under `diff-only`) keeps `full`: render-report.mjs's
+ * carve-out expects exactly that pair, alongside the RUN_ANOMALY naming the cap.
+ * @param {{ runMode: { mode: string|null }, zeroDelta: boolean, routing: { tier: string, capApplied?: boolean } }} args
+ * @returns {string}
+ */
+export function resolveContextMode({ runMode, zeroDelta, routing }) {
+  if (runMode.mode) return runMode.mode;
+  if (zeroDelta) return "zero-delta";
+  if (routing.capApplied) return "full";
+  const mode = MODE_FOR_TIER[routing.tier];
+  if (!mode) throw new Error(`resolveContextMode: routed tier ${JSON.stringify(routing.tier)} maps to no mode`);
+  return mode;
+}
+
 /**
  * `--isolated`'s "no fallback to the sticky's footer SHA either" rule (pipeline.md §
  * --isolated item 1), extracted as a pure function so it is self-testable without a
@@ -290,9 +403,29 @@ export function resolveRunMode({ isolated = false, full = false, statePath = nul
  * @param {{ isolated: boolean, stickyBody: string|null, headSha: string }} args
  * @returns {{ priorSha: string|null, zeroDelta: boolean }}
  */
-export function resolvePriorRun({ isolated, stickyBody, headSha }) {
+/**
+ * Where `priorSha` came from, stated in the artifact's own words. A non-isolated run whose
+ * `--state` record supplied `priorSha` must not be told that value is the GitHub fallback rung
+ * — the two rungs carry different guarantees, and a consumer reads these strings literally.
+ * @param {{ fromState: boolean }} args
+ * @returns {{ loreKitNotCovered: string, note: string }}
+ */
+export function priorShaProvenance({ fromState }) {
+  return fromState
+    ? {
+      loreKitNotCovered: "LoreKit reads (Steps 1.0, 1.2c, 1.2d) — priorSha below is from the --state record (Step 0.7), and carries no PRIOR_DIAGNOSTICS",
+      note: "priorSha is from the --state record. PRIOR_DIAGNOSTICS is not carried into context.json — read it off that record before taking Step 0.8's fast path.",
+    }
+    : {
+      loreKitNotCovered: "LoreKit reads (Steps 0.7, 1.0, 1.2c, 1.2d) — priorSha below is the GitHub FALLBACK rung only, and carries no PRIOR_DIAGNOSTICS",
+      note: "PRIOR_DIAGNOSTICS is NOT recoverable from the fallback rung. Read the LoreKit state record before taking Step 0.8's fast path.",
+    };
+}
+
+export function resolvePriorRun({ isolated, stickyBody, headSha, statePriorSha = null }) {
   if (isolated) return { priorSha: null, zeroDelta: false };
-  const priorSha = stickyBody ? priorShaFromBody(stickyBody) : null;
+  // The state record is the primary source (Step 0.7); the sticky's footer is the fallback rung.
+  const priorSha = statePriorSha || (stickyBody ? priorShaFromBody(stickyBody) : null);
   return { priorSha, zeroDelta: sameCommit(headSha, priorSha) };
 }
 
@@ -662,6 +795,15 @@ export function computeThreadOverlap(files, threads) {
   return matched / hunks.length;
 }
 
+/** `gh pr checks` exits 1 when a check failed and 8 while one is pending, printing the table
+ *  either way — a red CI is a read, not a failure to read. On dash0#20655 a failing "Generate
+ *  types" check was reported as "gh pr checks unreadable".
+ *  @param {{ ok: boolean, code?: number|string, stdout?: string, timedOut?: boolean }} r */
+export function checksReadable(r) {
+  if (r.ok) return true;
+  return !r.timedOut && (r.code === 1 || r.code === 8) && String(r.stdout || "").trim().length > 0;
+}
+
 /**
  * Reads the `--state` file (D10) — the caller's already-fetched LoreKit
  * state record `data`, read by the AGENT before invoking this script
@@ -669,18 +811,41 @@ export function computeThreadOverlap(files, threads) {
  * "What it deliberately does NOT do" note above). Absent or unreadable
  * degrades to "no prior deep pass on record" — the SAFE direction per
  * depth-routing.md's D6 ("no prior full review is recorded").
- * @param {string|null} path @returns {{lastFullSha: string|null, incrRunsSinceFull: number}}
+ * Accepts the record as Step 4c writes it (`{v, commit, data: {runs[]}}`, or a LoreKit read's
+ * `{value: "<that JSON>"}`), or the flat `{priorSha, lastFullSha, incrRunsSinceFull}` shape.
+ * @param {string|null} path @returns {{priorSha: string|null, lastFullSha: string|null, incrRunsSinceFull: number, stickyCommentId?: number|null, botLogin?: string|null}}
  */
 export function readStateFile(path) {
-  if (!path) return { lastFullSha: null, incrRunsSinceFull: 0 };
+  const none = { priorSha: null, lastFullSha: null, incrRunsSinceFull: 0 };
+  if (!path) return none;
   try {
-    const raw = JSON.parse(readFileSync(path, "utf8"));
+    let raw = JSON.parse(readFileSync(path, "utf8"));
+    // A LoreKit read returns the record's value as a string; accept the envelope as well.
+    if (typeof raw?.value === "string") raw = JSON.parse(raw.value);
+    // The record itself (Step 4c's shape): the same three bindings Step 0.7 derives with jq.
+    // On dash0#20655 a re-review that had read this record still ran as a first run, because the
+    // script took the prior SHA only from the sticky and could not read `data.runs[]` at all.
+    const runs = Array.isArray(raw?.data?.runs) ? raw.data.runs : null;
+    if (runs) {
+      const lastFull = runs.map((r) => r?.mode).lastIndexOf("full");
+      return {
+        stickyCommentId: raw.data.sticky_comment_id ?? null,
+        // pr-reviewer.md's identity ladder falls back to the record's bot_login when no login was
+        // supplied; without it the Fix-this links (which need a login) were never built. Validated
+        // with isGithubLogin — an unvalidated record value must never become the reviewer identity.
+        botLogin: isGithubLogin(raw.data.bot_login) ? raw.data.bot_login : null,
+        priorSha: runs.length ? String(runs[runs.length - 1]?.sha || "") || null : null,
+        lastFullSha: lastFull < 0 ? null : String(runs[lastFull]?.sha || "") || null,
+        incrRunsSinceFull: lastFull < 0 ? runs.length : runs.length - 1 - lastFull,
+      };
+    }
     return {
+      priorSha: raw.priorSha || raw.prior_sha || null,
       lastFullSha: raw.lastFullSha || raw.last_full_sha || null,
       incrRunsSinceFull: Number(raw.incrRunsSinceFull ?? raw.incr_runs_since_full ?? 0) || 0,
     };
   } catch {
-    return { lastFullSha: null, incrRunsSinceFull: 0 };
+    return none;
   }
 }
 
@@ -708,8 +873,152 @@ const CLONE_TIMEOUT_FLOOR_MS = 300000;
  * temp clone or tarball: on a worktree it leaves a stale entry in the parent
  * repo's `.git/worktrees`, so the review breaks the repo it was reviewing.
  */
-async function materializeWorkspace({ repo, number, headSha, timeoutMs, anomalies, isolated = false }) {
-  const originRepo = await currentRepoSlug();
+/** Both compare reads' jq: the divergence fields plus what an intact range needs, in one call. */
+/** The commit-history fields compareTrust() reads: merges in the range, and whether the (250-row) commit list is whole. */
+const COMPARE_HISTORY_JQ = "total_commits, listed_commits: ((.commits // []) | length), merge_commits: ([(.commits // [])[] | select(((.parents // []) | length) > 1)] | length)";
+const DELTA_COMPARE_JQ = `{status, ahead_by, behind_by, ${COMPARE_HISTORY_JQ}, files: [(.files // [])[] | {filename, additions, deletions, status, patch}]}`;
+/** Per-file lines, not a pre-summed total: resolveChurnLines() needs the list to judge truncation/pollution. */
+const CHURN_COMPARE_JQ = `{status, behind_by, ${COMPARE_HISTORY_JQ}, files: [(.files // [])[] | {filename, lines: (.additions + .deletions)}]}`;
+
+/** One `compare/<from>...<to>` read that returns the divergence fields and the file data together.
+ *  A range too large to return with files still has to classify, so a failed combined read falls
+ *  back to the fields-only read, and the result says the file data is missing (`files`/`lines`
+ *  absent, `filesError` set) — the caller then degrades exactly as it did when that was a
+ *  second call.
+ *  @param {string} repo @param {string} from @param {string} to @param {string} jq
+ *  @param {string} metaJq @param {number} timeoutMs */
+async function compareRange(repo, from, to, jq, metaJq, timeoutMs) {
+  const path = `repos/${repo}/compare/${from}...${to}`;
+  const both = await ghJson(["api", path, "--jq", jq], { timeoutMs: Math.max(timeoutMs, 120000) });
+  if (both.ok) return both;
+  const meta = await ghJson(["api", path, "--jq", metaJq], { timeoutMs });
+  return meta.ok ? { ...meta, filesError: both.error } : meta;
+}
+
+/**
+ * The authored delta `from..to` read from a LOCAL git checkout — no 300-file compare cap. Tries
+ * each candidate dir in order and uses the first whose object store holds `from`, `to` and the
+ * PR's base tip (`baseSha`) with `from` an ancestor of `to`. Authored = files changed by the
+ * non-merge commits in `from..to` NOT reachable from the base tip (`rev-list --no-merges from..to
+ * --not base`) — so a teammate's commit pulled in, or a sibling branch merged in, counts on either
+ * parent, while the base branch's own commits never do — plus files each merge in that set resolved
+ * differently from git's automatic re-merge (conflicts, hand edits), kept to the PR's own files
+ * (authoredPrPaths). Residual: a PR file the author and the merged-in base both touched carries
+ * the base's hunks too (the diff is `from..to` per file), which over-counts — the safe direction.
+ * @param {{dirs: (string|null|undefined)[], from: string, to: string, baseSha: string, prFiles: any[], prFilesComplete: boolean, timeoutMs?: number}} input
+ * @returns {Promise<{ok: true, files: any[], dir: string} | {ok: false, reason: string}>}
+ */
+export async function localAuthoredDelta({ dirs, from, to, baseSha, prFiles, prFilesComplete, timeoutMs = 60000 }) {
+  if (!baseSha) return { ok: false, reason: "no base SHA — base-branch commits cannot be told from authored ones" };
+  const candidates = [...new Set(dirs.filter((d) => d && existsSync(/** @type {string} */ (d))))];
+  if (!candidates.length) return { ok: false, reason: "no local git checkout" };
+  /** @param {string} out */
+  const lines = (out) => out.split("\n").map((l) => l.trim()).filter(Boolean);
+  let lastReason = "no candidate checkout holds both SHAs";
+  for (const dir of /** @type {string[]} */ (candidates)) {
+    /** @param {string[]} args */
+    const g = (args) => run("git", ["-C", dir, "-c", "core.quotePath=false", "--literal-pathspecs", ...args], { timeoutMs });
+    const have = async (/** @type {string} */ sha) => (await g(["cat-file", "-e", `${sha}^{commit}`])).ok;
+    // PR #213 r4134545772: no workspace rung fetches the base tip (rung 0 fetches only
+    // pull/<n>/head, rung 1 is head-only, --repo-dir fetches nothing), so once main moves the
+    // PR's baseRefOid — and an old prior SHA — are usually absent. Fetch a missing one by SHA
+    // from origin, once; a successful fetch is silent, a failed one is the reason returned.
+    /** @param {string} sha @returns {Promise<string|null>} null when present, else why not */
+    const haveOrFetch = async (sha) => {
+      if (await have(sha)) return null;
+      const f = await run("git", [...GIT_CREDENTIAL_ARGS, "-C", dir, "fetch", "-q", "--no-tags", "origin", sha], { timeoutMs, env: GIT_NONINTERACTIVE_ENV });
+      if (f.ok && (await have(sha))) return null;
+      return `not in ${dir}'s object store and fetching it from origin failed (${f.ok ? "fetched, still absent" : describeFailure(f, timeoutMs)})`;
+    };
+    if (!(await have(to))) { lastReason = `${to.slice(0, 7)} not in ${dir}'s object store`; continue; }
+    const fromMiss = await haveOrFetch(from);
+    if (fromMiss) { lastReason = `${from.slice(0, 7)} ${fromMiss}`; continue; }
+    const baseMiss = await haveOrFetch(baseSha);
+    if (baseMiss) { lastReason = `base ${baseSha.slice(0, 7)} ${baseMiss}`; continue; }
+    if (!(await g(["merge-base", "--is-ancestor", from, to])).ok) { lastReason = `${from.slice(0, 7)} is not an ancestor of ${to.slice(0, 7)} in ${dir}`; continue; }
+    const range = [`${from}..${to}`, "--not", baseSha];
+    const own = await g(["log", "--no-merges", "--no-renames", "--format=", "--name-only", ...range]);
+    const merges = await g(["rev-list", "--merges", "--parents", ...range]);
+    if (!own.ok || !merges.ok) return { ok: false, reason: `git log failed in ${dir}: ${(own.stderr || merges.stderr).trim().slice(0, 160)}` };
+    const touched = new Set(lines(own.stdout));
+    for (const [m, ...parents] of lines(merges.stdout).map((l) => l.split(/\s+/))) {
+      // `--remerge-diff` (git >= 2.36) names only files the recorded merge differs from git's own
+      // automatic re-merge — conflict resolutions and hand edits. `--cc` also lists every file a
+      // CLEAN merge combined from both sides (dash0#20655: dozens of main's files), so it is only
+      // the fallback, over-counting in the safe direction: for an older git, and for an octopus
+      // merge, where remerge-diff prints a warning, lists nothing, and still exits 0.
+      let res = parents.length > 2 ? null : await g(["show", "--remerge-diff", "--no-renames", "--format=", "--name-only", m]);
+      if (res && res.ok && !res.stdout.trim() && res.stderr.trim()) res = null;
+      if (!res || !res.ok) res = await g(["diff-tree", "--cc", "--no-commit-id", "--name-only", "-r", m]);
+      if (!res.ok) return { ok: false, reason: `reading merge ${m.slice(0, 7)} failed` };
+      for (const f of lines(res.stdout)) touched.add(f);
+    }
+    const paths = authoredPrPaths(touched, prFiles, prFilesComplete);
+    if (!paths.length) return { ok: true, files: [], dir };
+    // Fixed a/ and b/ prefixes and repo-root paths whatever the user's config says (diff.noprefix,
+    // diff.mnemonicPrefix, diff.relative): parseLocalDiff keys each patch on its `+++ b/` header.
+    const base = ["-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.relative=false",
+      "diff", "--no-color", "--no-ext-diff", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/"];
+    const [numstat, nameStatus, patch] = await Promise.all([
+      g([...base, "--numstat", from, to, "--", ...paths]),
+      g([...base, "--name-status", from, to, "--", ...paths]),
+      g([...base, from, to, "--", ...paths]),
+    ]);
+    if (!numstat.ok || !nameStatus.ok || !patch.ok) return { ok: false, reason: `git diff failed in ${dir}` };
+    return { ok: true, files: parseLocalDiff(numstat.stdout, nameStatus.stdout, patch.stdout), dir };
+  }
+  return { ok: false, reason: lastReason };
+}
+
+/**
+ * Dispose of a context's workspace by the method its `workspace.cleanup` names — the scripted form
+ * of workspace.md § Cleanup, so the process that ran prepare can release what prepare made.
+ * Whoever ran prepare owns this call: under `/pr-review` and `review-loop` that is the CALLER (it
+ * prepares once for the reviewer and the intent worker), never the reviewer it hands `--context`
+ * to. `none` is left alone; `worktree` goes through `git worktree remove` (an `rm -rf` leaves a stale
+ * `.git/worktrees` entry in the repo under review); `rm` is `rm -rf`. A `worktree`/`rm` directory
+ * outside the scratch root is refused, never deleted: a context that names one was not written by
+ * this script. Idempotent — a directory already gone is success.
+ * @param {{ dir?: string|null, worktreeParent?: string|null, cleanup?: string }} ws
+ * @returns {{ ok: boolean, action: string, message: string }}
+ */
+export function cleanupWorkspace(ws) {
+  const action = String(ws?.cleanup || "none");
+  const dir = ws?.dir ? pathResolve(ws.dir) : "";
+  if (action === "none" || !dir) return { ok: true, action: "none", message: "nothing to clean (cleanup: none)" };
+  if (action !== "worktree" && action !== "rm") return { ok: false, action, message: `unknown cleanup ${JSON.stringify(action)} — refused` };
+  const roots = [tmpdir()];
+  try { roots.push(realpathSync(tmpdir())); } catch { /* keep the unresolved form */ }
+  const inScratch = dir.includes("/.pr-reviewer-scratch/") || roots.some((r) => dir.startsWith(`${r}/`));
+  if (!inScratch) return { ok: false, action, message: `${dir} is outside the scratch root — refused, nothing deleted` };
+  if (!existsSync(dir)) return { ok: true, action, message: `${dir} already gone` };
+  try {
+    if (action === "worktree") {
+      execFileSync("git", ["-C", dir, "worktree", "remove", "--force", dir], { stdio: ["ignore", "ignore", "pipe"], timeout: 60000 });
+      // workspace.md: `git worktree add` refused an existing path, so the parent is a mkdtemp dir
+      // holding only the worktree, and its `run-*` parent holds only that. rmdir, never rm -rf.
+      for (const d of [ws.worktreeParent, ws.worktreeParent ? dirname(ws.worktreeParent) : null]) {
+        if (d && /\/(wt-[^/]+|run-[^/]+)$/.test(d)) { try { rmdirSync(d); } catch { /* not empty: leave it */ } }
+      }
+    } else {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  } catch (e) {
+    return { ok: false, action, message: `${action} cleanup of ${dir} failed: ${String(/** @type {any} */ (e)?.stderr || /** @type {any} */ (e)?.message || e).trim().slice(0, 200)}` };
+  }
+  return { ok: !existsSync(dir), action, message: existsSync(dir) ? `${dir} still exists after ${action}` : `removed ${dir} (${action})` };
+}
+
+async function materializeWorkspace({ repo, number, headSha, timeoutMs, anomalies, isolated = false, repoDir = null }) {
+  // Rung 0's local clone. `--repo-dir` names it explicitly; otherwise it is the process's own cwd,
+  // which is only right when the caller happens to run inside a clone of the PR's repo — a
+  // `review-loop` session started in another repo skipped rung 0 and fell to the network rungs.
+  const cloneCwd = repoDir ? pathResolve(repoDir) : process.cwd();
+  if (repoDir && !existsSync(cloneCwd)) anomalies.push(`workspace --repo-dir ${repoDir} does not exist — rung 0 skipped`);
+  const originRepo = repoDir && !existsSync(cloneCwd) ? null : await currentRepoSlug(cloneCwd);
+  if (repoDir && originRepo && originRepo.toLowerCase() !== repo.toLowerCase()) {
+    anomalies.push(`workspace --repo-dir ${repoDir} is a clone of ${originRepo}, not ${repo} — rung 0 skipped`);
+  }
   const cloneTimeoutMs = Math.max(timeoutMs, CLONE_TIMEOUT_FLOOR_MS);
 
   // A/B round 2 item 1(b): every worktree this ladder can create lands under ONE run-scoped
@@ -730,7 +1039,7 @@ async function materializeWorkspace({ repo, number, headSha, timeoutMs, anomalie
     // ANOTHER RUN (arm B) had created, because reuse scanned every worktree registered against
     // the shared repo with no notion of which run made which — breaking `--isolated`'s own
     // independence promise. `runScratchDir` below is this scoping.
-    const existing = await findWorktreeAt(headSha, { isolated, runScratchDir });
+    const existing = await findWorktreeAt(headSha, { isolated, runScratchDir, cwd: cloneCwd });
     if (existing) {
       return {
         dir: existing,
@@ -741,16 +1050,19 @@ async function materializeWorkspace({ repo, number, headSha, timeoutMs, anomalie
       };
     }
 
-    const fetched = await run(
+    // A clone that already has the head commit needs no fetch: on dash0 the `pull/<n>/head`
+    // fetch cost 2.6 s of a 14.7 s workspace phase for a commit that was already local.
+    const present = await run("git", ["cat-file", "-e", `${headSha}^{commit}`], { timeoutMs, cwd: cloneCwd });
+    const fetched = present.ok ? present : await run(
       "git",
       [...GIT_CREDENTIAL_ARGS, "fetch", "-q", "origin", `pull/${number}/head`],
-      { timeoutMs, env: GIT_NONINTERACTIVE_ENV },
+      { timeoutMs, cwd: cloneCwd, env: GIT_NONINTERACTIVE_ENV },
     );
     if (fetched.ok) {
       mkdirSync(runScratchDir, { recursive: true });
       const parent = mkdtempSync(join(runScratchDir, "wt-"));
       const dir = join(parent, "w");
-      const added = await run("git", ["worktree", "add", "--detach", dir, headSha], { timeoutMs });
+      const added = await run("git", ["worktree", "add", "--detach", dir, headSha], { timeoutMs, cwd: cloneCwd });
       if (added.ok) {
         return {
           dir,
@@ -800,9 +1112,8 @@ async function materializeWorkspace({ repo, number, headSha, timeoutMs, anomalie
   // the clone it falls back from, and the old 120s-floor-less timeout starved it identically.
   const tarDir = mkdtempSync(join(scratchRoot(), "tar-"));
   const tarball = join(tarDir, "head.tgz");
-  const got = await run("gh", ["api", `repos/${repo}/tarball/${headSha}`], { timeoutMs: cloneTimeoutMs });
-  if (got.ok && got.stdout.length > 0) {
-    writeFileSync(tarball, got.stdout, "binary");
+  const got = await runToFile("gh", ["api", `repos/${repo}/tarball/${headSha}`], tarball, { timeoutMs: cloneTimeoutMs });
+  if (got.ok && got.bytes > 0) {
     const untarred = await run("tar", ["-xzf", tarball, "-C", tarDir, "--strip-components", "1"], { timeoutMs });
     if (untarred.ok) {
       return {
@@ -848,9 +1159,9 @@ export function isReusableWorktreeDir(dir, { isolated = false, runScratchDir = n
  * worktree is excluded: reviewing inside it would put the review in the tree the
  * user is sitting in, and disposal there is never ours.
  */
-async function findWorktreeAt(sha, { isolated = false, runScratchDir = null } = {}) {
+async function findWorktreeAt(sha, { isolated = false, runScratchDir = null, cwd = process.cwd() } = {}) {
   if (!sha) return null;
-  const r = await run("git", ["worktree", "list", "--porcelain"], { timeoutMs: 10000 });
+  const r = await run("git", ["worktree", "list", "--porcelain"], { timeoutMs: 10000, cwd });
   if (!r.ok) return null;
   let dir = null;
   let head = null;
@@ -877,8 +1188,8 @@ async function findWorktreeAt(sha, { isolated = false, runScratchDir = null } = 
   return hit ? hit.dir : null;
 }
 
-async function currentRepoSlug() {
-  const r = await run("git", ["remote", "get-url", "origin"], { timeoutMs: 10000 });
+async function currentRepoSlug(cwd = process.cwd()) {
+  const r = await run("git", ["remote", "get-url", "origin"], { timeoutMs: 10000, cwd });
   if (!r.ok) return null;
   const m = r.stdout.trim().match(/github\.com[:/]([^/]+)\/([^/.]+)(?:\.git)?$/i);
   return m ? `${m[1]}/${m[2]}` : null;
@@ -927,6 +1238,25 @@ export function extraHighStakes(yamlText) {
     if (!m) continue;
     const v = m[1].replace(/\s+#.*$/, "").replace(/"/g, "").trim();
     if (v) out.push(v);
+  }
+  return out;
+}
+
+/**
+ * The three run-level Agent0 fix-link keys (review-config.md § Run-level fields), top-level only —
+ * a nested or subtree key never governs the run. `fixLinks` is null when the key is absent, so
+ * finalize.mjs can tell "said nothing" (buttons on) from "said false" (buttons off).
+ */
+export function agent0Config(yamlText) {
+  const out = { fixLinks: null, environment: null, org: null };
+  if (!yamlText) return out;
+  for (const raw of yamlText.split("\n")) {
+    const m = /^(agent0_fix_links|agent0_environment|agent0_org):\s*(.*)$/.exec(raw);
+    if (!m) continue;
+    const v = m[2].replace(/\s+#.*$/, "").replace(/["']/g, "").trim();
+    if (m[1] === "agent0_fix_links") out.fixLinks = v === "true" ? true : v === "false" ? false : null;
+    else if (m[1] === "agent0_environment") out.environment = v || null;
+    else out.org = v || null;
   }
   return out;
 }
@@ -1011,14 +1341,14 @@ async function prepare(opts) {
         `repos/${owner}/${name}/issues/${number}/comments`,
         "--paginate",
         "--jq",
-        ".[] | {id: .id, user: .user.login, body: .body, html_url: .html_url, created_at: .created_at}",
+        ISSUE_COMMENTS_JQ,
       ],
       timeoutMs,
     ),
     wantHistorical ? Promise.resolve({ ok: false, error: null, value: [] }) : fetchFiles(repo, number, timeoutMs),
   ]);
   /** @type {any} */ let diffR = diffR0;
-  /** @type {any} */ let checksR = checksR0;
+  /** @type {any} */ let checksR = checksReadable(checksR0) ? { ...checksR0, ok: true } : checksR0;
   /** @type {any} */ let filesR = filesR0;
 
   timing.end(); // fetch
@@ -1082,6 +1412,10 @@ async function prepare(opts) {
   if (!commentsR.ok) anomalies.push(`issue comments unreadable: ${commentsR.error} — prior-run detection degrades to first run`);
 
   const files = filesR.value || [];
+  // pulls/{n}/files is paginated and capped at 3000: a short list would make the delta's PR-file
+  // restriction drop authored files, so it is reported and the restriction is relaxed.
+  const prFilesState = wantHistorical || !filesR.ok ? { complete: false, note: null } : prFilesCompleteness(files.length, meta.changedFiles, filesR.error);
+  if (prFilesState.note) anomalies.push(prFilesState.note);
   const { diffable, undiffable } = partitionUndiffable(files);
   const comments = commentsR.value || [];
   const sticky = findSticky(comments);
@@ -1096,10 +1430,12 @@ async function prepare(opts) {
   // series (or, worse, an entirely earlier review of the same PR) left behind. A
   // sticky can still EXIST on the PR (duplicate-sticky detection above still runs),
   // but under `--isolated` this run never treats it as a prior run to diff against.
+  const state = readStateFile(runMode.stateIgnored ? null : (opts.state || null));
   const { priorSha, zeroDelta } = resolvePriorRun({
     isolated: runMode.isolated,
     stickyBody: sticky ? sticky.body : null,
     headSha,
+    statePriorSha: state.priorSha,
   });
 
   // Step 0.5 — review relation. Never from `gh api /user`: it is not repo-scoped
@@ -1108,13 +1444,14 @@ async function prepare(opts) {
   // body as `--reviewer-login` (the agent body's `ME=$(gh api user … || echo "")` captures gh's
   // stdout error payload, then appends the empty fallback) and this script accepted it as a login.
   // Anything that is not a GitHub login shape is treated as unknown, and says so.
-  const suppliedLogin = opts.reviewerLogin || process.env.PR_REVIEWER_LOGIN || "";
-  const me = isGithubLogin(suppliedLogin) ? suppliedLogin : "";
+  const identityInput = identityInputs({ opts, state, sticky, isolated: runMode.isolated });
+  const { suppliedLogin } = identityInput;
+  const { me, identitySource } = resolveReviewerIdentity(identityInput);
   const authorLogin = meta.author?.login || "";
   const reviewRelation = me ? (normalizeLogin(me) === normalizeLogin(authorLogin) ? "self" : "cross") : "cross";
-  if (!me && suppliedLogin) {
+  if (suppliedLogin && !isGithubLogin(suppliedLogin)) {
     anomalies.push(
-      `reviewer login rejected — ${JSON.stringify(String(suppliedLogin).slice(0, 40))} is not a GitHub login; relation defaulted to cross`,
+      `reviewer login rejected — ${JSON.stringify(String(suppliedLogin).slice(0, 40))} is not a GitHub login; ${me ? `identity taken from ${identitySource === "state-record" ? "the state record's bot_login" : "the prior report's author"}` : "relation defaulted to cross"}`,
     );
   } else if (!me) {
     anomalies.push(
@@ -1132,7 +1469,7 @@ async function prepare(opts) {
   if (opts.workspace && checkoutSha) {
     workspace = opts.workdir
       ? { dir: opts.workdir, worktreeParent: null, depthCapability: "checkout", rung: "caller-supplied", cleanup: "none" }
-      : await materializeWorkspace({ repo, number, headSha: checkoutSha, timeoutMs, anomalies, isolated: runMode.isolated });
+      : await materializeWorkspace({ repo, number, headSha: checkoutSha, timeoutMs, anomalies, isolated: runMode.isolated, repoDir: opts.repoDir || null });
   }
   const tier2Checker = detectTier2Checker(workspace.dir);
   timing.end(); // workspace
@@ -1167,7 +1504,8 @@ async function prepare(opts) {
   // Shape classification — a pure local computation, no API calls.
   timing.start("classify-shape");
   let shape = null;
-  const hsArgs = extraHighStakes(readReviewConfig(workspace.dir)).flatMap((r) => ["--extra-high-stakes", r]);
+  const reviewConfigText = readReviewConfig(workspace.dir);
+  const hsArgs = extraHighStakes(reviewConfigText).flatMap((r) => ["--extra-high-stakes", r]);
   const classify = await run("node", [join(HERE, "classify-shape.mjs"), prFilesPath, ...hsArgs], { timeoutMs });
   if (classify.ok) {
     try {
@@ -1273,7 +1611,6 @@ async function prepare(opts) {
   // unconditionally (`resolveRunMode`'s `stateIgnored`) — a caller-supplied state
   // file is itself carried state from a prior run, exactly the class of input an
   // isolated comparability run must not depend on.
-  const state = readStateFile(runMode.stateIgnored ? null : (opts.state || null));
   if (!opts.state && !runMode.isolated) {
     anomalies.push(
       "no --state file supplied — routing computed with lastFullSha=none, incrRunsSinceFull=0 " +
@@ -1290,9 +1627,15 @@ async function prepare(opts) {
   // The graphql reviewThreads read — every mode, always: THREAD_OVERLAP needs
   // it even on a full run, and the context's threads[] field is a caller
   // input regardless of tier.
+  // The threads read and both compares are independent GitHub calls; they run concurrently and
+  // are awaited where each result is needed (5.7 s of sequential calls on dash0#20655).
+  const threadsRead = opts.threads !== false ? fetchReviewThreads(owner, name, number, timeoutMs) : null;
+  const hasPriorRun = !!priorSha && !zeroDelta && !runMode.full;
+  const deltaCompare = hasPriorRun ? compareRange(repo, priorSha, headSha, DELTA_COMPARE_JQ, "{status, ahead_by, behind_by}", timeoutMs) : null;
+  const churnCompare = hasPriorRun && state.lastFullSha ? compareRange(repo, state.lastFullSha, headSha, CHURN_COMPARE_JQ, "{status, behind_by}", timeoutMs) : null;
   let threads = [];
-  if (opts.threads !== false) {
-    const tr = await fetchReviewThreads(owner, name, number, timeoutMs);
+  if (threadsRead) {
+    const tr = await threadsRead;
     threads = buildThreads(tr.nodes);
     if (!tr.complete) {
       anomalies.push("review threads read incomplete — THREAD_OVERLAP and open-thread data may undercount");
@@ -1308,6 +1651,10 @@ async function prepare(opts) {
   }
 
   let deltaFiles = diffable.length ? files.filter((f) => diffable.includes(f.filename)) : files;
+  /** @type {string} */ let deltaRoute = hasPriorRun ? "full-pr" : "none";
+  // Checkouts that may hold both SHAs for the truncation-immune local-git delta: the materialized
+  // workspace (rung 0 worktree / caller --workdir), then the --repo-dir clone.
+  const localGitDirs = [workspace.depthCapability === "checkout" ? workspace.dir : null, opts.repoDir ? pathResolve(opts.repoDir) : null];
   let deltaShape = shape;
   let deltaCountsResult = { deltaLines: deltaLines(files), newFiles: files.filter((f) => f.status === "added").length };
   let cumDeltaLines = 0;
@@ -1315,28 +1662,34 @@ async function prepare(opts) {
   // `priorSha` is already null under `--isolated` (above), so this is naturally false
   // there too — `runMode.full` (not the raw `opts.full`) so a plain `--full` (no
   // `--isolated`) gets the same treatment.
-  const hasPriorRun = !!priorSha && !zeroDelta && !runMode.full;
   if (hasPriorRun) {
-    const cmp = await ghJson(
-      ["api", `repos/${repo}/compare/${priorSha}...${headSha}`, "--jq", "{status, ahead_by, behind_by}"],
-      { timeoutMs },
-    );
+    const cmp = await /** @type {Promise<any>} */ (deltaCompare);
     if (cmp.ok) {
       const divergence = classifyDivergence(cmp.value);
       if (divergence === "intact") {
-        const full = await ghJson(
-          [
-            "api",
-            `repos/${repo}/compare/${priorSha}...${headSha}`,
-            "--jq",
-            "{files: [.files[] | {filename, additions, deletions, status, patch}]}",
-          ],
-          { timeoutMs: Math.max(timeoutMs, 120000) },
-        );
-        if (full.ok) {
-          deltaFiles = full.value.files || [];
+        if (Array.isArray(cmp.value.files)) {
+          // An intact range is not proof the list is the author's delta: a head that merges the
+          // base in stays `ahead` while sweeping in the base's files, and GitHub cuts the list at
+          // 300 — on dash0#20655 the authored files were the ones cut off. A truncated or polluted
+          // list is REPLACED (local git, else blob route), never filtered (resolveIntactDelta).
+          const resolved = await resolveIntactDelta({
+            compareFiles: cmp.value.files,
+            prFiles: files,
+            history: compareHistory(cmp.value),
+            readLocal: () => localAuthoredDelta({ dirs: localGitDirs, from: /** @type {string} */ (priorSha), to: headSha, baseSha, prFiles: files, prFilesComplete: prFilesState.complete, timeoutMs }),
+            readPriorTree: async () => {
+              const tree = await ghJson(
+                ["api", `repos/${repo}/git/trees/${priorSha}?recursive=1`, "--jq", '[.tree[] | select(.type == "blob") | {path, sha}]'],
+                { timeoutMs },
+              );
+              return tree.ok ? { ok: true, tree: tree.value || [] } : { ok: false, reason: String(tree.error) };
+            },
+          });
+          deltaFiles = resolved.files;
+          deltaRoute = resolved.route;
+          if (resolved.anomaly) anomalies.push(resolved.anomaly);
         } else {
-          anomalies.push(`delta compare fetch failed: ${full.error} — falling back to full-PR delta`);
+          anomalies.push(`delta compare fetch failed: ${cmp.filesError} — falling back to full-PR delta`);
         }
       } else {
         // Diverged history — the blob-SHA authored delta, rebase-immune.
@@ -1347,6 +1700,7 @@ async function prepare(opts) {
           );
           if (tree.ok) {
             deltaFiles = blobDelta(files, tree.value || []);
+            deltaRoute = "blob-diff";
           } else {
             anomalies.push(`diverged-history tree read failed: ${tree.error} — upgrading to full-PR delta, never trusting the diverged compare`);
           }
@@ -1380,19 +1734,23 @@ async function prepare(opts) {
     }
 
     // Cumulative churn since the last full pass (deep-lens refresh, D4/D5/D6).
-    if (state.lastFullSha) {
-      const cum = await ghJson(
-        ["api", `repos/${repo}/compare/${state.lastFullSha}...${headSha}`, "--jq", "{status, behind_by}"],
-        { timeoutMs },
-      );
+    if (churnCompare) {
+      const cum = await churnCompare;
       if (cum.ok) {
         let cumLines = 0;
         if (classifyDivergence(cum.value) === "intact") {
-          const cumFull = await ghJson(
-            ["api", `repos/${repo}/compare/${state.lastFullSha}...${headSha}`, "--jq", "[(.files // [])[] | .additions + .deletions] | add // 0"],
-            { timeoutMs },
-          );
-          cumLines = cumFull.ok ? Number(cumFull.value) || 0 : FULL_REFRESH_DELTA + 1;
+          if (Array.isArray(cum.value.files)) {
+            const churn = await resolveChurnLines({
+              perFile: cum.value.files,
+              prFiles: files,
+              history: compareHistory(cum.value),
+              readLocal: () => localAuthoredDelta({ dirs: localGitDirs, from: /** @type {string} */ (state.lastFullSha), to: headSha, baseSha, prFiles: files, prFilesComplete: prFilesState.complete, timeoutMs }),
+            });
+            cumLines = churn.lines;
+            if (churn.anomaly) anomalies.push(churn.anomaly);
+          } else {
+            cumLines = FULL_REFRESH_DELTA + 1;
+          }
         }
         cumDeltaLines = churnState({ hasLastFull: true, meta: cum.value, deltaLinesIfIntact: cumLines });
       } else {
@@ -1409,7 +1767,9 @@ async function prepare(opts) {
     // --isolated item 2), regardless of whether a sticky happens to already exist on
     // the PR from an earlier, non-comparability review — `!sticky` alone missed exactly
     // that case (a re-review of an already-reviewed PR run under `--isolated`).
-    firstRun: runMode.isolated || !sticky,
+    // A state record with runs is a prior review even when no sticky carries the marker
+    // (dash0#20655's sticky held a file path, not a report, and D1 fired on its seventh run).
+    firstRun: runMode.isolated || (!sticky && !state.priorSha),
     full: runMode.full,
     effortHigh: opts.effort === "high",
     cumDeltaLines,
@@ -1436,7 +1796,9 @@ async function prepare(opts) {
   // "in-context"` and logs RUN_ANOMALY when that downgrades it
   // (dispatch-topology.md § Reading a budget into dispatch).
   const thoroughnessOverride = opts.thoroughness === "" ? undefined : Number(opts.thoroughness);
+  const contextMode = resolveContextMode({ runMode, zeroDelta, routing });
   const budget = resolveBudget({
+    runMode: contextMode, // a small incremental re-review skips the intent worker (route-depth.mjs SMALL_INCREMENTAL_MODES)
     thoroughness: thoroughnessOverride,
     routedTier: routing.tier,
     shape: (deltaShape && deltaShape.shapes) || [],
@@ -1464,17 +1826,17 @@ async function prepare(opts) {
     isolated: runMode.isolated,
     runMode,
     // finalize.mjs reads a top-level `mode` (RUN.mode for the renderer) — this is that field,
-    // mirrored from runMode.mode rather than a second source of truth. Without it, finalize.mjs's
+    // derived from runMode and the routed tier (resolveContextMode). Without it, finalize.mjs's
     // `context?.mode` fallback silently renders "unknown", which is not a member of
     // render-report.mjs's VALID_MODES and fails closed only at render time, not here.
-    mode: runMode.mode,
+    mode: contextMode,
 
     // What the caller must still do itself. Stated in the artifact, not only in
     // the docs, so a consumer cannot read a partial context as a complete one.
     notCovered: [
       runMode.isolated
         ? "LoreKit reads — Step 0.7 (the state record) is SKIPPED entirely under --isolated, and priorSha below is null (pipeline.md § --isolated). Steps 1.0/1.2c/1.2d (codebase-knowledge/lesson reads) are NOT skipped by --isolated — those are project memory, not run-comparability state, and persist by design across PRs and across runs; a comparability run (A/B, shadow) that wants a clean memory baseline must arrange that itself, --isolated does not guarantee it."
-        : "LoreKit reads (Steps 0.7, 1.0, 1.2c, 1.2d) — priorSha below is the GitHub FALLBACK rung only, and carries no PRIOR_DIAGNOSTICS",
+        : priorShaProvenance({ fromState: !!state.priorSha }).loreKitNotCovered,
       "routing{} below is only as accurate as the --state file the caller passed — no --state means lastFullSha/incrRunsSinceFull default to none/0 (see anomalies[] when this fired)",
       "Phases D and E, Steps 2.4*, 2.7, 2.9c — the Gate 4 SCAN below is mechanical pre-candidates only; confirm/exempt disposition and any AI-stub findings are judgment",
       "every write: the sticky, the review, the state record",
@@ -1507,7 +1869,9 @@ async function prepare(opts) {
     historical,
     reviewRelation,
     reviewerLogin: me || null,
-    identitySource: me ? (opts.reviewerLogin ? "--reviewer-login" : "PR_REVIEWER_LOGIN") : "unknown",
+    identitySource,
+    // Read by finalize.mjs, which builds the Fix-with-Agent0 links (finalize/fix-links.mjs).
+    agent0: agent0Config(reviewConfigText),
 
     // Bulk payloads live on disk; the context names them. `inline` says which
     // form this context is in, so a consumer never has to guess whether a null
@@ -1534,7 +1898,11 @@ async function prepare(opts) {
     filesPath: prFilesPath,
     diffablePaths: diffable,
     undiffablePaths: undiffable,
-    deltaLines: deltaLines(files),
+    // The delta's own count on an incremental run (what RUN.delta_lines renders as "N lines in
+    // delta"); the full-PR count otherwise — deltaCountsResult is initialised to it.
+    deltaLines: deltaCountsResult.deltaLines,
+    // Which route produced the incremental delta: compare | local-git | blob-diff | full-pr | none.
+    deltaRoute,
 
     checks: { raw: checksR.ok ? checksR.stdout.trim() : null, readable: checksR.ok },
     reviews: reviewsR.value || [],
@@ -1549,8 +1917,12 @@ async function prepare(opts) {
       // judgment-affecting state. Because that target is the LIVE report, finalize.mjs refuses an
       // --isolated context without --dry-run and marks the plan `isolated`, which
       // execute-write-plan.mjs refuses on its own (A/B round 3; rules/pipeline.md § --isolated).
-      source: runMode.isolated ? "none" : (sticky ? "github-fallback-rung" : "none"),
-      stickyCommentId: sticky ? sticky.id : null,
+      source: runMode.isolated ? "none" : state.priorSha ? "state-record" : (sticky ? "github-fallback-rung" : "none"),
+      // The record's id when no marker was found: a real run then PATCHes that comment — which
+      // repairs a sticky whose body lost its marker — instead of posting a second report. A comment
+      // deleted since the record was written 404s that PATCH, and execute-write-plan.mjs recreates
+      // the full report with a POST rather than falling back to the pointer.
+      stickyCommentId: sticky ? sticky.id : (runMode.isolated ? null : state.stickyCommentId ?? null),
       stickyUrl: sticky ? sticky.html_url : null,
       stickyKind: sticky ? sticky.kind : null,
       priorSha,
@@ -1558,7 +1930,7 @@ async function prepare(opts) {
       priorDiagnostics: null,
       note: runMode.isolated
         ? "--isolated: first-run semantics — no prior-run diagnostics, no delta triage, no fallback-rung priorSha (pipeline.md § --isolated)."
-        : "PRIOR_DIAGNOSTICS is NOT recoverable from the fallback rung. Read the LoreKit state record before taking Step 0.8's fast path.",
+        : priorShaProvenance({ fromState: !!state.priorSha }).note,
     },
 
     workspace: {
@@ -1619,7 +1991,7 @@ async function prepare(opts) {
       beginRun(runDir, {
         ...hostFacts(),
         repo, number, head_sha: checkoutSha, head_ref: meta.headRefName || undefined,
-        mode: runMode.mode, tier: routing.tier, thoroughness: budget.effectiveThoroughness, topology: budget.topology,
+        mode: context.mode, tier: routing.tier, thoroughness: budget.effectiveThoroughness, topology: budget.topology,
       }, { ns: startNs });
       /** @type {Record<string, number>} */
       const phaseAttrs = {};
@@ -1629,7 +2001,13 @@ async function prepare(opts) {
       // child spans of `prepare` — a 14 s step is only actionable once its 6 s clone is visible.
       const sub = timing.segments().map((g) => ({ name: g.name, start_ns: String(BigInt(g.startMs) * 1_000_000n), end_ns: String(BigInt(g.endMs) * 1_000_000n) }));
       appendRecord(runDir, { t: "step", phase: "end", attrs: { ...phaseAttrs, files: files.length, delta_lines: context.deltaLines }, sub });
-      context.telemetry = { runDir, ledger: ledgerPath(runDir) };
+      // The marker list travels with the run: the model reads it here, at the point it starts
+      // marking, rather than recalling a rule it read before Step 1. Every step it lists and the
+      // model forgets is exported as `unmarked`, which is how lenses and verify went missing.
+      context.telemetry = {
+        runDir, ledger: ledgerPath(runDir),
+        markers: { command: markerCommand(runDir), steps: modelSteps({ tier: routing.tier, topology: budget.topology }) },
+      };
     } catch (e) {
       anomalies.push(`run telemetry not started: ${String(e && e.message || e).slice(0, 160)}`);
     }
@@ -1756,6 +2134,14 @@ async function selfTest() {
     const r = extraHighStakes(y);
     return r.length === 2 && r[0] === "^src/auth/" && r[1] === "^db/migrations/";
   });
+  t("agent0Config reads the three top-level keys and strips comments and quotes", () => {
+    const r = agent0Config(["agent0_fix_links: false  # off", 'agent0_environment: "development"', "agent0_org: acme", "  agent0_org: nested"].join("\n"));
+    return r.fixLinks === false && r.environment === "development" && r.org === "acme";
+  });
+  t("agent0Config leaves fixLinks null when the key is absent", () => {
+    const r = agent0Config("profile: strict\n");
+    return r.fixLinks === null && r.environment === null && r.org === null && agent0Config("").fixLinks === null;
+  });
   t("extraHighStakes returns empty when the key is absent", () => {
     return extraHighStakes("profile: strict\n").length === 0 && extraHighStakes("").length === 0;
   });
@@ -1797,6 +2183,44 @@ async function selfTest() {
     return r.mode === null && r.full === false;
   });
 
+  // ── resolveContextMode (Phase C decides what Phase 0 left undecided) ──
+  const undecided = resolveRunMode({});
+  t("a re-review routed deep (refresh trigger) renders mode full, not null", () =>
+    resolveContextMode({ runMode: undecided, zeroDelta: false, routing: { tier: "deep", capApplied: false } }) === "full");
+  t("a re-review routed standard renders mode incremental", () =>
+    resolveContextMode({ runMode: undecided, zeroDelta: false, routing: { tier: "standard" } }) === "incremental");
+  t("a re-review routed quick renders mode incremental-quick", () =>
+    resolveContextMode({ runMode: undecided, zeroDelta: false, routing: { tier: "quick" } }) === "incremental-quick");
+  t("a zero-delta re-review renders mode zero-delta", () =>
+    resolveContextMode({ runMode: undecided, zeroDelta: true, routing: { tier: "quick" } }) === "zero-delta");
+  t("a deep run capped to standard under diff-only keeps mode full (render-report's carve-out pair)", () =>
+    resolveContextMode({ runMode: undecided, zeroDelta: false, routing: { tier: "standard", capApplied: true } }) === "full");
+  t("--full wins over the routed tier", () =>
+    resolveContextMode({ runMode: resolveRunMode({ full: true }), zeroDelta: false, routing: { tier: "standard" } }) === "full");
+  t("every mode resolveContextMode emits is one render-report.mjs accepts", () => {
+    const valid = new Set(["full", "incremental", "incremental-quick", "zero-delta"]);
+    return ["deep", "standard", "quick"].every((tier) => valid.has(resolveContextMode({ runMode: undecided, zeroDelta: false, routing: { tier } })));
+  });
+  t("an unknown routed tier throws instead of rendering an invalid mode", () => {
+    try { resolveContextMode({ runMode: undecided, zeroDelta: false, routing: { tier: "bogus" } }); return false; } catch { return true; }
+  });
+
+  // ── runToFile (rung 2: a binary tarball must reach disk byte-for-byte) ──
+  {
+    const dir = mkdtempSync(join(tmpdir(), "prep-selftest-"));
+    const out = join(dir, "bin.dat");
+    // Every byte value, including the ones UTF-8 decoding rewrites (0x80–0xff).
+    const script = "process.stdout.write(Buffer.from(Array.from({length:256},(_, i)=>i)))";
+    const r = await runToFile(process.execPath, ["-e", script], out, { timeoutMs: 10000 });
+    const bytes = readFileSync(out);
+    t("runToFile streams binary stdout to disk unmodified (all 256 byte values)", () =>
+      r.ok && r.bytes === 256 && bytes.length === 256 && bytes.every((b, i) => b === i));
+    const big = await runToFile(process.execPath, ["-e", "process.stdout.write(Buffer.alloc(80*1024*1024))"], join(dir, "big.dat"), { timeoutMs: 30000 });
+    t("runToFile has no maxBuffer ceiling (80 MB, above run()'s 64 MB)", () => big.ok && big.bytes === 80 * 1024 * 1024);
+    const failed = await runToFile(process.execPath, ["-e", "process.stderr.write('nope'); process.exit(3)"], join(dir, "f.dat"), { timeoutMs: 10000 });
+    t("runToFile reports a non-zero exit and its stderr", () => !failed.ok && failed.code === 3 && failed.stderr.includes("nope"));
+  }
+
   // ── resolvePriorRun (pipeline.md § --isolated item 1: no fallback-rung leak) ──
   t("resolvePriorRun: isolated is null/false even when a real sticky footer is present", () => {
     const r = resolvePriorRun({ isolated: true, stickyBody: "commit `abc1234`", headSha: "abc1234def" });
@@ -1809,6 +2233,15 @@ async function selfTest() {
   t("resolvePriorRun: non-isolated recovers priorSha from the sticky footer, as before", () => {
     const r = resolvePriorRun({ isolated: false, stickyBody: "commit `abc1234`", headSha: "abc1234def56789" });
     return r.priorSha === "abc1234" && r.zeroDelta === true;
+  });
+  t("priorShaProvenance: a --state priorSha is named as the state record, never the fallback rung", () => {
+    const p = priorShaProvenance({ fromState: true });
+    return p.loreKitNotCovered.includes("from the --state record") && !/FALLBACK rung/i.test(p.loreKitNotCovered)
+      && p.loreKitNotCovered.includes("carries no PRIOR_DIAGNOSTICS") && !/fallback rung/i.test(p.note);
+  });
+  t("priorShaProvenance: without a --state priorSha the fallback-rung wording stands", () => {
+    const p = priorShaProvenance({ fromState: false });
+    return p.loreKitNotCovered.includes("GitHub FALLBACK rung only") && p.note.includes("fallback rung");
   });
   t("resolvePriorRun: non-isolated with no sticky is a genuine first run", () => {
     const r = resolvePriorRun({ isolated: false, stickyBody: null, headSha: "abc1234def56789" });
@@ -1897,6 +2330,206 @@ async function selfTest() {
     const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
     const body = src.slice(src.indexOf("async function prepare("), src.indexOf("function selfTest("));
     return /historicalThreads\(\{/.test(body) && /threads_created_as_of/.test(body);
+  });
+  // ── dash0#20655: a head that merges the base in keeps compare/PRIOR...HEAD `ahead`, and GitHub
+  // cuts the compare at 300 files — so the intact list was main's files, with the authored ones
+  // cut off. prepare() hands both compares to resolveIntactDelta/resolveChurnLines, which REPLACE
+  // an untrusted list (local git, else blob route) instead of filtering it. ──
+  t("prepare() routes the intact delta and the churn compare through the truncation-aware resolvers, and reports the delta count", () => {
+    const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
+    const body = src.slice(src.indexOf("async function prepare("), src.indexOf("function selfTest("));
+    return /const resolved = await resolveIntactDelta\(\{\s*compareFiles: cmp\.value\.files,/.test(body)
+      && /deltaFiles = resolved\.files;/.test(body) && /if \(resolved\.anomaly\) anomalies\.push\(resolved\.anomaly\)/.test(body)
+      && /readLocal: \(\) => localAuthoredDelta\(\{ dirs: localGitDirs, from: \/\*\* @type \{string\} \*\/ \(priorSha\), to: headSha, baseSha,/.test(body)
+      && /const churn = await resolveChurnLines\(\{\s*perFile: cum\.value\.files,/.test(body)
+      && /readLocal: \(\) => localAuthoredDelta\(\{ dirs: localGitDirs, from: \/\*\* @type \{string\} \*\/ \(state\.lastFullSha\), to: headSha, baseSha,/.test(body)
+      && /prFilesCompleteness\(files\.length, meta\.changedFiles, filesR\.error\)/.test(body)
+      && /\n    deltaLines: deltaCountsResult\.deltaLines,\n/.test(body)
+      && /files: \[\(\.files \/\/ \[\]\)\[\] \| \{filename, lines/.test(CHURN_COMPARE_JQ)
+      && /history: compareHistory\(cmp\.value\),/.test(body) && /history: compareHistory\(cum\.value\),/.test(body)
+      && [DELTA_COMPARE_JQ, CHURN_COMPARE_JQ].every((jq) => jq.includes(COMPARE_HISTORY_JQ));
+  });
+  t("localAuthoredDelta: a head that merges main in yields only the authored files (real git repo)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "prr-local-delta-"));
+    /** @param {string[]} a */
+    const g = (a) => run("git", ["-C", dir, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...a]);
+    await g(["init", "-q", "-b", "main"]);
+    const lines10 = Array.from({ length: 10 }, (_, i) => `l${i}`);
+    writeFileSync(join(dir, "shared.ts"), "one\n"); writeFileSync(join(dir, "main-only.ts"), "m\n");
+    writeFileSync(join(dir, "both.ts"), lines10.join("\n") + "\n"); writeFileSync(join(dir, "conflict.ts"), "c\n");
+    await g(["add", "-A"]); await g(["commit", "-qm", "base"]);
+    await g(["checkout", "-qb", "feat"]);
+    writeFileSync(join(dir, "feat.ts"), "f1\n"); writeFileSync(join(dir, "shared.ts"), "one\nfeat\n");
+    writeFileSync(join(dir, "both.ts"), ["FEAT", ...lines10.slice(1)].join("\n") + "\n"); writeFileSync(join(dir, "conflict.ts"), "feat\n");
+    await g(["add", "-A"]); await g(["commit", "-qm", "feat 1"]);
+    const prior = (await g(["rev-parse", "HEAD"])).stdout.trim();
+    await g(["checkout", "-q", "main"]);
+    writeFileSync(join(dir, "main-only.ts"), "m\nm2\n"); writeFileSync(join(dir, "main-new.ts"), "n\n");
+    // both.ts: main edits a far line, so the merge combines it CLEANLY — `--cc` would list it,
+    // `--remerge-diff` does not. conflict.ts: same line, so the author resolves it by hand.
+    writeFileSync(join(dir, "both.ts"), [...lines10.slice(0, 9), "MAIN"].join("\n") + "\n"); writeFileSync(join(dir, "conflict.ts"), "main\n");
+    await g(["add", "-A"]); await g(["commit", "-qm", "main moves"]);
+    await g(["checkout", "-q", "feat"]);
+    writeFileSync(join(dir, "feat.ts"), "f1\nf2\nf3\n");
+    await g(["add", "-A"]); await g(["commit", "-qm", "feat 2"]);
+    await g(["merge", "-q", "--no-edit", "main"]);
+    writeFileSync(join(dir, "conflict.ts"), "resolved\n");
+    await g(["add", "-A"]); await g(["commit", "-qm", "merge main", "--no-edit"]);
+    const head = (await g(["rev-parse", "HEAD"])).stdout.trim();
+    const baseSha = (await g(["rev-parse", "main"])).stdout.trim();
+    const prFiles = [{ filename: "shared.ts" }, { filename: "feat.ts" }, { filename: "both.ts" }, { filename: "conflict.ts" }];
+    const r = await localAuthoredDelta({ dirs: [null, "/nonexistent-prr", dir], from: prior, to: head, baseSha, prFiles, prFilesComplete: true });
+    const names = r.ok ? r.files.map((f) => f.filename).sort() : [];
+    const feat = r.ok ? r.files.find((f) => f.filename === "feat.ts") : null;
+    const missing = await localAuthoredDelta({ dirs: [dir], from: "0".repeat(40), to: head, baseSha, prFiles, prFilesComplete: true });
+    const noBase = await localAuthoredDelta({ dirs: [dir], from: prior, to: head, baseSha: "1".repeat(40), prFiles, prFilesComplete: true });
+    rmSync(dir, { recursive: true, force: true });
+    return r.ok && JSON.stringify(names) === JSON.stringify(["conflict.ts", "feat.ts"]) && feat?.additions === 2 && feat?.deletions === 0
+      && String(feat?.patch).startsWith("@@") && missing.ok === false && noBase.ok === false && /base 1111111 not in/.test(noBase.reason);
+  });
+  // PR #213 r4134280273: authored commits are those in prior..head NOT reachable from the base
+  // tip — on EITHER parent of a merge. A first-parent walk lost a teammate's pushed commit pulled
+  // in by a pull, and a sibling branch merged in, both of which arrive on a second parent.
+  t("localAuthoredDelta: second-parent authored commits count, base commits do not (real git repo)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "prr-second-parent-"));
+    /** @param {string[]} a */
+    const g = (a) => run("git", ["-C", dir, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...a]);
+    /** @param {string} f @param {string} body @param {string} msg */
+    const commit = async (f, body, msg) => { writeFileSync(join(dir, f), body); await g(["add", "-A"]); await g(["commit", "-qm", msg]); };
+    const sha = async (/** @type {string} */ ref) => (await g(["rev-parse", ref])).stdout.trim();
+    await g(["init", "-q", "-b", "main"]);
+    await commit("base.ts", "b\n", "base");
+    await g(["checkout", "-qb", "feat"]);
+    await commit("mine.ts", "m\n", "mine");
+    const prior = await sha("HEAD");
+    // A teammate pushes to the same branch; the author pulls it in with a merge (second parent).
+    await g(["checkout", "-qb", "teammate", prior]);
+    await commit("teammate.ts", "t\n", "teammate");
+    // A sibling branch, cut from main, merged into feat (second parent).
+    await g(["checkout", "-qb", "sibling", "main"]);
+    await commit("sibling.ts", "s\n", "sibling");
+    // Main moves on and is merged in too — its files must stay out.
+    await g(["checkout", "-q", "main"]);
+    await commit("main-only.ts", "x\n", "main moves");
+    await g(["checkout", "-q", "feat"]);
+    await commit("mine.ts", "m\nm2\n", "mine 2");
+    await g(["merge", "-q", "--no-ff", "--no-edit", "teammate"]);
+    await g(["merge", "-q", "--no-ff", "--no-edit", "sibling"]);
+    await g(["merge", "-q", "--no-ff", "--no-edit", "main"]);
+    const head = await sha("HEAD");
+    const baseSha = await sha("main");
+    const prFiles = ["mine.ts", "teammate.ts", "sibling.ts"].map((filename) => ({ filename }));
+    const r = await localAuthoredDelta({ dirs: [dir], from: prior, to: head, baseSha, prFiles, prFilesComplete: false });
+    const names = r.ok ? r.files.map((f) => f.filename).sort() : [];
+    // A head made ONLY of merges of authored work: the first-parent walk saw no commit at all.
+    await g(["checkout", "-qb", "merges-only", prior]);
+    await g(["merge", "-q", "--no-ff", "--no-edit", "teammate"]);
+    await g(["merge", "-q", "--no-ff", "--no-edit", "sibling"]);
+    const onlyMerges = await localAuthoredDelta({ dirs: [dir], from: prior, to: await sha("HEAD"), baseSha, prFiles, prFilesComplete: true });
+    const onlyNames = onlyMerges.ok ? onlyMerges.files.map((f) => f.filename).sort() : [];
+    rmSync(dir, { recursive: true, force: true });
+    return r.ok && JSON.stringify(names) === JSON.stringify(["mine.ts", "sibling.ts", "teammate.ts"])
+      && JSON.stringify(onlyNames) === JSON.stringify(["sibling.ts", "teammate.ts"]);
+  });
+  // PR #213 (Less certain): `diff.noprefix` in the user's config dropped the `b/` the patch parser
+  // keys on, and a space in a path put a TAB after the header — either way the row's patch was null.
+  t("localAuthoredDelta: patches survive diff.noprefix and a path with a space (real git repo)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "prr-noprefix-"));
+    /** @param {string[]} a */
+    const g = (a) => run("git", ["-C", dir, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...a]);
+    await g(["init", "-q", "-b", "main"]);
+    writeFileSync(join(dir, "base.ts"), "b\n"); await g(["add", "-A"]); await g(["commit", "-qm", "base"]);
+    await g(["config", "diff.noprefix", "true"]);
+    await g(["checkout", "-qb", "feat"]);
+    const prior = (await g(["rev-parse", "HEAD"])).stdout.trim();
+    writeFileSync(join(dir, "my file.ts"), "x\n"); writeFileSync(join(dir, "plain.ts"), "y\n");
+    await g(["add", "-A"]); await g(["commit", "-qm", "feat"]);
+    const head = (await g(["rev-parse", "HEAD"])).stdout.trim();
+    const prFiles = [{ filename: "my file.ts" }, { filename: "plain.ts" }];
+    const r = await localAuthoredDelta({ dirs: [dir], from: prior, to: head, baseSha: prior, prFiles, prFilesComplete: true });
+    rmSync(dir, { recursive: true, force: true });
+    return r.ok && r.files.length === 2 && r.files.every((f) => String(f.patch).startsWith("@@ -0,0 +1 @@"));
+  });
+  // PR #213 r4134280286: `--remerge-diff` on an octopus merge warns on stderr, lists nothing, and
+  // exits 0 — so a hand edit made inside the octopus merge vanished instead of reaching `--cc`.
+  t("localAuthoredDelta: a hand edit inside an octopus merge is read via --cc (real git repo)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "prr-octopus-"));
+    /** @param {string[]} a */
+    const g = (a) => run("git", ["-C", dir, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...a]);
+    /** @param {string} f @param {string} body @param {string} msg */
+    const commit = async (f, body, msg) => { writeFileSync(join(dir, f), body); await g(["add", "-A"]); await g(["commit", "-qm", msg]); };
+    const sha = async (/** @type {string} */ ref) => (await g(["rev-parse", ref])).stdout.trim();
+    await g(["init", "-q", "-b", "main"]);
+    await commit("base.ts", "b\n", "base");
+    await g(["checkout", "-qb", "feat"]);
+    await commit("mine.ts", "m\n", "mine");
+    const prior = await sha("HEAD");
+    for (const side of ["t1", "t2"]) {
+      await g(["checkout", "-qb", side, prior]);
+      await commit(`${side}.ts`, `${side}\n`, side);
+    }
+    await g(["checkout", "-q", "feat"]);
+    await g(["merge", "-q", "--no-ff", "--no-edit", "t1", "t2"]);
+    writeFileSync(join(dir, "evil.ts"), "hand edit in the octopus\n");
+    await g(["add", "-A"]); await g(["commit", "-q", "--amend", "--no-edit"]);
+    const head = await sha("HEAD");
+    const parents = (await g(["rev-list", "--parents", "-n1", head])).stdout.trim().split(/\s+/).length - 1;
+    const prFiles = ["mine.ts", "t1.ts", "t2.ts", "evil.ts"].map((filename) => ({ filename }));
+    const r = await localAuthoredDelta({ dirs: [dir], from: prior, to: head, baseSha: await sha("main"), prFiles, prFilesComplete: true });
+    const names = r.ok ? r.files.map((f) => f.filename).sort() : [];
+    rmSync(dir, { recursive: true, force: true });
+    return parents === 3 && r.ok && JSON.stringify(names) === JSON.stringify(["evil.ts", "t1.ts", "t2.ts"]);
+  });
+  // PR #213 r4134545772: the base tip is fetched by nothing upstream, so once origin's main moves
+  // past the local clone the local-git route must fetch it by SHA — or fall through, saying why.
+  t("localAuthoredDelta: fetches a base SHA the clone lacks after origin's main moves (real origin + clone)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "prr-fetch-base-"));
+    const origin = join(root, "origin"), clone = join(root, "clone"), dead = join(root, "dead");
+    /** @param {string} d @param {string[]} a */
+    const g = (d, a) => run("git", ["-C", d, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...a]);
+    /** @param {string} f @param {string} body @param {string} msg */
+    const commit = async (f, body, msg) => { writeFileSync(join(origin, f), body); await g(origin, ["add", "-A"]); await g(origin, ["commit", "-qm", msg]); };
+    const sha = async (/** @type {string} */ ref) => (await g(origin, ["rev-parse", ref])).stdout.trim();
+    mkdirSync(origin);
+    await g(origin, ["init", "-q", "-b", "main"]);
+    await commit("base.ts", "b\n", "base");
+    await g(origin, ["checkout", "-qb", "feat"]);
+    await commit("mine.ts", "m\n", "mine");
+    const prior = await sha("HEAD");
+    await commit("mine.ts", "m\nm2\n", "mine 2");
+    const head = await sha("HEAD");
+    for (const d of [clone, dead]) await g(root, ["clone", "-q", "--no-local", origin, d]);
+    await g(dead, ["remote", "set-url", "origin", join(root, "no-such-remote")]);
+    await g(origin, ["checkout", "-q", "main"]);
+    await commit("main-only.ts", "x\n", "main moves after the clone");
+    const baseSha = await sha("main");
+    const absentBefore = !(await g(clone, ["cat-file", "-e", `${baseSha}^{commit}`])).ok;
+    const prFiles = [{ filename: "mine.ts", sha: "x" }];
+    const r = await localAuthoredDelta({ dirs: [clone], from: prior, to: head, baseSha, prFiles, prFilesComplete: true });
+    const names = r.ok ? r.files.map((f) => f.filename) : [];
+    const deadRead = () => localAuthoredDelta({ dirs: [dead], from: prior, to: head, baseSha, prFiles, prFilesComplete: true });
+    const failed = await deadRead();
+    const fellThrough = await resolveIntactDelta({
+      compareFiles: [{ filename: "mine.ts", patch: "@@ -1 +1 @@\n+m" }, { filename: "main-only.ts", patch: "@@ -0,0 +1 @@\n+x" }],
+      prFiles, readLocal: deadRead, readPriorTree: async () => ({ ok: false, reason: "no tree" }),
+    });
+    rmSync(root, { recursive: true, force: true });
+    return absentBefore && r.ok && JSON.stringify(names) === JSON.stringify(["mine.ts"])
+      && failed.ok === false && /^base [0-9a-f]{7} not in .* fetching it from origin failed \(/.test(failed.reason)
+      && fellThrough.route === "full-pr" && /fetching it from origin failed/.test(String(fellThrough.anomaly));
+  });
+  t("Gate 4 over the resolved delta flags nothing in a merged-in base file", async () => {
+    const secret = { filename: "main/test/fixture.test.ts", patch: "@@ -1,0 +1,1 @@\n+const password = \"hunter2hunter2hunter2\";" };
+    const authored = [{ filename: "src/a.ts", patch: "@@ -1,0 +1,1 @@\n+export const a = 1;" }];
+    const resolved = await resolveIntactDelta({
+      compareFiles: [authored[0], secret], prFiles: [{ filename: "src/a.ts", sha: "x" }],
+      readLocal: async () => ({ ok: true, files: authored }), readPriorTree: async () => ({ ok: false, reason: "unused" }),
+    });
+    const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
+    const body = src.slice(src.indexOf("async function prepare("), src.indexOf("function selfTest("));
+    // prepare() must scan the resolved delta, never the raw compare list.
+    return scanGate4([secret]).some((c) => c.category === "secret") && scanGate4(resolved.files).length === 0
+      && /const gate4Precandidates = scanGate4\(deltaFiles\);/.test(body);
   });
   t("buildThreads: carries the root comment's createdAt as created_at (the as-of filter's key)", () => {
     const out = buildThreads([{ id: "T", comments: { nodes: [{ databaseId: 1, createdAt: "2026-01-01T00:00:00Z" }] } }]);
@@ -2003,6 +2636,88 @@ async function selfTest() {
     const s = readStateFile(p);
     return s.lastFullSha === "abc1234" && s.incrRunsSinceFull === 2;
   });
+  t("readStateFile: the record as Step 4c writes it binds the prior SHA, the last full SHA and the incremental count", () => {
+    const p = join(tmpdir(), `prr-state-rec-${process.pid}.json`);
+    const rec = { v: 1, commit: "ccc", data: { runs: [
+      { sha: "aaa", mode: "incremental" }, { sha: "bbb", mode: "full" }, { sha: "ccc", mode: "incremental" }, { sha: "ddd", mode: "incremental-quick" },
+    ] } };
+    writeFileSync(p, JSON.stringify(rec), "utf8");
+    const direct = readStateFile(p);
+    writeFileSync(p, JSON.stringify({ key: "ci-state::pr-review-1", value: JSON.stringify(rec) }), "utf8");
+    const envelope = readStateFile(p);
+    writeFileSync(p, JSON.stringify({ v: 1, data: { runs: [{ sha: "eee", mode: "incremental" }] } }), "utf8");
+    const noFull = readStateFile(p);
+    return [direct, envelope].every((s) => s.priorSha === "ddd" && s.lastFullSha === "bbb" && s.incrRunsSinceFull === 2)
+      && noFull.priorSha === "eee" && noFull.lastFullSha === null && noFull.incrRunsSinceFull === 1;
+  });
+  t("resolvePriorRun: the state record's prior SHA wins over the sticky footer, which stays the fallback", () => {
+    const body = "commit `abc1234`";
+    return resolvePriorRun({ isolated: false, stickyBody: body, headSha: "fff9999", statePriorSha: "def5678" }).priorSha === "def5678"
+      && resolvePriorRun({ isolated: false, stickyBody: body, headSha: "fff9999" }).priorSha === "abc1234"
+      && resolvePriorRun({ isolated: true, stickyBody: body, headSha: "fff9999", statePriorSha: "def5678" }).priorSha === null;
+  });
+  t("checksReadable: a red (1) or pending (8) table is a read; an empty, timed-out or other failure is not", () =>
+    checksReadable({ ok: false, code: 1, stdout: "Generate types\tfail\t1m\n" })
+      && checksReadable({ ok: false, code: 8, stdout: "build\tpending\n" })
+      && checksReadable({ ok: true, code: 0, stdout: "" })
+      && !checksReadable({ ok: false, code: 1, stdout: "" })
+      && !checksReadable({ ok: false, code: 1, stdout: "x", timedOut: true })
+      && !checksReadable({ ok: false, code: 4, stdout: "x" }));
+  t("readStateFile: the record's sticky_comment_id is returned for a sticky the marker scan cannot find", () => {
+    const p = join(tmpdir(), `prr-state-sticky-${process.pid}.json`);
+    writeFileSync(p, JSON.stringify({ v: 1, data: { sticky_comment_id: 5876011167, runs: [{ sha: "aaa", mode: "full" }] } }), "utf8");
+    return readStateFile(p).stickyCommentId === 5876011167;
+  });
+  t("readStateFile: the record's bot_login is returned as botLogin", () => {
+    const p = join(tmpdir(), `prr-state-bot-${process.pid}.json`);
+    writeFileSync(p, JSON.stringify({ v: 1, data: { bot_login: "dash0-dev[bot]", runs: [{ sha: "aaa", mode: "full" }] } }), "utf8");
+    return readStateFile(p).botLogin === "dash0-dev[bot]";
+  });
+  t("readStateFile: an invalid bot_login is ignored (null), never returned as an identity", () => {
+    const p = join(tmpdir(), `prr-state-badbot-${process.pid}.json`);
+    writeFileSync(p, JSON.stringify({ v: 1, data: { bot_login: '{"message":"Bad credentials"}', runs: [{ sha: "aaa", mode: "full" }] } }), "utf8");
+    return readStateFile(p).botLogin === null;
+  });
+  t("resolveReviewerIdentity: a supplied login wins; the state record's bot_login is the fallback; else unknown", () => {
+    const a = resolveReviewerIdentity({ suppliedLogin: "mthines", fromFlag: true, stateBotLogin: "dash0-dev[bot]" });
+    const b = resolveReviewerIdentity({ suppliedLogin: "", fromFlag: false, stateBotLogin: "dash0-dev[bot]" });
+    const c = resolveReviewerIdentity({ suppliedLogin: "not a login", fromFlag: true, stateBotLogin: null });
+    const d = resolveReviewerIdentity({ suppliedLogin: "mthines", fromFlag: false, stateBotLogin: null });
+    return a.me === "mthines" && a.identitySource === "--reviewer-login"
+      && b.me === "dash0-dev[bot]" && b.identitySource === "state-record"
+      && c.me === "" && c.identitySource === "unknown"
+      && d.identitySource === "PR_REVIEWER_LOGIN";
+  });
+  t("resolveReviewerIdentity: the prior sticky's author is the last rung, below the state record and any supplied login, validated", () => {
+    const e = resolveReviewerIdentity({ suppliedLogin: "", fromFlag: false, stateBotLogin: null, stickyAuthorLogin: "dash0-dev[bot]" });
+    const f = resolveReviewerIdentity({ suppliedLogin: "", fromFlag: false, stateBotLogin: "state-bot[bot]", stickyAuthorLogin: "dash0-dev[bot]" });
+    const g = resolveReviewerIdentity({ suppliedLogin: "mthines", fromFlag: true, stateBotLogin: null, stickyAuthorLogin: "dash0-dev[bot]" });
+    const h = resolveReviewerIdentity({ suppliedLogin: "", fromFlag: false, stateBotLogin: null, stickyAuthorLogin: "{\"message\":\"Bad credentials\"}" });
+    return e.me === "dash0-dev[bot]" && e.identitySource === "prior-report-author"
+      && f.me === "state-bot[bot]" && f.identitySource === "state-record"
+      && g.me === "mthines" && g.identitySource === "--reviewer-login"
+      && h.me === "" && h.identitySource === "unknown";
+  });
+  t("identity wiring: a sticky shaped by the real issue-comments projection yields prior-report-author", () => {
+    // Mirror ISSUE_COMMENTS_JQ exactly — the fetch flattens the author to a string.
+    const fields = [...ISSUE_COMMENTS_JQ.matchAll(/(\w+): \.([\w.]+)/g)].map((m) => [m[1], m[2]]);
+    const flattensUser = fields.some(([k, v]) => k === "user" && v === "user.login");
+    const row = (id, login, body) => {
+      const src = { id, user: { login }, body, html_url: `https://github.com/o/r/pull/1#issuecomment-${id}`, created_at: "2026-09-29T00:00:00Z" };
+      return Object.fromEntries(fields.map(([k, v]) => [k, v.split(".").reduce((o, key) => o?.[key], src)]));
+    };
+    const comments = [row(1, "someone", "hello"), row(2, "dash0-dev[bot]", `${REPORT_MARKER}\n### report`)];
+    const sticky = findSticky(comments);
+    // Through prepare()'s own argument builder, so a regression at the call site turns this red.
+    const input = identityInputs({ opts: {}, state: { botLogin: null }, sticky, isolated: false, env: {} });
+    const r = resolveReviewerIdentity(input);
+    const iso = resolveReviewerIdentity(identityInputs({ opts: {}, state: { botLogin: null }, sticky, isolated: true, env: {} }));
+    return flattensUser && typeof comments[1].user === "string" && sticky?.id === 2
+      && r.identitySource === "prior-report-author" && r.me === "dash0-dev[bot]"
+      && iso.identitySource === "unknown"
+      && stickyAuthorLogin({ user: { login: "x[bot]" } }) === "x[bot]"
+      && stickyAuthorLogin(null) === null && stickyAuthorLogin({ user: "" }) === null;
+  });
   t("readStateFile: an unparseable file degrades to the safe default rather than throwing", () => {
     const p = join(tmpdir(), `prr-state-bad-${process.pid}.json`);
     writeFileSync(p, "{not json", "utf8");
@@ -2017,7 +2732,9 @@ async function selfTest() {
     return r.ok === false && r.timedOut === true;
   });
   t("run(): a process that exits non-zero on its own (no kill) is NOT reported as a timeout", async () => {
-    const r = await run("node", ["-e", "process.exit(3)"], { timeoutMs: 5000 });
+    // A generous budget: this asserts a NON-kill, and a node cold start on a host whose endpoint
+    // agent scans each spawn (NODE_USE_SYSTEM_CA) measured ~5 s, which a 5 s budget read as a timeout.
+    const r = await run("node", ["-e", "process.exit(3)"], { timeoutMs: 30000 });
     return r.ok === false && r.timedOut === false && r.code === 3;
   });
   t("describeFailure(): a timed-out result reports 'timed out after Ns', never empty stderr", () => {
@@ -2075,6 +2792,43 @@ async function selfTest() {
     return isReusableWorktreeDir("/anything", { isolated: true, runScratchDir: null }) === false;
   });
 
+  // The caller that ran prepare owns the workspace (pr-review SKILL.md § Step 2): the scripted
+  // cleanup removes a worktree through git, an rm-rung dir with rm -rf, leaves `none`, and refuses
+  // a directory outside the scratch root.
+  t("cleanupWorkspace removes a worktree through git, leaving no .git/worktrees entry, and is idempotent", () => {
+    const base = mkdtempSync(join(tmpdir(), "prr-cleanup-"));
+    try {
+      const repo = join(base, "repo");
+      mkdirSync(repo);
+      const g = (/** @type {string[]} */ a, cwd = repo) => execFileSync("git", a, { cwd, stdio: ["ignore", "pipe", "ignore"], encoding: "utf8" });
+      g(["init", "-q"]); writeFileSync(join(repo, "f"), "x");
+      g(["-c", "user.email=t@t", "-c", "user.name=t", "add", "f"]);
+      g(["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", "c"]);
+      const parent = join(base, ".pr-reviewer-scratch", "run-1", "wt-a");
+      mkdirSync(parent, { recursive: true });
+      const dir = join(parent, "w");
+      g(["worktree", "add", "-q", "--detach", dir]);
+      const r = cleanupWorkspace({ dir, worktreeParent: parent, cleanup: "worktree" });
+      const again = cleanupWorkspace({ dir, worktreeParent: parent, cleanup: "worktree" });
+      return r.ok && !existsSync(dir) && !existsSync(parent) && !g(["worktree", "list"]).includes(dir) && again.ok;
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+  t("cleanupWorkspace rm-rfs an rm-rung dir, leaves cleanup:none alone, and refuses a dir outside the scratch root", () => {
+    const base = mkdtempSync(join(tmpdir(), "prr-cleanup-"));
+    try {
+      const clone = join(base, "clone-x"); mkdirSync(join(clone, "sub"), { recursive: true }); writeFileSync(join(clone, "sub", "f"), "x");
+      const kept = join(base, "user-worktree"); mkdirSync(kept);
+      const rm = cleanupWorkspace({ dir: clone, cleanup: "rm" });
+      const none = cleanupWorkspace({ dir: kept, cleanup: "none" });
+      const outside = cleanupWorkspace({ dir: "/definitely/not/scratch/w", cleanup: "rm" });
+      return rm.ok && !existsSync(clone) && none.ok && existsSync(kept) && !outside.ok && /outside the scratch root/.test(outside.message);
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+  t("budget reads the context's run mode: a small incremental re-review is in-context", () => {
+    const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
+    return /const budget = resolveBudget\(\{\n\s+runMode: contextMode,/.test(src) && /mode: contextMode,/.test(src);
+  });
+
   // Every case's name is echoed on PASS too, not only on failure — this is the one self-test
   // in the pipeline a standing L1 guard (or a checks.yaml AC) greps for a case NAME in the
   // OUTPUT rather than only in the source, so a silent-on-success run would read as though
@@ -2105,6 +2859,18 @@ async function selfTest() {
 
 async function main(argv) {
   if (argv[0] === "--self-test") return selfTest();
+  if (argv[0] === "--cleanup") {
+    // The caller that ran prepare releases the workspace once every agent it handed the context to
+    // has returned (pr-review SKILL.md § Step 2). Exit 1 on a refusal or a failed removal.
+    let ws;
+    try { ws = JSON.parse(readFileSync(argv[1] || "", "utf8")).workspace; } catch (e) {
+      process.stderr.write(`cleanup: cannot read ${JSON.stringify(argv[1] || "")}: ${String(/** @type {any} */ (e)?.message || e)}\n`);
+      process.exit(2);
+    }
+    const r = cleanupWorkspace(ws);
+    process.stderr.write(`cleanup: ${r.message}\n`);
+    process.exit(r.ok ? 0 : 1);
+  }
 
   const opts = {
     pr: "",
@@ -2134,6 +2900,7 @@ async function main(argv) {
     else if (a === "--repo") opts.repo = argv[++i];
     else if (a === "--out") opts.out = argv[++i];
     else if (a === "--workdir") opts.workdir = argv[++i];
+    else if (a === "--repo-dir") opts.repoDir = argv[++i]; // rung 0's local clone of the PR repo, when the cwd is not one
     else if (a === "--reviewer-login") opts.reviewerLogin = argv[++i];
     else if (a === "--no-workspace") opts.workspace = false;
     else if (a === "--no-impact") opts.impact = false;
@@ -2158,8 +2925,8 @@ async function main(argv) {
   if (!opts.pr) {
     process.stderr.write(
       "usage: prepare-review.mjs --pr <url|owner/repo#n|n> [--repo owner/repo] [--out file] " +
-        "[--workdir dir] [--reviewer-login login] [--no-workspace] [--no-impact] " +
-        "[--inline-payloads] [--timeout-ms N] [--quiet] [--pin-head sha] [--isolated] [--full] " +
+        "[--workdir dir] [--repo-dir dir] [--reviewer-login login] [--no-workspace] [--no-impact] " +
+        "[--no-telemetry] [--inline-payloads] [--timeout-ms N] [--quiet] [--pin-head sha] [--isolated] [--full] " +
         "[--state file] [--effort high] [--thoroughness 0..1] [--no-threads] [--review-sha sha] | --self-test\n",
     );
     process.exit(2);
@@ -2205,7 +2972,7 @@ async function main(argv) {
           `context: ${outPath}  (${context.elapsedMs} ms)`,
           `  PR        ${context.target.repo}#${context.target.number} · ${context.meta.state}${context.meta.isDraft ? " (draft)" : ""} · @${context.meta.author}`,
           `  head      ${context.headSha.slice(0, 7)}  base ${context.baseSha.slice(0, 7)}`,
-          `  delta     ${context.deltaLines} lines across ${context.files.length} files (${context.undiffablePaths.length} undiffable)`,
+          `  delta     ${context.deltaLines} lines via ${context.deltaRoute} · PR ${context.files.length} files (${context.undiffablePaths.length} undiffable)`,
           `  relation  ${context.reviewRelation} (identity: ${context.identitySource})`,
           `  depth     ${w.depthCapability} via rung ${w.rung} · tier2 ${w.tier2Checker || "none"} · cleanup ${w.cleanup}`,
           `  prior     ${context.priorRun.priorSha ? `${context.priorRun.priorSha} (${context.priorRun.source})` : "none"}${context.priorRun.zeroDelta ? " · ZERO DELTA" : ""}`,
@@ -2214,6 +2981,11 @@ async function main(argv) {
           `  routing   tier=${context.routing.tier}${context.routing.capApplied ? " (capped)" : ""} · triggers=[${context.routing.triggers.join(",")}] · threads=${context.threads.length} · gate4=${context.gate4_precandidates.length} pre-candidate(s)`,
           `  budget    thoroughness=${context.budget.effectiveThoroughness}${context.budget.riskFloorApplied ? ` (floored: ${context.budget.riskFloorReason})` : ""} · topology=${context.budget.topology} · votes=${context.budget.correctnessVotes} · tool calls=${context.budget.toolCalls ?? "?"}`,
           `  context   ${(Buffer.byteLength(JSON.stringify(context)) / 1024).toFixed(0)} KB index + sidecars in ${dirname(outPath)}`,
+          ...(context.telemetry?.markers ? [
+            `  markers   put this in front of each step's first command (fill <step>, <N> = your tool calls so far):`,
+            `            ${context.telemetry.markers.command}`,
+            `            steps: ${context.telemetry.markers.steps.join(" → ")}`,
+          ] : []),
           `  anomalies ${context.anomalies.length}`,
           ...context.anomalies.map((a) => `    ⚠ ${a}`),
         ].join("\n") + "\n",
