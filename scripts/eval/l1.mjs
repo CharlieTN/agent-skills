@@ -6841,7 +6841,7 @@ const isPollBlock = (block) =>
 // A deleted or renamed skill leaves `Skill("<old>")` calls behind that nothing else catches:
 // the link checker sees only Markdown links, and the harness answers with `Unknown skill` —
 // which every caller here is written to treat as a tolerable skip. The restructure deletes
-// skills in bulk (review-changes, polish, …), so this is where a leftover call would hide.
+// skills in bulk (review-changes, test-auto-fix, …), so this is where a leftover call would hide.
 // Three kinds of name are legitimate:
 //   - a skill directory in this repo (holds a SKILL.md);
 //   - an EXTERNAL skill from another repo, named here so the list is reviewed;
