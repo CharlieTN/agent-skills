@@ -1308,8 +1308,8 @@ jq '.files' <<< "$DELTA_JSON" > /tmp/pr-delta.json
 DELTA_SOURCE="compare"
 ```
 
-A list of ≥ 300 rows (GitHub's cap) or with a file absent from `/tmp/pr-files.json` (a merged-in
-base stays `ahead`) is untrusted — never filter it. Recompute from a local checkout holding both
+A list of ≥ 300 rows (GitHub's cap), with a file absent from `/tmp/pr-files.json`, or over a
+range with a merge commit is untrusted — never filter it. Recompute from a local checkout holding both
 SHAs: files of `git log --no-merges PRIOR..HEAD --not BASE` plus each merge's `--remerge-diff`,
 ∩ the PR's files, then `git diff PRIOR HEAD --` them; else the blob route below. The churn compare
 gets the same rule (`resolveIntactDelta()` / `resolveChurnLines()`).

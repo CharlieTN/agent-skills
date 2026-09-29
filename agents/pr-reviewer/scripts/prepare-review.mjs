@@ -51,7 +51,7 @@ import { tmpdir } from "node:os";
 import { join, dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Timing, beginRun, appendRecord, hostFacts, ledgerPath, markerCommand, modelSteps } from "./review-telemetry.mjs";
-import { classifyDivergence, blobDelta, deltaCounts, churnState, resolveIntactDelta, resolveChurnLines, authoredPrPaths, parseLocalDiff, prFilesCompleteness, FULL_REFRESH_DELTA } from "./delta-triage.mjs";
+import { classifyDivergence, blobDelta, deltaCounts, churnState, resolveIntactDelta, resolveChurnLines, compareHistory, authoredPrPaths, parseLocalDiff, prFilesCompleteness, FULL_REFRESH_DELTA } from "./delta-triage.mjs";
 import { routeDepth, resolveBudget } from "./route-depth.mjs";
 import { buildReviewPacket, consumersByFile } from "./review-packet.mjs";
 import { discoverStandards, trivialSkip } from "./discover-standards.mjs";
@@ -873,9 +873,11 @@ const CLONE_TIMEOUT_FLOOR_MS = 300000;
  * repo's `.git/worktrees`, so the review breaks the repo it was reviewing.
  */
 /** Both compare reads' jq: the divergence fields plus what an intact range needs, in one call. */
-const DELTA_COMPARE_JQ = "{status, ahead_by, behind_by, files: [(.files // [])[] | {filename, additions, deletions, status, patch}]}";
+/** The commit-history fields compareTrust() reads: merges in the range, and whether the (250-row) commit list is whole. */
+const COMPARE_HISTORY_JQ = "total_commits, listed_commits: ((.commits // []) | length), merge_commits: ([(.commits // [])[] | select(((.parents // []) | length) > 1)] | length)";
+const DELTA_COMPARE_JQ = `{status, ahead_by, behind_by, ${COMPARE_HISTORY_JQ}, files: [(.files // [])[] | {filename, additions, deletions, status, patch}]}`;
 /** Per-file lines, not a pre-summed total: resolveChurnLines() needs the list to judge truncation/pollution. */
-const CHURN_COMPARE_JQ = "{status, behind_by, files: [(.files // [])[] | {filename, lines: (.additions + .deletions)}]}";
+const CHURN_COMPARE_JQ = `{status, behind_by, ${COMPARE_HISTORY_JQ}, files: [(.files // [])[] | {filename, lines: (.additions + .deletions)}]}`;
 
 /** One `compare/<from>...<to>` read that returns the divergence fields and the file data together.
  *  A range too large to return with files still has to classify, so a failed combined read falls
@@ -1619,6 +1621,7 @@ async function prepare(opts) {
           const resolved = await resolveIntactDelta({
             compareFiles: cmp.value.files,
             prFiles: files,
+            history: compareHistory(cmp.value),
             readLocal: () => localAuthoredDelta({ dirs: localGitDirs, from: /** @type {string} */ (priorSha), to: headSha, baseSha, prFiles: files, prFilesComplete: prFilesState.complete, timeoutMs }),
             readPriorTree: async () => {
               const tree = await ghJson(
@@ -1686,6 +1689,7 @@ async function prepare(opts) {
             const churn = await resolveChurnLines({
               perFile: cum.value.files,
               prFiles: files,
+              history: compareHistory(cum.value),
               readLocal: () => localAuthoredDelta({ dirs: localGitDirs, from: /** @type {string} */ (state.lastFullSha), to: headSha, baseSha, prFiles: files, prFilesComplete: prFilesState.complete, timeoutMs }),
             });
             cumLines = churn.lines;
@@ -2285,7 +2289,9 @@ async function selfTest() {
       && /readLocal: \(\) => localAuthoredDelta\(\{ dirs: localGitDirs, from: \/\*\* @type \{string\} \*\/ \(state\.lastFullSha\), to: headSha, baseSha,/.test(body)
       && /prFilesCompleteness\(files\.length, meta\.changedFiles, filesR\.error\)/.test(body)
       && /\n    deltaLines: deltaCountsResult\.deltaLines,\n/.test(body)
-      && /files: \[\(\.files \/\/ \[\]\)\[\] \| \{filename, lines/.test(CHURN_COMPARE_JQ);
+      && /files: \[\(\.files \/\/ \[\]\)\[\] \| \{filename, lines/.test(CHURN_COMPARE_JQ)
+      && /history: compareHistory\(cmp\.value\),/.test(body) && /history: compareHistory\(cum\.value\),/.test(body)
+      && [DELTA_COMPARE_JQ, CHURN_COMPARE_JQ].every((jq) => jq.includes(COMPARE_HISTORY_JQ));
   });
   t("localAuthoredDelta: a head that merges main in yields only the authored files (real git repo)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "prr-local-delta-"));

@@ -104,24 +104,43 @@ export function prChurnLines(perFile, prFiles) {
 /** GitHub truncates a compare's `files` at 300 entries; a list that long cannot be trusted as complete. */
 export const COMPARE_FILES_CAP = 300;
 
+/** @typedef {{mergeCommits?: number, totalCommits?: number, listedCommits?: number}} CompareHistory */
+
+/**
+ * The commit-history fields compareTrust() reads, from a compare read projected with
+ * `merge_commits` / `total_commits` / `listed_commits` (prepare-review.mjs's compare jq).
+ * @param {any} v @returns {CompareHistory}
+ */
+export function compareHistory(v) {
+  return { mergeCommits: v?.merge_commits, totalCommits: v?.total_commits, listedCommits: v?.listed_commits };
+}
+
 /**
  * Whether an INTACT compare's file list may be used as the delta. It may not when it is
  * truncated (length >= COMPARE_FILES_CAP — the authored files can be the ones cut off: on
  * dash0#20655 the 300 returned were main's, and the 4 authored files were absent), nor when
  * `restrictToPrFiles()` dropped anything (a merged-in base polluted the range, and the kept rows
- * are PR files the base ALSO touched, not the author's delta). An untrusted list is never
- * filtered into a delta; the caller recomputes it from local git or the blob-SHA route.
- * @param {PrFile[]} compareFiles @param {PrFile[]} prFiles
+ * are PR files the base ALSO touched, not the author's delta), nor when the range holds a merge
+ * commit, or lists fewer commits than it has (GitHub lists 250) so one cannot be ruled out: a
+ * merged-in base that touched ONLY files the PR also touches drops nothing, and would otherwise
+ * pass as the author's delta. An untrusted list is never filtered into a delta; the caller
+ * recomputes it from local git or the blob-SHA route.
+ * @param {PrFile[]} compareFiles @param {PrFile[]} prFiles @param {CompareHistory} [history]
  * @returns {{trusted: true, files: PrFile[], reason: null} | {trusted: false, files: null, reason: string}}
  */
-export function compareTrust(compareFiles, prFiles) {
+export function compareTrust(compareFiles, prFiles, history = {}) {
   const list = compareFiles || [];
   const own = restrictToPrFiles(list, prFiles);
   const truncated = list.length >= COMPARE_FILES_CAP;
-  if (!truncated && !own.note) return { trusted: true, files: own.files, reason: null };
+  const merges = Number(history.mergeCommits) || 0;
+  const { totalCommits: total, listedCommits: listed } = history;
+  const unlisted = Number.isInteger(total) && Number.isInteger(listed) && /** @type {number} */ (total) > /** @type {number} */ (listed);
+  if (!truncated && !own.note && !merges && !unlisted) return { trusted: true, files: own.files, reason: null };
   const parts = [];
   if (truncated) parts.push(`delta compare returned ${list.length} files (GitHub's ${COMPARE_FILES_CAP}-file cap) — truncated`);
   if (own.note) parts.push(own.note);
+  if (merges) parts.push(`delta range holds ${merges} merge commit(s) — a merged-in base can touch the PR's own files`);
+  if (unlisted) parts.push(`delta range has ${total} commits but the compare listed ${listed} — a merge commit cannot be ruled out`);
   return { trusted: false, files: null, reason: parts.join("; ") };
 }
 
@@ -206,12 +225,12 @@ export { FULL_REFRESH_DELTA };
  * by the local-git authored delta when a checkout holds both SHAs (no truncation), else by the
  * blob-SHA route over the PR's own files (safe over-count), else the full PR list. Every
  * replacement returns an anomaly naming the route and why.
- * @param {{compareFiles: PrFile[], prFiles: PrFile[], readLocal: () => Promise<LocalDeltaResult>,
+ * @param {{compareFiles: PrFile[], prFiles: PrFile[], history?: CompareHistory, readLocal: () => Promise<LocalDeltaResult>,
  *   readPriorTree: () => Promise<PriorTreeResult>}} input
  * @returns {Promise<{files: PrFile[], route: "compare"|"local-git"|"blob-diff"|"full-pr", anomaly: string|null}>}
  */
-export async function resolveIntactDelta({ compareFiles, prFiles, readLocal, readPriorTree }) {
-  const trust = compareTrust(compareFiles, prFiles);
+export async function resolveIntactDelta({ compareFiles, prFiles, history, readLocal, readPriorTree }) {
+  const trust = compareTrust(compareFiles, prFiles, history);
   if (trust.trusted) return { files: trust.files, route: "compare", anomaly: null };
   const local = await readLocal();
   if (local.ok) {
@@ -232,11 +251,11 @@ export async function resolveIntactDelta({ compareFiles, prFiles, readLocal, rea
  * trusted list sums over the PR's files; an untrusted one (truncated or polluted) is replaced by
  * the local-git authored delta's lines, else read as OVER the refresh threshold — never guessed.
  * Either replacement returns an anomaly naming the route and the reason.
- * @param {{perFile: {filename: string, lines?: number}[], prFiles: PrFile[], readLocal: () => Promise<LocalDeltaResult>}} input
+ * @param {{perFile: {filename: string, lines?: number}[], prFiles: PrFile[], history?: CompareHistory, readLocal: () => Promise<LocalDeltaResult>}} input
  * @returns {Promise<{lines: number, anomaly: string|null}>}
  */
-export async function resolveChurnLines({ perFile, prFiles, readLocal }) {
-  const trust = compareTrust(/** @type {PrFile[]} */ (perFile), prFiles);
+export async function resolveChurnLines({ perFile, prFiles, history, readLocal }) {
+  const trust = compareTrust(/** @type {PrFile[]} */ (perFile), prFiles, history);
   if (trust.trusted) return { lines: prChurnLines(perFile, prFiles), anomaly: null };
   const local = await readLocal();
   if (local.ok) {
@@ -362,6 +381,20 @@ async function selfTest() {
   ok("compareTrust: an under-cap compare with no extra files is trusted and unchanged",
     trusted.trusted === true && trusted.files.length === compareIntact.files.length && trusted.files.every((f, i) => f === compareIntact.files[i]));
 
+  // PR #213 (Less certain): a merged-in base that touches ONLY files the PR also touches drops
+  // nothing, so the list looked clean. A merge commit in the range, or a commit list shorter than
+  // the range, makes it untrusted — and it then routes to local git like any untrusted list.
+  const onlyPrFiles = [{ filename: "agent0/store.ts", additions: 9, deletions: 1 }];
+  const viaMerge = compareTrust(onlyPrFiles, pr20655, compareHistory({ merge_commits: 1, total_commits: 3, listed_commits: 3 }));
+  ok("compareTrust: a range holding a merge commit is untrusted even when every file is a PR file",
+    viaMerge.trusted === false && /holds 1 merge commit/.test(viaMerge.reason || ""), JSON.stringify(viaMerge.reason));
+  const viaUnlisted = compareTrust(onlyPrFiles, pr20655, compareHistory({ merge_commits: 0, total_commits: 400, listed_commits: 250 }));
+  ok("compareTrust: a range with more commits than the compare listed is untrusted (a merge cannot be ruled out)",
+    viaUnlisted.trusted === false && /has 400 commits but the compare listed 250/.test(viaUnlisted.reason || ""), JSON.stringify(viaUnlisted.reason));
+  const linear = compareTrust(onlyPrFiles, pr20655, compareHistory({ merge_commits: 0, total_commits: 2, listed_commits: 2 }));
+  ok("compareTrust: a linear, fully-listed range of PR files stays trusted; absent history fields change nothing",
+    linear.trusted === true && compareTrust(onlyPrFiles, pr20655, compareHistory({})).trusted === true && compareTrust(onlyPrFiles, pr20655).trusted === true);
+
   // authoredPrPaths / parseLocalDiff / prFilesCompleteness
   ok("authoredPrPaths keeps touched PR files in PR order, drops touched non-PR files",
     JSON.stringify(authoredPrPaths(["agent0/page.tsx", "main/x.ts", "agent0/store.ts"], pr20655, true)) === JSON.stringify(["agent0/store.ts", "agent0/page.tsx"]));
@@ -416,6 +449,11 @@ async function selfTest() {
   const viaCompare = await resolveIntactDelta({ compareFiles: compareIntact.files, prFiles: compareIntact.files, readLocal: noLocal, readPriorTree: tree });
   ok("clean intact compare: used as-is, no local or tree read, no anomaly",
     viaCompare.route === "compare" && viaCompare.anomaly === null && calls.length === 0 && viaCompare.files.length === compareIntact.files.length);
+
+  const mergeLocal = await resolveIntactDelta({ compareFiles: onlyPrFiles, prFiles: pr20655, history: { mergeCommits: 1 },
+    readLocal: async () => ({ ok: true, files: authored }), readPriorTree: tree });
+  ok("an all-PR-files compare over a merge commit routes to local git and says why",
+    mergeLocal.route === "local-git" && mergeLocal.files === authored && /merge commit/.test(mergeLocal.anomaly || ""), JSON.stringify(mergeLocal));
 
   // resolveChurnLines
   const churnTrusted = await resolveChurnLines({ perFile: [{ filename: "agent0/store.ts", lines: 30 }], prFiles: pr20655, readLocal: noLocal });
