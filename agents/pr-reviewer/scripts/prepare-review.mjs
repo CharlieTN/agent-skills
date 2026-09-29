@@ -290,6 +290,19 @@ export function isGithubLogin(s) {
 }
 
 /**
+ * The reviewer identity, first match wins: a valid supplied login (`--reviewer-login`, then
+ * PR_REVIEWER_LOGIN), then the state record's `bot_login` (pr-reviewer.md's identity ladder),
+ * else unknown. A supplied login always outranks the record.
+ * @param {{ suppliedLogin: string, fromFlag: boolean, stateBotLogin: string|null }} input
+ * @returns {{ me: string, identitySource: string }}
+ */
+export function resolveReviewerIdentity({ suppliedLogin, fromFlag, stateBotLogin }) {
+  if (isGithubLogin(suppliedLogin)) return { me: suppliedLogin, identitySource: fromFlag ? "--reviewer-login" : "PR_REVIEWER_LOGIN" };
+  if (isGithubLogin(stateBotLogin)) return { me: /** @type {string} */ (stateBotLogin), identitySource: "state-record" };
+  return { me: "", identitySource: "unknown" };
+}
+
+/**
  * `--isolated` run-mode resolution (R3, D10, D13, AC-5). Isolated repeat
  * runs (the A/B harness, the shadow run) need first-run semantics on every
  * invocation — no LoreKit state-record read, `--full` forced, so a run's
@@ -756,7 +769,7 @@ export function checksReadable(r) {
  * depth-routing.md's D6 ("no prior full review is recorded").
  * Accepts the record as Step 4c writes it (`{v, commit, data: {runs[]}}`, or a LoreKit read's
  * `{value: "<that JSON>"}`), or the flat `{priorSha, lastFullSha, incrRunsSinceFull}` shape.
- * @param {string|null} path @returns {{priorSha: string|null, lastFullSha: string|null, incrRunsSinceFull: number}}
+ * @param {string|null} path @returns {{priorSha: string|null, lastFullSha: string|null, incrRunsSinceFull: number, stickyCommentId?: number|null, botLogin?: string|null}}
  */
 export function readStateFile(path) {
   const none = { priorSha: null, lastFullSha: null, incrRunsSinceFull: 0 };
@@ -773,6 +786,10 @@ export function readStateFile(path) {
       const lastFull = runs.map((r) => r?.mode).lastIndexOf("full");
       return {
         stickyCommentId: raw.data.sticky_comment_id ?? null,
+        // pr-reviewer.md's identity ladder falls back to the record's bot_login when no login was
+        // supplied; without it the Fix-this links (which need a login) were never built. Validated
+        // with isGithubLogin — an unvalidated record value must never become the reviewer identity.
+        botLogin: isGithubLogin(raw.data.bot_login) ? raw.data.bot_login : null,
         priorSha: runs.length ? String(runs[runs.length - 1]?.sha || "") || null : null,
         lastFullSha: lastFull < 0 ? null : String(runs[lastFull]?.sha || "") || null,
         incrRunsSinceFull: lastFull < 0 ? runs.length : runs.length - 1 - lastFull,
@@ -1263,12 +1280,14 @@ async function prepare(opts) {
   // stdout error payload, then appends the empty fallback) and this script accepted it as a login.
   // Anything that is not a GitHub login shape is treated as unknown, and says so.
   const suppliedLogin = opts.reviewerLogin || process.env.PR_REVIEWER_LOGIN || "";
-  const me = isGithubLogin(suppliedLogin) ? suppliedLogin : "";
+  const { me, identitySource } = resolveReviewerIdentity({
+    suppliedLogin, fromFlag: Boolean(opts.reviewerLogin), stateBotLogin: state.botLogin ?? null,
+  });
   const authorLogin = meta.author?.login || "";
   const reviewRelation = me ? (normalizeLogin(me) === normalizeLogin(authorLogin) ? "self" : "cross") : "cross";
-  if (!me && suppliedLogin) {
+  if (suppliedLogin && !isGithubLogin(suppliedLogin)) {
     anomalies.push(
-      `reviewer login rejected — ${JSON.stringify(String(suppliedLogin).slice(0, 40))} is not a GitHub login; relation defaulted to cross`,
+      `reviewer login rejected — ${JSON.stringify(String(suppliedLogin).slice(0, 40))} is not a GitHub login; ${me ? "identity taken from the state record's bot_login" : "relation defaulted to cross"}`,
     );
   } else if (!me) {
     anomalies.push(
@@ -1649,7 +1668,7 @@ async function prepare(opts) {
     historical,
     reviewRelation,
     reviewerLogin: me || null,
-    identitySource: me ? (opts.reviewerLogin ? "--reviewer-login" : "PR_REVIEWER_LOGIN") : "unknown",
+    identitySource,
     // Read by finalize.mjs, which builds the Fix-with-Agent0 links (finalize/fix-links.mjs).
     agent0: agent0Config(reviewConfigText),
 
@@ -2243,6 +2262,26 @@ async function selfTest() {
     const p = join(tmpdir(), `prr-state-sticky-${process.pid}.json`);
     writeFileSync(p, JSON.stringify({ v: 1, data: { sticky_comment_id: 5876011167, runs: [{ sha: "aaa", mode: "full" }] } }), "utf8");
     return readStateFile(p).stickyCommentId === 5876011167;
+  });
+  t("readStateFile: the record's bot_login is returned as botLogin", () => {
+    const p = join(tmpdir(), `prr-state-bot-${process.pid}.json`);
+    writeFileSync(p, JSON.stringify({ v: 1, data: { bot_login: "dash0-dev[bot]", runs: [{ sha: "aaa", mode: "full" }] } }), "utf8");
+    return readStateFile(p).botLogin === "dash0-dev[bot]";
+  });
+  t("readStateFile: an invalid bot_login is ignored (null), never returned as an identity", () => {
+    const p = join(tmpdir(), `prr-state-badbot-${process.pid}.json`);
+    writeFileSync(p, JSON.stringify({ v: 1, data: { bot_login: '{"message":"Bad credentials"}', runs: [{ sha: "aaa", mode: "full" }] } }), "utf8");
+    return readStateFile(p).botLogin === null;
+  });
+  t("resolveReviewerIdentity: a supplied login wins; the state record's bot_login is the fallback; else unknown", () => {
+    const a = resolveReviewerIdentity({ suppliedLogin: "mthines", fromFlag: true, stateBotLogin: "dash0-dev[bot]" });
+    const b = resolveReviewerIdentity({ suppliedLogin: "", fromFlag: false, stateBotLogin: "dash0-dev[bot]" });
+    const c = resolveReviewerIdentity({ suppliedLogin: "not a login", fromFlag: true, stateBotLogin: null });
+    const d = resolveReviewerIdentity({ suppliedLogin: "mthines", fromFlag: false, stateBotLogin: null });
+    return a.me === "mthines" && a.identitySource === "--reviewer-login"
+      && b.me === "dash0-dev[bot]" && b.identitySource === "state-record"
+      && c.me === "" && c.identitySource === "unknown"
+      && d.identitySource === "PR_REVIEWER_LOGIN";
   });
   t("readStateFile: an unparseable file degrades to the safe default rather than throwing", () => {
     const p = join(tmpdir(), `prr-state-bad-${process.pid}.json`);
