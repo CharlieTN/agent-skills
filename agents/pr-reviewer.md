@@ -297,7 +297,8 @@ Examine the **raw arguments** verbatim. Do not paraphrase.
 | `--measurable-advisory` | Opt the measurability lens down to advisory for this run, so no measurability finding reaches `FAIL_REASONS` (`missing` → `suggestion:`, `unlinked` → aggregated `nitpick:`). Also settable as `measurable: advisory` in the review config |
 | `--skip-gates` | Skip Gates 1–5, run inline review (Gate 6) only |
 | `--repo-dir <p>` | Rung 0's local clone; forward to `prepare-review.mjs` |
-| `--intent-from <path>` | `/pr-review` runs the intent finder as its own sub-agent: skip it here; merge `<path>`'s candidates before Step 2.5 ([`dispatch-topology.md`](./pr-reviewer/rules/dispatch-topology.md#the-two-topologies)) |
+| `--context <path>` | The caller already ran `prepare-review.mjs`: skip it, read `<path>` as the context, and never clean up its workspace — the caller does ([`dispatch-topology.md`](./pr-reviewer/rules/dispatch-topology.md#the-two-topologies)) |
+| `--intent-from <path>` | `/pr-review` runs the intent finder as its own sub-agent: skip it here; read `<path>` only after verifying your own candidates at Step 2.6b, then verify its new ones (same link) |
 | `--with a,b,c` | Up to 3 additional review lenses |
 | `--no-fix-links` | Suppress the "Fix with Agent0" buttons for this run. They render by default everywhere (`agents/shared/rules/agent0-fix-links.md`); this is the per-run opt-out and beats every other signal. |
 | `--fix-links` | Force the buttons on for this run, overriding an `agent0_fix_links: false` in the review config. Rarely needed — they are already on by default. |
@@ -476,12 +477,8 @@ them is most of what this step now is:
 | **What happened on the previous run?** — baseline SHA, run-mode history, open threads, deferred findings, anchorless diagnostics | The **PR-state record** in LoreKit (below) |
 | **Where does the report live?** | The **sticky comment** on GitHub, located by its marker (Step 4a) |
 
-The state used to travel *inside* the sticky's body: a `<!-- PR_REVIEWER_LEDGER … -->` block
-plus five sections re-parsed out of rendered Markdown on the next run. That coupled the
-reviewer's memory to its own presentation — a heading rename lost the delta baseline, a run
-that could not write the comment lost every deferred finding with it, and recovering the
-baseline took three fetch ladders and three fallback rungs. State now lives in a store built
-for state, and the comment carries only what a human reads.
+State once rode inside the sticky's body and was re-parsed from rendered Markdown, so a heading
+rename lost the baseline; it now lives in a store built for state.
 
 ### The PR-state record
 
@@ -1078,7 +1075,7 @@ The `<D> suppressions, <P> promotions` figures are NOT announced here: they come
 **Mechanical home:** `prepare-review.mjs`'s `prepare()` (Step "fetch") issues the five calls below
 concurrently, in one `Promise.all`, binding `context.meta` / `context.headSha` / `context.baseSha` /
 `context.reviews` / `context.issueComments`. `node "$AGENT_SUPPORT/pr-reviewer/scripts/prepare-review.mjs"
---pr <ref> --out ctx.json` performs this step (and every mechanical step through "Bind `DEPTH_TIER`"
+--pr <ref> --out ctx.json` (never under `--context`) performs this step (and every mechanical step through "Bind `DEPTH_TIER`"
 below) in one call. The manual form below is the literal fallback contract — a change to one
 requires the same change to the other:
 
