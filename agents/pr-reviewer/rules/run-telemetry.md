@@ -33,6 +33,11 @@ Everything between `prepare` and `finalize` is model time, and only you know whe
 Mark a step when it starts; a step ends when the next one starts.
 A gap nobody marked is exported as `unmarked`, so the steps always add up to the run.
 
+`prepare-review.mjs` prints the marker for this run on its `markers` line, with both absolute paths filled in, followed by the steps this run's tier and topology will take.
+The same two values are in the context as `telemetry.markers.command` and `telemetry.markers.steps`.
+Copy the command from there rather than rebuilding it.
+On dash0#20655 a deep run that read this rule before Step 1 marked `memory`, `gates`, `finders`, and `judgments`, and never marked `lenses`, `consolidate`, or `verify`, although all three ran.
+
 | Step | Starts at |
 | --- | --- |
 | `memory` | Step 0.7 / Step 1.0 memory reads |
@@ -44,9 +49,10 @@ A gap nobody marked is exported as `unmarked`, so the steps always add up to the
 | `verify` | Step 2.6b |
 | `judgments` | writing `judgments.json` |
 | `validate` | the `validate-judgments.mjs` command — it closes `judgments`, so that step gets a tool-call count too |
-| `state` | Step 4c / 4d memory writes |
+| `assert` | Step 4a's pre-write assertions, after `finalize` and before `post` |
 
-A step that does not run this time — `memory` and `state` when memory is skipped, `intent-wait` outside `hybrid` — gets no marker.
+A step that does not run this time — `memory` when memory is skipped, `intent-wait` outside `hybrid`, `lenses` on `quick` — gets no marker.
+Step 4c and 4d's LoreKit writes are not a step: they run after `post` has already exported the run, so a marker there records nothing.
 
 **Never spend a tool call on a marker.**
 A turn costs 13–16 seconds; ten markers issued on their own would add two minutes to the run they measure.

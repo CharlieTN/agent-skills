@@ -63,7 +63,7 @@
 //   node review-telemetry.mjs --self-test
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
@@ -149,10 +149,32 @@ export const STEPS = Object.freeze({
   judgments: "model",
   validate: "script",
   finalize: "script",
+  assert: "model",
   post: "script",
-  state: "model",
 });
 const STEP_NAME_RE = /^[a-z][a-z0-9-]{0,39}$/;
+/** The steps the model marks itself, in order, for one run's tier and topology — what
+ *  prepare-review.mjs prints so the marker list is in front of the model when it needs it,
+ *  instead of in a rule it read before Step 1. `quick` runs no lenses; only `hybrid` waits
+ *  for the intent worker; `assert` is Step 4a's pre-write checks between `finalize` and `post`.
+ *  `state` is not a step: Step 4c's LoreKit writes happen after `post` has exported the run.
+ *  @param {{ tier?: string|null, topology?: string|null }} run @returns {string[]} */
+export function modelSteps({ tier, topology }) {
+  return [
+    "memory", "gates", "finders",
+    ...(topology === "hybrid" ? ["intent-wait"] : []),
+    ...(tier === "quick" ? [] : ["lenses"]),
+    "consolidate", "verify", "judgments", "validate", "assert",
+  ];
+}
+
+/** The literal marker prefix for one run: absolute paths, because a harness's next tool call
+ *  starts a fresh shell and a variable set in this one is gone. `<step>` and `<N>` are the only
+ *  blanks. @param {string} runDir @returns {string} */
+export function markerCommand(runDir) {
+  const self = fileURLToPath(import.meta.url);
+  return `node ${JSON.stringify(self)} step <step> --attr tool_calls_so_far=<N> --run-dir ${JSON.stringify(resolvePath(runDir))};`;
+}
 /** A gap shorter than this between two marked steps is bookkeeping, not an unmarked step. */
 const GAP_MIN_NS = 1_000_000_000n;
 
@@ -1139,6 +1161,19 @@ async function selfTest() {
         && dispatchTime("/x/intent-72-1790000300", 1_790_000_200n * S) === null
         && dispatchTime("/x/intent-72-1780000000", 1_790_000_200n * S) === null
         && dispatchTime("/x/intent", 1_790_000_200n * S) === null);
+    // The marker prepare-review.mjs prints: filled in and run as written, it records the step.
+    ok("modelSteps lists intent-wait only for hybrid, lenses except on quick, and never state",
+      modelSteps({ tier: "deep", topology: "hybrid" }).join() === "memory,gates,finders,intent-wait,lenses,consolidate,verify,judgments,validate,assert"
+        && !modelSteps({ tier: "standard", topology: "in-context" }).includes("intent-wait")
+        && !modelSteps({ tier: "quick", topology: "in-context" }).includes("lenses")
+        && modelSteps({ tier: "deep", topology: "hybrid" }).every((n) => n in STEPS));
+    const mRun = join(dir, "marker");
+    beginRun(mRun, facts);
+    const filled = markerCommand(mRun).replace("<step>", "verify").replace("<N>", "7").replace(/;$/, "");
+    const ran = spawnSync("sh", ["-c", `${filled}; echo after`], { encoding: "utf8" });
+    const mRecs = readLedger(mRun).filter((r) => r.t === "step" && r.name === "verify");
+    ok("markerCommand, filled and run in a fresh shell, records the step and lets the next command run",
+      ran.stdout.trim() === "after" && mRecs.length === 1 && mRecs[0].attrs?.tool_calls_so_far === 7, ran.stderr);
   } finally {
     server.close();
     rmSync(dir, { recursive: true, force: true });

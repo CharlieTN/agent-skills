@@ -47,7 +47,7 @@ import { writeFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, openSy
 import { tmpdir } from "node:os";
 import { join, dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Timing, beginRun, appendRecord, hostFacts, ledgerPath } from "./review-telemetry.mjs";
+import { Timing, beginRun, appendRecord, hostFacts, ledgerPath, markerCommand, modelSteps } from "./review-telemetry.mjs";
 import { classifyDivergence, blobDelta, deltaCounts, churnState, FULL_REFRESH_DELTA } from "./delta-triage.mjs";
 import { routeDepth, resolveBudget } from "./route-depth.mjs";
 import { buildReviewPacket, consumersByFile } from "./review-packet.mjs";
@@ -761,6 +761,25 @@ const CLONE_TIMEOUT_FLOOR_MS = 300000;
  * temp clone or tarball: on a worktree it leaves a stale entry in the parent
  * repo's `.git/worktrees`, so the review breaks the repo it was reviewing.
  */
+/** Both compare reads' jq: the divergence fields plus what an intact range needs, in one call. */
+const DELTA_COMPARE_JQ = "{status, ahead_by, behind_by, files: [(.files // [])[] | {filename, additions, deletions, status, patch}]}";
+const CHURN_COMPARE_JQ = "{status, behind_by, lines: ([(.files // [])[] | .additions + .deletions] | add // 0)}";
+
+/** One `compare/<from>...<to>` read that returns the divergence fields and the file data together.
+ *  A range too large to return with files still has to classify, so a failed combined read falls
+ *  back to the fields-only read, and the result says the file data is missing (`files`/`lines`
+ *  absent, `filesError` set) — the caller then degrades exactly as it did when that was a
+ *  second call.
+ *  @param {string} repo @param {string} from @param {string} to @param {string} jq
+ *  @param {string} metaJq @param {number} timeoutMs */
+async function compareRange(repo, from, to, jq, metaJq, timeoutMs) {
+  const path = `repos/${repo}/compare/${from}...${to}`;
+  const both = await ghJson(["api", path, "--jq", jq], { timeoutMs: Math.max(timeoutMs, 120000) });
+  if (both.ok) return both;
+  const meta = await ghJson(["api", path, "--jq", metaJq], { timeoutMs });
+  return meta.ok ? { ...meta, filesError: both.error } : meta;
+}
+
 async function materializeWorkspace({ repo, number, headSha, timeoutMs, anomalies, isolated = false, repoDir = null }) {
   // Rung 0's local clone. `--repo-dir` names it explicitly; otherwise it is the process's own cwd,
   // which is only right when the caller happens to run inside a clone of the PR's repo — a
@@ -802,7 +821,10 @@ async function materializeWorkspace({ repo, number, headSha, timeoutMs, anomalie
       };
     }
 
-    const fetched = await run(
+    // A clone that already has the head commit needs no fetch: on dash0 the `pull/<n>/head`
+    // fetch cost 2.6 s of a 14.7 s workspace phase for a commit that was already local.
+    const present = await run("git", ["cat-file", "-e", `${headSha}^{commit}`], { timeoutMs, cwd: cloneCwd });
+    const fetched = present.ok ? present : await run(
       "git",
       [...GIT_CREDENTIAL_ARGS, "fetch", "-q", "origin", `pull/${number}/head`],
       { timeoutMs, cwd: cloneCwd, env: GIT_NONINTERACTIVE_ENV },
@@ -1350,9 +1372,15 @@ async function prepare(opts) {
   // The graphql reviewThreads read — every mode, always: THREAD_OVERLAP needs
   // it even on a full run, and the context's threads[] field is a caller
   // input regardless of tier.
+  // The threads read and both compares are independent GitHub calls; they run concurrently and
+  // are awaited where each result is needed (5.7 s of sequential calls on dash0#20655).
+  const threadsRead = opts.threads !== false ? fetchReviewThreads(owner, name, number, timeoutMs) : null;
+  const hasPriorRun = !!priorSha && !zeroDelta && !runMode.full;
+  const deltaCompare = hasPriorRun ? compareRange(repo, priorSha, headSha, DELTA_COMPARE_JQ, "{status, ahead_by, behind_by}", timeoutMs) : null;
+  const churnCompare = hasPriorRun && state.lastFullSha ? compareRange(repo, state.lastFullSha, headSha, CHURN_COMPARE_JQ, "{status, behind_by}", timeoutMs) : null;
   let threads = [];
-  if (opts.threads !== false) {
-    const tr = await fetchReviewThreads(owner, name, number, timeoutMs);
+  if (threadsRead) {
+    const tr = await threadsRead;
     threads = buildThreads(tr.nodes);
     if (!tr.complete) {
       anomalies.push("review threads read incomplete — THREAD_OVERLAP and open-thread data may undercount");
@@ -1375,28 +1403,15 @@ async function prepare(opts) {
   // `priorSha` is already null under `--isolated` (above), so this is naturally false
   // there too — `runMode.full` (not the raw `opts.full`) so a plain `--full` (no
   // `--isolated`) gets the same treatment.
-  const hasPriorRun = !!priorSha && !zeroDelta && !runMode.full;
   if (hasPriorRun) {
-    const cmp = await ghJson(
-      ["api", `repos/${repo}/compare/${priorSha}...${headSha}`, "--jq", "{status, ahead_by, behind_by}"],
-      { timeoutMs },
-    );
+    const cmp = await /** @type {Promise<any>} */ (deltaCompare);
     if (cmp.ok) {
       const divergence = classifyDivergence(cmp.value);
       if (divergence === "intact") {
-        const full = await ghJson(
-          [
-            "api",
-            `repos/${repo}/compare/${priorSha}...${headSha}`,
-            "--jq",
-            "{files: [.files[] | {filename, additions, deletions, status, patch}]}",
-          ],
-          { timeoutMs: Math.max(timeoutMs, 120000) },
-        );
-        if (full.ok) {
-          deltaFiles = full.value.files || [];
+        if (Array.isArray(cmp.value.files)) {
+          deltaFiles = cmp.value.files;
         } else {
-          anomalies.push(`delta compare fetch failed: ${full.error} — falling back to full-PR delta`);
+          anomalies.push(`delta compare fetch failed: ${cmp.filesError} — falling back to full-PR delta`);
         }
       } else {
         // Diverged history — the blob-SHA authored delta, rebase-immune.
@@ -1440,19 +1455,12 @@ async function prepare(opts) {
     }
 
     // Cumulative churn since the last full pass (deep-lens refresh, D4/D5/D6).
-    if (state.lastFullSha) {
-      const cum = await ghJson(
-        ["api", `repos/${repo}/compare/${state.lastFullSha}...${headSha}`, "--jq", "{status, behind_by}"],
-        { timeoutMs },
-      );
+    if (churnCompare) {
+      const cum = await churnCompare;
       if (cum.ok) {
         let cumLines = 0;
         if (classifyDivergence(cum.value) === "intact") {
-          const cumFull = await ghJson(
-            ["api", `repos/${repo}/compare/${state.lastFullSha}...${headSha}`, "--jq", "[(.files // [])[] | .additions + .deletions] | add // 0"],
-            { timeoutMs },
-          );
-          cumLines = cumFull.ok ? Number(cumFull.value) || 0 : FULL_REFRESH_DELTA + 1;
+          cumLines = cum.value.lines === undefined ? FULL_REFRESH_DELTA + 1 : Number(cum.value.lines) || 0;
         }
         cumDeltaLines = churnState({ hasLastFull: true, meta: cum.value, deltaLinesIfIntact: cumLines });
       } else {
@@ -1689,7 +1697,13 @@ async function prepare(opts) {
       // child spans of `prepare` — a 14 s step is only actionable once its 6 s clone is visible.
       const sub = timing.segments().map((g) => ({ name: g.name, start_ns: String(BigInt(g.startMs) * 1_000_000n), end_ns: String(BigInt(g.endMs) * 1_000_000n) }));
       appendRecord(runDir, { t: "step", phase: "end", attrs: { ...phaseAttrs, files: files.length, delta_lines: context.deltaLines }, sub });
-      context.telemetry = { runDir, ledger: ledgerPath(runDir) };
+      // The marker list travels with the run: the model reads it here, at the point it starts
+      // marking, rather than recalling a rule it read before Step 1. Every step it lists and the
+      // model forgets is exported as `unmarked`, which is how lenses and verify went missing.
+      context.telemetry = {
+        runDir, ledger: ledgerPath(runDir),
+        markers: { command: markerCommand(runDir), steps: modelSteps({ tier: routing.tier, topology: budget.topology }) },
+      };
     } catch (e) {
       anomalies.push(`run telemetry not started: ${String(e && e.message || e).slice(0, 160)}`);
     }
@@ -2313,6 +2327,11 @@ async function main(argv) {
           `  routing   tier=${context.routing.tier}${context.routing.capApplied ? " (capped)" : ""} · triggers=[${context.routing.triggers.join(",")}] · threads=${context.threads.length} · gate4=${context.gate4_precandidates.length} pre-candidate(s)`,
           `  budget    thoroughness=${context.budget.effectiveThoroughness}${context.budget.riskFloorApplied ? ` (floored: ${context.budget.riskFloorReason})` : ""} · topology=${context.budget.topology} · votes=${context.budget.correctnessVotes} · tool calls=${context.budget.toolCalls ?? "?"}`,
           `  context   ${(Buffer.byteLength(JSON.stringify(context)) / 1024).toFixed(0)} KB index + sidecars in ${dirname(outPath)}`,
+          ...(context.telemetry?.markers ? [
+            `  markers   put this in front of each step's first command (fill <step>, <N> = your tool calls so far):`,
+            `            ${context.telemetry.markers.command}`,
+            `            steps: ${context.telemetry.markers.steps.join(" → ")}`,
+          ] : []),
           `  anomalies ${context.anomalies.length}`,
           ...context.anomalies.map((a) => `    ⚠ ${a}`),
         ].join("\n") + "\n",
