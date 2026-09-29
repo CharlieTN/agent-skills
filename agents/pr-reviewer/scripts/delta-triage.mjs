@@ -126,8 +126,8 @@ export function compareTrust(compareFiles, prFiles) {
 }
 
 /**
- * Paths the author touched in `prior..head` (first-parent non-merge commits plus files a
- * first-parent merge resolved by hand, i.e. conflict resolutions), kept to the PR's
+ * Paths the author touched in `prior..head` (non-merge commits not reachable from the base tip,
+ * plus files a merge among them resolved by hand, i.e. conflict resolutions), kept to the PR's
  * own files when that list is complete. A complete PR list excludes a file the author touched and
  * later reverted out of the PR; an incomplete one would wrongly drop authored files, so it is not
  * applied then. Order follows the PR list, then the rest sorted, so output is stable.
@@ -213,7 +213,7 @@ export async function resolveIntactDelta({ compareFiles, prFiles, readLocal, rea
   if (trust.trusted) return { files: trust.files, route: "compare", anomaly: null };
   const local = await readLocal();
   if (local.ok) {
-    return { files: local.files, route: "local-git", anomaly: `${trust.reason}; delta computed from local git (authored first-parent commits, prior..head, over the PR's files)` };
+    return { files: local.files, route: "local-git", anomaly: `${trust.reason}; delta computed from local git (authored commits in prior..head not on the base branch, over the PR's files)` };
   }
   if ((prFiles || []).every((f) => f.sha)) {
     const tree = await readPriorTree();

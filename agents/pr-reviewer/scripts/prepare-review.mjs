@@ -894,16 +894,19 @@ async function compareRange(repo, from, to, jq, metaJq, timeoutMs) {
 
 /**
  * The authored delta `from..to` read from a LOCAL git checkout — no 300-file compare cap. Tries
- * each candidate dir in order and uses the first whose object store holds both SHAs with `from`
- * an ancestor of `to`. "Authored" = files changed by first-parent non-merge commits in the range,
- * plus files a first-parent merge resolved differently from git's automatic re-merge (conflicts),
- * kept to the PR's own files (authoredPrPaths). Main's commits arrive on a merge's second parent,
- * so they never count. Residual: a PR file the author and the merged-in base both touched carries
+ * each candidate dir in order and uses the first whose object store holds `from`, `to` and the
+ * PR's base tip (`baseSha`) with `from` an ancestor of `to`. Authored = files changed by the
+ * non-merge commits in `from..to` NOT reachable from the base tip (`rev-list --no-merges from..to
+ * --not base`) — so a teammate's commit pulled in, or a sibling branch merged in, counts on either
+ * parent, while the base branch's own commits never do — plus files each merge in that set resolved
+ * differently from git's automatic re-merge (conflicts, hand edits), kept to the PR's own files
+ * (authoredPrPaths). Residual: a PR file the author and the merged-in base both touched carries
  * the base's hunks too (the diff is `from..to` per file), which over-counts — the safe direction.
- * @param {{dirs: (string|null|undefined)[], from: string, to: string, prFiles: any[], prFilesComplete: boolean, timeoutMs?: number}} input
+ * @param {{dirs: (string|null|undefined)[], from: string, to: string, baseSha: string, prFiles: any[], prFilesComplete: boolean, timeoutMs?: number}} input
  * @returns {Promise<{ok: true, files: any[], dir: string} | {ok: false, reason: string}>}
  */
-export async function localAuthoredDelta({ dirs, from, to, prFiles, prFilesComplete, timeoutMs = 60000 }) {
+export async function localAuthoredDelta({ dirs, from, to, baseSha, prFiles, prFilesComplete, timeoutMs = 60000 }) {
+  if (!baseSha) return { ok: false, reason: "no base SHA — base-branch commits cannot be told from authored ones" };
   const candidates = [...new Set(dirs.filter((d) => d && existsSync(/** @type {string} */ (d))))];
   if (!candidates.length) return { ok: false, reason: "no local git checkout" };
   /** @param {string} out */
@@ -912,12 +915,13 @@ export async function localAuthoredDelta({ dirs, from, to, prFiles, prFilesCompl
   for (const dir of /** @type {string[]} */ (candidates)) {
     /** @param {string[]} args */
     const g = (args) => run("git", ["-C", dir, "-c", "core.quotePath=false", "--literal-pathspecs", ...args], { timeoutMs });
-    const haveBoth = (await g(["cat-file", "-e", `${from}^{commit}`])).ok && (await g(["cat-file", "-e", `${to}^{commit}`])).ok;
-    if (!haveBoth) { lastReason = `${from.slice(0, 7)} or ${to.slice(0, 7)} not in ${dir}'s object store`; continue; }
+    const have = async (/** @type {string} */ sha) => (await g(["cat-file", "-e", `${sha}^{commit}`])).ok;
+    if (!(await have(from)) || !(await have(to))) { lastReason = `${from.slice(0, 7)} or ${to.slice(0, 7)} not in ${dir}'s object store`; continue; }
+    if (!(await have(baseSha))) { lastReason = `base ${baseSha.slice(0, 7)} not in ${dir}'s object store`; continue; }
     if (!(await g(["merge-base", "--is-ancestor", from, to])).ok) { lastReason = `${from.slice(0, 7)} is not an ancestor of ${to.slice(0, 7)} in ${dir}`; continue; }
-    const range = `${from}..${to}`;
-    const own = await g(["log", "--first-parent", "--no-merges", "--no-renames", "--format=", "--name-only", range]);
-    const merges = await g(["rev-list", "--first-parent", "--merges", range]);
+    const range = [`${from}..${to}`, "--not", baseSha];
+    const own = await g(["log", "--no-merges", "--no-renames", "--format=", "--name-only", ...range]);
+    const merges = await g(["rev-list", "--merges", ...range]);
     if (!own.ok || !merges.ok) return { ok: false, reason: `git log failed in ${dir}: ${(own.stderr || merges.stderr).trim().slice(0, 160)}` };
     const touched = new Set(lines(own.stdout));
     for (const m of lines(merges.stdout)) {
@@ -1610,7 +1614,7 @@ async function prepare(opts) {
           const resolved = await resolveIntactDelta({
             compareFiles: cmp.value.files,
             prFiles: files,
-            readLocal: () => localAuthoredDelta({ dirs: localGitDirs, from: /** @type {string} */ (priorSha), to: headSha, prFiles: files, prFilesComplete: prFilesState.complete, timeoutMs }),
+            readLocal: () => localAuthoredDelta({ dirs: localGitDirs, from: /** @type {string} */ (priorSha), to: headSha, baseSha, prFiles: files, prFilesComplete: prFilesState.complete, timeoutMs }),
             readPriorTree: async () => {
               const tree = await ghJson(
                 ["api", `repos/${repo}/git/trees/${priorSha}?recursive=1`, "--jq", '[.tree[] | select(.type == "blob") | {path, sha}]'],
@@ -1677,7 +1681,7 @@ async function prepare(opts) {
             const churn = await resolveChurnLines({
               perFile: cum.value.files,
               prFiles: files,
-              readLocal: () => localAuthoredDelta({ dirs: localGitDirs, from: /** @type {string} */ (state.lastFullSha), to: headSha, prFiles: files, prFilesComplete: prFilesState.complete, timeoutMs }),
+              readLocal: () => localAuthoredDelta({ dirs: localGitDirs, from: /** @type {string} */ (state.lastFullSha), to: headSha, baseSha, prFiles: files, prFilesComplete: prFilesState.complete, timeoutMs }),
             });
             cumLines = churn.lines;
             if (churn.anomaly) anomalies.push(churn.anomaly);
@@ -2271,9 +2275,9 @@ async function selfTest() {
     const body = src.slice(src.indexOf("async function prepare("), src.indexOf("function selfTest("));
     return /const resolved = await resolveIntactDelta\(\{\s*compareFiles: cmp\.value\.files,/.test(body)
       && /deltaFiles = resolved\.files;/.test(body) && /if \(resolved\.anomaly\) anomalies\.push\(resolved\.anomaly\)/.test(body)
-      && /readLocal: \(\) => localAuthoredDelta\(\{ dirs: localGitDirs, from: \/\*\* @type \{string\} \*\/ \(priorSha\), to: headSha/.test(body)
+      && /readLocal: \(\) => localAuthoredDelta\(\{ dirs: localGitDirs, from: \/\*\* @type \{string\} \*\/ \(priorSha\), to: headSha, baseSha,/.test(body)
       && /const churn = await resolveChurnLines\(\{\s*perFile: cum\.value\.files,/.test(body)
-      && /readLocal: \(\) => localAuthoredDelta\(\{ dirs: localGitDirs, from: \/\*\* @type \{string\} \*\/ \(state\.lastFullSha\)/.test(body)
+      && /readLocal: \(\) => localAuthoredDelta\(\{ dirs: localGitDirs, from: \/\*\* @type \{string\} \*\/ \(state\.lastFullSha\), to: headSha, baseSha,/.test(body)
       && /prFilesCompleteness\(files\.length, meta\.changedFiles, filesR\.error\)/.test(body)
       && /\n    deltaLines: deltaCountsResult\.deltaLines,\n/.test(body)
       && /files: \[\(\.files \/\/ \[\]\)\[\] \| \{filename, lines/.test(CHURN_COMPARE_JQ);
@@ -2305,14 +2309,60 @@ async function selfTest() {
     writeFileSync(join(dir, "conflict.ts"), "resolved\n");
     await g(["add", "-A"]); await g(["commit", "-qm", "merge main", "--no-edit"]);
     const head = (await g(["rev-parse", "HEAD"])).stdout.trim();
+    const baseSha = (await g(["rev-parse", "main"])).stdout.trim();
     const prFiles = [{ filename: "shared.ts" }, { filename: "feat.ts" }, { filename: "both.ts" }, { filename: "conflict.ts" }];
-    const r = await localAuthoredDelta({ dirs: [null, "/nonexistent-prr", dir], from: prior, to: head, prFiles, prFilesComplete: true });
+    const r = await localAuthoredDelta({ dirs: [null, "/nonexistent-prr", dir], from: prior, to: head, baseSha, prFiles, prFilesComplete: true });
     const names = r.ok ? r.files.map((f) => f.filename).sort() : [];
     const feat = r.ok ? r.files.find((f) => f.filename === "feat.ts") : null;
-    const missing = await localAuthoredDelta({ dirs: [dir], from: "0".repeat(40), to: head, prFiles, prFilesComplete: true });
+    const missing = await localAuthoredDelta({ dirs: [dir], from: "0".repeat(40), to: head, baseSha, prFiles, prFilesComplete: true });
+    const noBase = await localAuthoredDelta({ dirs: [dir], from: prior, to: head, baseSha: "1".repeat(40), prFiles, prFilesComplete: true });
     rmSync(dir, { recursive: true, force: true });
     return r.ok && JSON.stringify(names) === JSON.stringify(["conflict.ts", "feat.ts"]) && feat?.additions === 2 && feat?.deletions === 0
-      && String(feat?.patch).startsWith("@@") && missing.ok === false;
+      && String(feat?.patch).startsWith("@@") && missing.ok === false && noBase.ok === false && /base 1111111 not in/.test(noBase.reason);
+  });
+  // PR #213 r4134280273: authored commits are those in prior..head NOT reachable from the base
+  // tip — on EITHER parent of a merge. A first-parent walk lost a teammate's pushed commit pulled
+  // in by a pull, and a sibling branch merged in, both of which arrive on a second parent.
+  t("localAuthoredDelta: second-parent authored commits count, base commits do not (real git repo)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "prr-second-parent-"));
+    /** @param {string[]} a */
+    const g = (a) => run("git", ["-C", dir, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...a]);
+    /** @param {string} f @param {string} body @param {string} msg */
+    const commit = async (f, body, msg) => { writeFileSync(join(dir, f), body); await g(["add", "-A"]); await g(["commit", "-qm", msg]); };
+    const sha = async (/** @type {string} */ ref) => (await g(["rev-parse", ref])).stdout.trim();
+    await g(["init", "-q", "-b", "main"]);
+    await commit("base.ts", "b\n", "base");
+    await g(["checkout", "-qb", "feat"]);
+    await commit("mine.ts", "m\n", "mine");
+    const prior = await sha("HEAD");
+    // A teammate pushes to the same branch; the author pulls it in with a merge (second parent).
+    await g(["checkout", "-qb", "teammate", prior]);
+    await commit("teammate.ts", "t\n", "teammate");
+    // A sibling branch, cut from main, merged into feat (second parent).
+    await g(["checkout", "-qb", "sibling", "main"]);
+    await commit("sibling.ts", "s\n", "sibling");
+    // Main moves on and is merged in too — its files must stay out.
+    await g(["checkout", "-q", "main"]);
+    await commit("main-only.ts", "x\n", "main moves");
+    await g(["checkout", "-q", "feat"]);
+    await commit("mine.ts", "m\nm2\n", "mine 2");
+    await g(["merge", "-q", "--no-ff", "--no-edit", "teammate"]);
+    await g(["merge", "-q", "--no-ff", "--no-edit", "sibling"]);
+    await g(["merge", "-q", "--no-ff", "--no-edit", "main"]);
+    const head = await sha("HEAD");
+    const baseSha = await sha("main");
+    const prFiles = ["mine.ts", "teammate.ts", "sibling.ts"].map((filename) => ({ filename }));
+    const r = await localAuthoredDelta({ dirs: [dir], from: prior, to: head, baseSha, prFiles, prFilesComplete: false });
+    const names = r.ok ? r.files.map((f) => f.filename).sort() : [];
+    // A head made ONLY of merges of authored work: the first-parent walk saw no commit at all.
+    await g(["checkout", "-qb", "merges-only", prior]);
+    await g(["merge", "-q", "--no-ff", "--no-edit", "teammate"]);
+    await g(["merge", "-q", "--no-ff", "--no-edit", "sibling"]);
+    const onlyMerges = await localAuthoredDelta({ dirs: [dir], from: prior, to: await sha("HEAD"), baseSha, prFiles, prFilesComplete: true });
+    const onlyNames = onlyMerges.ok ? onlyMerges.files.map((f) => f.filename).sort() : [];
+    rmSync(dir, { recursive: true, force: true });
+    return r.ok && JSON.stringify(names) === JSON.stringify(["mine.ts", "sibling.ts", "teammate.ts"])
+      && JSON.stringify(onlyNames) === JSON.stringify(["sibling.ts", "teammate.ts"]);
   });
   t("Gate 4 over the resolved delta flags nothing in a merged-in base file", async () => {
     const secret = { filename: "main/test/fixture.test.ts", patch: "@@ -1,0 +1,1 @@\n+const password = \"hunter2hunter2hunter2\";" };

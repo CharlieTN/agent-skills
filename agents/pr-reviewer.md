@@ -1310,7 +1310,7 @@ DELTA_SOURCE="compare"
 
 A list of ≥ 300 rows (GitHub's cap) or with a file absent from `/tmp/pr-files.json` (a merged-in
 base stays `ahead`) is untrusted — never filter it. Recompute from a local checkout holding both
-SHAs: files of `git log --first-parent --no-merges PRIOR..HEAD` plus each merge's `--remerge-diff`,
+SHAs: files of `git log --no-merges PRIOR..HEAD --not BASE` plus each merge's `--remerge-diff`,
 ∩ the PR's files, then `git diff PRIOR HEAD --` them; else the blob route below. The churn compare
 gets the same rule (`resolveIntactDelta()` / `resolveChurnLines()`).
 
