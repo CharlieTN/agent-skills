@@ -1651,7 +1651,9 @@ async function prepare(opts) {
       // execute-write-plan.mjs refuses on its own (A/B round 3; rules/pipeline.md § --isolated).
       source: runMode.isolated ? "none" : state.priorSha ? "state-record" : (sticky ? "github-fallback-rung" : "none"),
       // The record's id when no marker was found: a real run then PATCHes that comment — which
-      // repairs a sticky whose body lost its marker — instead of posting a second report.
+      // repairs a sticky whose body lost its marker — instead of posting a second report. A comment
+      // deleted since the record was written 404s that PATCH, and execute-write-plan.mjs recreates
+      // the full report with a POST rather than falling back to the pointer.
       stickyCommentId: sticky ? sticky.id : (runMode.isolated ? null : state.stickyCommentId ?? null),
       stickyUrl: sticky ? sticky.html_url : null,
       stickyKind: sticky ? sticky.kind : null,
