@@ -311,9 +311,26 @@ export function isGithubLogin(s) {
 }
 
 /**
+ * The exact input `prepare()` hands `resolveReviewerIdentity`, built in one place so the self-test
+ * exercises the real call site rather than a hand-assembled copy of it. Under `--isolated` the
+ * sticky is never read as prior-run state, so its author is `null`.
+ * @param {{ opts: { reviewerLogin?: string }, state: { botLogin?: string|null }, sticky: any, isolated: boolean, env?: Record<string, string|undefined> }} input
+ * @returns {{ suppliedLogin: string, fromFlag: boolean, stateBotLogin: string|null, stickyAuthorLogin: string|null }}
+ */
+export function identityInputs({ opts, state, sticky, isolated, env = process.env }) {
+  return {
+    suppliedLogin: opts.reviewerLogin || env.PR_REVIEWER_LOGIN || "",
+    fromFlag: Boolean(opts.reviewerLogin),
+    stateBotLogin: state.botLogin ?? null,
+    stickyAuthorLogin: isolated ? null : stickyAuthorLogin(sticky),
+  };
+}
+
+/**
  * The reviewer identity, first match wins: a valid supplied login (`--reviewer-login`, then
  * PR_REVIEWER_LOGIN), then the state record's `bot_login` (pr-reviewer.md's identity ladder),
- * then the matched prior sticky's own `user.login` (the GitHub fallback rung — whoever posted the
+ * then the matched prior sticky's author login (the GitHub fallback rung — `ISSUE_COMMENTS_JQ`
+ * flattens it to `user: "<login>"`, read via `stickyAuthorLogin`; whoever posted the
  * report is the reviewer, so a re-review with no `--state` still knows itself and still builds
  * Fix-this buttons), else unknown. A supplied login always outranks the record, and the record
  * outranks the sticky's author. The caller passes `null` for the sticky author under `--isolated`,
@@ -1305,11 +1322,9 @@ async function prepare(opts) {
   // body as `--reviewer-login` (the agent body's `ME=$(gh api user … || echo "")` captures gh's
   // stdout error payload, then appends the empty fallback) and this script accepted it as a login.
   // Anything that is not a GitHub login shape is treated as unknown, and says so.
-  const suppliedLogin = opts.reviewerLogin || process.env.PR_REVIEWER_LOGIN || "";
-  const { me, identitySource } = resolveReviewerIdentity({
-    suppliedLogin, fromFlag: Boolean(opts.reviewerLogin), stateBotLogin: state.botLogin ?? null,
-    stickyAuthorLogin: runMode.isolated ? null : stickyAuthorLogin(sticky),
-  });
+  const identityInput = identityInputs({ opts, state, sticky, isolated: runMode.isolated });
+  const { suppliedLogin } = identityInput;
+  const { me, identitySource } = resolveReviewerIdentity(identityInput);
   const authorLogin = meta.author?.login || "";
   const reviewRelation = me ? (normalizeLogin(me) === normalizeLogin(authorLogin) ? "self" : "cross") : "cross";
   if (suppliedLogin && !isGithubLogin(suppliedLogin)) {
@@ -2330,10 +2345,13 @@ async function selfTest() {
     };
     const comments = [row(1, "someone", "hello"), row(2, "dash0-dev[bot]", `${REPORT_MARKER}\n### report`)];
     const sticky = findSticky(comments);
-    const login = stickyAuthorLogin(sticky);
-    const r = resolveReviewerIdentity({ suppliedLogin: "", fromFlag: false, stateBotLogin: null, stickyAuthorLogin: login });
+    // Through prepare()'s own argument builder, so a regression at the call site turns this red.
+    const input = identityInputs({ opts: {}, state: { botLogin: null }, sticky, isolated: false, env: {} });
+    const r = resolveReviewerIdentity(input);
+    const iso = resolveReviewerIdentity(identityInputs({ opts: {}, state: { botLogin: null }, sticky, isolated: true, env: {} }));
     return flattensUser && typeof comments[1].user === "string" && sticky?.id === 2
       && r.identitySource === "prior-report-author" && r.me === "dash0-dev[bot]"
+      && iso.identitySource === "unknown"
       && stickyAuthorLogin({ user: { login: "x[bot]" } }) === "x[bot]"
       && stickyAuthorLogin(null) === null && stickyAuthorLogin({ user: "" }) === null;
   });
