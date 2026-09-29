@@ -921,16 +921,18 @@ export async function localAuthoredDelta({ dirs, from, to, baseSha, prFiles, prF
     if (!(await g(["merge-base", "--is-ancestor", from, to])).ok) { lastReason = `${from.slice(0, 7)} is not an ancestor of ${to.slice(0, 7)} in ${dir}`; continue; }
     const range = [`${from}..${to}`, "--not", baseSha];
     const own = await g(["log", "--no-merges", "--no-renames", "--format=", "--name-only", ...range]);
-    const merges = await g(["rev-list", "--merges", ...range]);
+    const merges = await g(["rev-list", "--merges", "--parents", ...range]);
     if (!own.ok || !merges.ok) return { ok: false, reason: `git log failed in ${dir}: ${(own.stderr || merges.stderr).trim().slice(0, 160)}` };
     const touched = new Set(lines(own.stdout));
-    for (const m of lines(merges.stdout)) {
+    for (const [m, ...parents] of lines(merges.stdout).map((l) => l.split(/\s+/))) {
       // `--remerge-diff` (git >= 2.36) names only files the recorded merge differs from git's own
       // automatic re-merge — conflict resolutions and hand edits. `--cc` also lists every file a
       // CLEAN merge combined from both sides (dash0#20655: dozens of main's files), so it is only
-      // the fallback for an older git, over-counting in the safe direction.
-      let res = await g(["show", "--remerge-diff", "--no-renames", "--format=", "--name-only", m]);
-      if (!res.ok) res = await g(["diff-tree", "--cc", "--no-commit-id", "--name-only", "-r", m]);
+      // the fallback, over-counting in the safe direction: for an older git, and for an octopus
+      // merge, where remerge-diff prints a warning, lists nothing, and still exits 0.
+      let res = parents.length > 2 ? null : await g(["show", "--remerge-diff", "--no-renames", "--format=", "--name-only", m]);
+      if (res && res.ok && !res.stdout.trim() && res.stderr.trim()) res = null;
+      if (!res || !res.ok) res = await g(["diff-tree", "--cc", "--no-commit-id", "--name-only", "-r", m]);
       if (!res.ok) return { ok: false, reason: `reading merge ${m.slice(0, 7)} failed` };
       for (const f of lines(res.stdout)) touched.add(f);
     }
@@ -2363,6 +2365,36 @@ async function selfTest() {
     rmSync(dir, { recursive: true, force: true });
     return r.ok && JSON.stringify(names) === JSON.stringify(["mine.ts", "sibling.ts", "teammate.ts"])
       && JSON.stringify(onlyNames) === JSON.stringify(["sibling.ts", "teammate.ts"]);
+  });
+  // PR #213 r4134280286: `--remerge-diff` on an octopus merge warns on stderr, lists nothing, and
+  // exits 0 — so a hand edit made inside the octopus merge vanished instead of reaching `--cc`.
+  t("localAuthoredDelta: a hand edit inside an octopus merge is read via --cc (real git repo)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "prr-octopus-"));
+    /** @param {string[]} a */
+    const g = (a) => run("git", ["-C", dir, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...a]);
+    /** @param {string} f @param {string} body @param {string} msg */
+    const commit = async (f, body, msg) => { writeFileSync(join(dir, f), body); await g(["add", "-A"]); await g(["commit", "-qm", msg]); };
+    const sha = async (/** @type {string} */ ref) => (await g(["rev-parse", ref])).stdout.trim();
+    await g(["init", "-q", "-b", "main"]);
+    await commit("base.ts", "b\n", "base");
+    await g(["checkout", "-qb", "feat"]);
+    await commit("mine.ts", "m\n", "mine");
+    const prior = await sha("HEAD");
+    for (const side of ["t1", "t2"]) {
+      await g(["checkout", "-qb", side, prior]);
+      await commit(`${side}.ts`, `${side}\n`, side);
+    }
+    await g(["checkout", "-q", "feat"]);
+    await g(["merge", "-q", "--no-ff", "--no-edit", "t1", "t2"]);
+    writeFileSync(join(dir, "evil.ts"), "hand edit in the octopus\n");
+    await g(["add", "-A"]); await g(["commit", "-q", "--amend", "--no-edit"]);
+    const head = await sha("HEAD");
+    const parents = (await g(["rev-list", "--parents", "-n1", head])).stdout.trim().split(/\s+/).length - 1;
+    const prFiles = ["mine.ts", "t1.ts", "t2.ts", "evil.ts"].map((filename) => ({ filename }));
+    const r = await localAuthoredDelta({ dirs: [dir], from: prior, to: head, baseSha: await sha("main"), prFiles, prFilesComplete: true });
+    const names = r.ok ? r.files.map((f) => f.filename).sort() : [];
+    rmSync(dir, { recursive: true, force: true });
+    return parents === 3 && r.ok && JSON.stringify(names) === JSON.stringify(["evil.ts", "t1.ts", "t2.ts"]);
   });
   t("Gate 4 over the resolved delta flags nothing in a merged-in base file", async () => {
     const secret = { filename: "main/test/fixture.test.ts", patch: "@@ -1,0 +1,1 @@\n+const password = \"hunter2hunter2hunter2\";" };
