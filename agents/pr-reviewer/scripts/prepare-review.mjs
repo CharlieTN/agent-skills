@@ -1064,6 +1064,25 @@ export function extraHighStakes(yamlText) {
   return out;
 }
 
+/**
+ * The three run-level Agent0 fix-link keys (review-config.md § Run-level fields), top-level only —
+ * a nested or subtree key never governs the run. `fixLinks` is null when the key is absent, so
+ * finalize.mjs can tell "said nothing" (buttons on) from "said false" (buttons off).
+ */
+export function agent0Config(yamlText) {
+  const out = { fixLinks: null, environment: null, org: null };
+  if (!yamlText) return out;
+  for (const raw of yamlText.split("\n")) {
+    const m = /^(agent0_fix_links|agent0_environment|agent0_org):\s*(.*)$/.exec(raw);
+    if (!m) continue;
+    const v = m[2].replace(/\s+#.*$/, "").replace(/["']/g, "").trim();
+    if (m[1] === "agent0_fix_links") out.fixLinks = v === "true" ? true : v === "false" ? false : null;
+    else if (m[1] === "agent0_environment") out.environment = v || null;
+    else out.org = v || null;
+  }
+  return out;
+}
+
 function readReviewConfig(dir) {
   if (!dir) return "";
   for (const p of [join(dir, ".github", "review.yaml"), join(dir, ".review.yaml")]) {
@@ -1302,7 +1321,8 @@ async function prepare(opts) {
   // Shape classification — a pure local computation, no API calls.
   timing.start("classify-shape");
   let shape = null;
-  const hsArgs = extraHighStakes(readReviewConfig(workspace.dir)).flatMap((r) => ["--extra-high-stakes", r]);
+  const reviewConfigText = readReviewConfig(workspace.dir);
+  const hsArgs = extraHighStakes(reviewConfigText).flatMap((r) => ["--extra-high-stakes", r]);
   const classify = await run("node", [join(HERE, "classify-shape.mjs"), prFilesPath, ...hsArgs], { timeoutMs });
   if (classify.ok) {
     try {
@@ -1630,6 +1650,8 @@ async function prepare(opts) {
     reviewRelation,
     reviewerLogin: me || null,
     identitySource: me ? (opts.reviewerLogin ? "--reviewer-login" : "PR_REVIEWER_LOGIN") : "unknown",
+    // Read by finalize.mjs, which builds the Fix-with-Agent0 links (finalize/fix-links.mjs).
+    agent0: agent0Config(reviewConfigText),
 
     // Bulk payloads live on disk; the context names them. `inline` says which
     // form this context is in, so a consumer never has to guess whether a null
@@ -1887,6 +1909,14 @@ async function selfTest() {
     const y = ["high_stakes_paths:", "  - ^src/auth/  # money", '  - "^db/migrations/"', "other: 1"].join("\n");
     const r = extraHighStakes(y);
     return r.length === 2 && r[0] === "^src/auth/" && r[1] === "^db/migrations/";
+  });
+  t("agent0Config reads the three top-level keys and strips comments and quotes", () => {
+    const r = agent0Config(["agent0_fix_links: false  # off", 'agent0_environment: "development"', "agent0_org: acme", "  agent0_org: nested"].join("\n"));
+    return r.fixLinks === false && r.environment === "development" && r.org === "acme";
+  });
+  t("agent0Config leaves fixLinks null when the key is absent", () => {
+    const r = agent0Config("profile: strict\n");
+    return r.fixLinks === null && r.environment === null && r.org === null && agent0Config("").fixLinks === null;
   });
   t("extraHighStakes returns empty when the key is absent", () => {
     return extraHighStakes("profile: strict\n").length === 0 && extraHighStakes("").length === 0;

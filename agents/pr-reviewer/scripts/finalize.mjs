@@ -45,6 +45,7 @@ import {
   buildOptimalityCard,
 } from "./finalize/payload.mjs";
 import { renderComment } from "./render-comment.mjs";
+import { resolveFixLinks, applyFixLinks } from "./finalize/fix-links.mjs";
 import { TITLE_MAX, PROSE_MAX, UNVERIFIED_MAX, EVIDENCE_REFS_MAX, SHA7, sentenceCount } from "./comment-spine.mjs";
 import { toFindingsBusRecords } from "./finalize/findings-bus.mjs";
 import { buildWritePlan } from "./finalize/write-plan.mjs";
@@ -57,6 +58,7 @@ const FINALIZE_SELF_TESTS = [
   "finalize/dedupe.mjs", "finalize/thresholds.mjs", "finalize/suppression.mjs",
   "finalize/placement.mjs", "finalize/line-validity.mjs", "finalize/gates.mjs",
   "finalize/payload.mjs", "finalize/findings-bus.mjs", "finalize/write-plan.mjs",
+  "finalize/fix-links.mjs",
 ];
 
 // render-report.mjs's SHA7 check requires RUN.sha/RUN.prior_sha to be EXACTLY 7 lowercase hex
@@ -793,14 +795,14 @@ function parseArgs(argv) {
   const opts = { writer: "github" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--self-test" || a === "--replay-fixtures" || a === "--dry-run" || a === "--skip-gates" || a === "--no-dispatch") { opts[a.slice(2)] = true; continue; }
+    if (a === "--self-test" || a === "--replay-fixtures" || a === "--dry-run" || a === "--skip-gates" || a === "--no-dispatch" || a === "--no-fix-links" || a === "--fix-links") { opts[a.slice(2)] = true; continue; }
     if (a.startsWith("--")) { opts[a.slice(2)] = argv[i + 1]; i++; continue; }
   }
   return opts;
 }
 
 function usage() {
-  console.error("usage: finalize.mjs --context <ctx.json> --judgments <j.json> [--config <review.yaml>] --out-dir <dir> [--writer github|findings-bus] [--bus-path <file>] [--dry-run] [--no-dispatch] [--skip-gates] [--self-test] [--replay-fixtures]\n"
+  console.error("usage: finalize.mjs --context <ctx.json> --judgments <j.json> [--config <review.yaml>] --out-dir <dir> [--writer github|findings-bus] [--bus-path <file>] [--dry-run] [--no-dispatch] [--skip-gates] [--no-fix-links] [--fix-links] [--self-test] [--replay-fixtures]\n"
     + "   or: finalize.mjs --dedupe-candidates <candidates.json> [--out <file>]\n"
     + "   or: finalize.mjs --check-shape <judgments.json>");
 }
@@ -1783,6 +1785,45 @@ async function selfTest() {
         && !reportBody.includes("[the retry doc](https://example.com/retry)"));
     }
 
+    // Fix-with-Agent0 buttons are built by main() itself, on by default (finalize/fix-links.mjs).
+    // Before this, only a caller that hand-built every link got buttons, and nothing noticed when
+    // one did not (mthines/agent-skills#213).
+    if (existsSync(join(outDir, "report-body.md"))) {
+      check("default run, no login: Fix all falls back to the prior sticky's permalink",
+        readFileSync(join(outDir, "report-body.md"), "utf8").includes(
+          "utm_source=pr-reviewer-fix-all")
+        && readFileSync(join(outDir, "report-body.md"), "utf8").includes(encodeURIComponent("pull/205#issuecomment-555")));
+    }
+    {
+      const fxDir = join(e2eDir, "fix-links");
+      rmSync(fxDir, { recursive: true, force: true });
+      mkdirSync(fxDir, { recursive: true });
+      const fxContextPath = join(fxDir, "context.json");
+      writeFileSync(fxContextPath, JSON.stringify({ ...e2eContext, reviewerLogin: "rev-bot" }, null, 2));
+      const spawnFx = (/** @type {string} */ name, /** @type {string[]} */ extra) => {
+        const d = join(fxDir, name);
+        const rr = spawnSync(process.execPath, [join(HERE, "finalize.mjs"), "--context", fxContextPath,
+          "--judgments", judgmentsPath, "--out-dir", d, "--dry-run", ...extra], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+        const plan = existsSync(join(d, "write-plan.json")) ? JSON.parse(readFileSync(join(d, "write-plan.json"), "utf8")) : null;
+        const report = existsSync(join(d, "report-body.md")) ? readFileSync(join(d, "report-body.md"), "utf8") : "";
+        return { status: rr.status, plan, report };
+      };
+      const on = spawnFx("on", []);
+      check("default run with a login: the inline claim carries a Fix this button scoped to its path:line",
+        on.status === 0 && Boolean(on.plan?.review_create?.comments?.[0]?.body.includes("utm_source=pr-reviewer-fix-this"))
+        && Boolean(on.plan?.review_create?.comments?.[0]?.body.includes(encodeURIComponent("src/api/client.ts:88"))));
+      check("default run with a login: Fix all names the reviewer's login",
+        on.report.includes(encodeURIComponent("/pr-fix https://github.com/o/r/pull/205 rev-bot")));
+      const off = spawnFx("off", ["--no-fix-links"]);
+      check("--no-fix-links builds neither placement",
+        off.status === 0 && !off.report.includes("goto/agent0")
+        && !off.plan?.review_create?.comments?.some((/** @type {any} */ c) => c.body.includes("goto/agent0")));
+      writeFileSync(fxContextPath, JSON.stringify({ ...e2eContext, reviewerLogin: "rev-bot", agent0: { fixLinks: false, environment: null, org: null } }, null, 2));
+      const cfgOff = spawnFx("cfg-off", []);
+      check("agent0_fix_links: false in the review config builds neither placement",
+        cfgOff.status === 0 && !cfgOff.report.includes("goto/agent0"));
+    }
+
     // D8/D9 (plan feat/pr-reviewer-shrink-fanout-ab, AC-17): a HISTORICAL context.json (the
     // context.historical block prepare-review.mjs's --review-sha attaches) must refuse a real
     // finalize.mjs run unless --dry-run is also passed, and once it is, the write-plan.json it
@@ -2127,6 +2168,25 @@ async function main() {
     console.log(`finalize: wrote ${result.findingsBusRecords.length} record(s) to ${busPath} (findings-bus writer, no GitHub write plan built)`);
     console.log(`finalize: verdict=${result.verdict} inline=${result.inline.length} deferred=${result.deferred.length} suppressed=${result.suppressed.length} anchorless=${result.anchorless.length}`);
     return;
+  }
+
+  // Fix-with-Agent0 buttons: built here on every GitHub-writer run, on by default
+  // (agent0-fix-links.md § Opt-in). A link the caller already supplied is kept.
+  const fixSettings = resolveFixLinks({
+    noFixLinks: Boolean(opts["no-fix-links"]), fixLinks: Boolean(opts["fix-links"]), config: context?.agent0 ?? null,
+  });
+  try {
+    const fx = applyFixLinks({
+      settings: fixSettings, prUrl: context?.target?.url ?? null, login: context?.reviewerLogin ?? null,
+      inline: result.inline, threads: context?.threads ?? [], stickyCommentId: context?.priorRun?.stickyCommentId ?? null,
+      existingFixAll: result.payload?.FIX_ALL_URL ?? null,
+    });
+    if (fx.fixAllUrl && result.payload) result.payload.FIX_ALL_URL = fx.fixAllUrl;
+    console.log(`finalize: fix links ${fixSettings.on ? `on (${fixSettings.reason}, ${fixSettings.env})` : `off (${fixSettings.reason})`}`
+      + ` — fix-all ${fx.fixAllUrl ? "built" : "omitted"}, fix-this ${fx.fixThis}${fx.skipped && fixSettings.on ? ` · ${fx.skipped}` : ""}`);
+  } catch (e) {
+    // A malformed agent0_org throws in buildLink: report it, never render a link to the wrong org.
+    console.error(`finalize: fix links not built — ${/** @type {Error} */ (e).message}`);
   }
 
   // Render the sticky report body with the SAME renderer --replay-fixtures spawns — this is where

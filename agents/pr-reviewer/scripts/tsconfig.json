@@ -30,6 +30,7 @@
     "finalize/payload.mjs",
     "finalize/findings-bus.mjs",
     "finalize/write-plan.mjs",
+    "finalize/fix-links.mjs",
     "execute-write-plan.mjs",
     "../../../scripts/eval/thread-outcomes.mjs",
     "../../../scripts/eval/ab-review.mjs",

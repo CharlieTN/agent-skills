@@ -9006,6 +9006,7 @@ const isPollBlock = (block) =>
     "finalize/dedupe.mjs", "finalize/thresholds.mjs", "finalize/suppression.mjs",
     "finalize/placement.mjs", "finalize/line-validity.mjs", "finalize/gates.mjs",
     "finalize/payload.mjs", "finalize/findings-bus.mjs", "finalize/write-plan.mjs",
+    "finalize/fix-links.mjs",
   ];
 
   for (const name of FINALIZE_SCRIPTS) {
@@ -9022,7 +9023,7 @@ const isPollBlock = (block) =>
   const TS = join(REPO_ROOT, SCRIPTS_DIR, "tsconfig.json");
   if (existsSync(TS)) {
     const tsText = readFileSync(TS, "utf8");
-    s.check("G63b tsconfig.json's files[] lists finalize.mjs and all 9 finalize/*.mjs modules",
+    s.check("G63b tsconfig.json's files[] lists finalize.mjs and all 10 finalize/*.mjs modules",
       FINALIZE_SCRIPTS.every((n) => tsText.includes(`"${n}"`)));
   }
 
