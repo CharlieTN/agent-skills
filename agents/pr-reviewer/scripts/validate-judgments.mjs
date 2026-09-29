@@ -46,6 +46,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { checkShape } from "./finalize.mjs";
+import { RESOLVE_CLASSES as THREAD_RESOLVE_CLASSES } from "./finalize/gates.mjs";
+import { CLAIM_PREFIXES } from "./comment-spine.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCHEMA_PATH = join(HERE, "..", "schemas", "judgments.schema.json");
@@ -64,9 +66,6 @@ export const SUPPORTED_KEYWORDS = new Set([
   "pattern",
   "title", "description",
 ]);
-
-const CLAIM_PREFIXES = ["issue", "suggestion"];
-const THREAD_RESOLVE_CLASSES = ["fixed", "declined", "acknowledged", "obsolete"];
 
 export class SchemaError extends Error {}
 
@@ -285,7 +284,7 @@ export function domainRules(data, errors) {
     if (t === null || typeof t !== "object") return;
     const path = `#.threads[${i}]`;
     const hasReply = typeof t.reply === "string" && t.reply.length > 0;
-    const resolves = THREAD_RESOLVE_CLASSES.includes(t.classification);
+    const resolves = THREAD_RESOLVE_CLASSES.has(t.classification);
     if (resolves && !hasReply) {
       errors.push(`${path}: classification ${JSON.stringify(t.classification)} requires a non-empty "reply"`);
     }

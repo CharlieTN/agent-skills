@@ -22,7 +22,7 @@
  * field for the model to (mis)supply one.
  */
 
-const RESOLVE_CLASSES = new Set(["fixed", "declined", "acknowledged", "obsolete"]);
+import { RESOLVE_CLASSES } from "./gates.mjs";
 
 /**
  * @param {any[]} threads - judgments.json's threads[] (finding-verifier.md / thread-resolution.md

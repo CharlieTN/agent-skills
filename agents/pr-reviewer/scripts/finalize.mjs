@@ -45,7 +45,7 @@ import {
   buildOptimalityCard,
 } from "./finalize/payload.mjs";
 import { renderComment } from "./render-comment.mjs";
-import { TITLE_MAX, PROSE_MAX, UNVERIFIED_MAX, EVIDENCE_REFS_MAX, sentenceCount } from "./comment-spine.mjs";
+import { TITLE_MAX, PROSE_MAX, UNVERIFIED_MAX, EVIDENCE_REFS_MAX, SHA7, sentenceCount } from "./comment-spine.mjs";
 import { toFindingsBusRecords } from "./finalize/findings-bus.mjs";
 import { buildWritePlan } from "./finalize/write-plan.mjs";
 import { scratchRoot } from "./prepare-review.mjs";
@@ -703,7 +703,7 @@ export function dedupeCandidates(candidates) {
  */
 function rendersInline(f, sha) {
   try {
-    renderComment(toInlineCommentPayload(f, { sha: /^[0-9a-f]{7}$/.test(sha) ? sha : "0000000" }));
+    renderComment(toInlineCommentPayload(f, { sha: SHA7.test(sha) ? sha : "0000000" }));
     return true;
   } catch {
     return false;

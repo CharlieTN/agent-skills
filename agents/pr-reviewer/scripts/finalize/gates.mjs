@@ -49,8 +49,8 @@ export function gate4(g4) {
   };
 }
 
-const RESOLVE_CLASSES = new Set(["fixed", "declined", "acknowledged", "obsolete"]);
-const BLOCKING_DECORATION_RE = /\(blocking\)|(?:^|\n)\s*issue:|severity:\s*(?:critical|high)/i;
+export const RESOLVE_CLASSES = new Set(["fixed", "declined", "acknowledged", "obsolete"]);
+export const BLOCKING_DECORATION_RE = /\(blocking\)|(?:^|\n)\s*issue:|severity:\s*(?:critical|high)/i;
 
 /**
  * @param {any[]} contextThreads - review-context.json's threads[] (from prepare-review.mjs)

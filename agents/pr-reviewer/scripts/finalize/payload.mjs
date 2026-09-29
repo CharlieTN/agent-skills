@@ -19,9 +19,9 @@
 import { buildFingerprint } from "../fingerprint.mjs";
 import { CLAIM_PREFIXES } from "./thresholds.mjs";
 import { TERMINAL_PUNCT_RE } from "../comment-spine.mjs";
+import { BLOCKING_DECORATION_RE } from "./gates.mjs";
 
 const GATE_FIELD = { g1: "GATE_DESCRIPTION", g3: "GATE_PRIOR", g4: "GATE_SELFREVIEW", g5: "GATE_DOCS", g6: "GATE_CODEREVIEW" };
-const BLOCKING_DECORATION_RE = /\(blocking\)|(?:^|\n)\s*issue:|severity:\s*(?:critical|high)/i;
 // render-report.mjs's VALID_STATUS is the glyph set, never the PASS/WARN/FAIL/SKIPPED gates.mjs
 // computes internally — the two vocabularies are separate by design (gates.mjs stays plain-text
 // so its own self-test can assert on status without a glyph table of its own).

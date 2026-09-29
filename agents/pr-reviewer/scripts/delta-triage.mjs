@@ -65,7 +65,8 @@ export function deltaCounts(files) {
   return { deltaLines, newFiles };
 }
 
-export const FULL_REFRESH_DELTA = 150;
+import { FULL_REFRESH_DELTA } from "./route-depth.mjs";
+export { FULL_REFRESH_DELTA };
 
 /**
  * Cumulative churn since the last full pass (the deep-lens-refresh input,

@@ -7,6 +7,8 @@
  * ONE profile record, per D18 — no parallel threshold/cap maps.
  */
 
+import { CLAIM_PREFIXES as SPINE_CLAIM_PREFIXES } from "../comment-spine.mjs";
+
 /** @type {Record<string, { thresholds: Record<string, number>, perFileCap: number }>} */
 export const PROFILES = {
   chill: { thresholds: { critical: 75, high: 85, medium: 90, low: 95 }, perFileCap: 3 },
@@ -20,7 +22,7 @@ export const TOTAL_INLINE_CAP = 20;
  * get an effective bar of min(threshold, 70) rather than the profile's own bar. */
 export const AGREEMENT_PROMOTED_CAP = 70;
 
-export const CLAIM_PREFIXES = new Set(["issue", "suggestion"]);
+export const CLAIM_PREFIXES = new Set(SPINE_CLAIM_PREFIXES);
 
 // finding-verifier.md § Step 4: Final = 0.4*Reproducible + 0.3*Attributable + 0.3*Actionable.
 // judgments.schema.json's own `final` field description: "finalize.mjs recomputes and
