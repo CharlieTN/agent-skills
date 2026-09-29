@@ -598,7 +598,8 @@ export function toExporter(run, env) {
   });
   ex.histogram("pr_review.run.duration", Number(run.endNs - run.startNs) / 1e9, {
     "gen_ai.agent.name": AGENT_NAME,
-    "pr_review.tier": f.tier, "pr_review.topology": f.topology,
+    // finalize.mjs records the topology that actually ran; the begin-time value is the budget's.
+    "pr_review.tier": f.tier, "pr_review.topology": run.runAttrs.topology ?? f.topology,
     "pr_review.verdict": run.runAttrs.verdict,
   }, "s");
   return ex;
@@ -951,6 +952,18 @@ async function selfTest() {
       && get(s, "dash0.gen_ai.vcs.repository.name") === "sync-tray" && get(s, "dash0.gen_ai.vcs.owner.name") === "mthines"
       && get(s, "dash0.gen_ai.vcs.pull_request.url") === "https://github.com/mthines/sync-tray/pull/72"
       && get(s, "dash0.gen_ai.vcs.ref.head.revision") === "bfd6662"));
+  {
+    // finalize.mjs overrides the budgeted topology with the one that ran (a hybrid budget whose
+    // intent worker never delivered ran in-context); both the root span and the run histogram
+    // must carry the override, not the begin-time value.
+    const ranRun = /** @type {BuiltRun} */ (buildRun(/** @type {any} */ ([...ledger, { t: "attr", target: "run", ns: ledger[ledger.length - 1].ns, attrs: { topology: "in-context" } }])));
+    const rex = toExporter(ranRun, env);
+    const rroot = /** @type {any} */ (rex.tracePayload()).resourceSpans[0].scopeSpans[0].spans[0];
+    const runHist = /** @type {any} */ (rex.metricPayload()).resourceMetrics[0].scopeMetrics[0].metrics.find((/** @type {any} */ m) => m.name === "pr_review.run.duration");
+    const histTopology = runHist?.histogram?.dataPoints?.[0]?.attributes?.find((/** @type {any} */ a) => a.key === "pr_review.topology")?.value?.stringValue;
+    ok("a finalize-recorded topology overrides the budgeted one on the root span and the run histogram",
+      get(rroot, "pr_review.topology") === "in-context" && histTopology === "in-context", `root=${get(rroot, "pr_review.topology")} hist=${histTopology}`);
+  }
   const phaseSpans = spans.filter((/** @type {any} */ s) => s.name.startsWith("pr_review.phase "));
   const prepSpan = spans.find((/** @type {any} */ s) => s.name === "pr_review.step prepare");
   ok("every step and worker parents the root, in one deterministic trace",

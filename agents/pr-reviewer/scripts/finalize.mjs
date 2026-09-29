@@ -1074,6 +1074,14 @@ async function selfTest() {
     const both = buildAutoRunAnomaly({ capApplied: true, depthCapability: "diff-only", contextAnomalies: ["a", "b", "c"] });
     check("buildAutoRunAnomaly combines the cap note and the anomaly count when both apply",
       typeof both === "string" && both.includes("diff-only") && both.includes("3 prepare-time anomalies"));
+    // The trace records the topology that ran, not the one budgeted at prepare time.
+    check("a hybrid budget whose intent worker never delivered is recorded as in-context",
+      effectiveTopology({ budget: { topology: "hybrid" } }) === "in-context"
+        && effectiveTopology({ budget: { topology: "hybrid" }, dispatchUnavailable: true }) === "in-context");
+    check("a hybrid budget with a delivered intent worker stays hybrid; in-context stays in-context",
+      effectiveTopology({ budget: { topology: "hybrid" }, intentIsolated: true }) === "hybrid"
+        && effectiveTopology({ budget: { topology: "in-context" } }) === "in-context"
+        && effectiveTopology({}) === undefined);
     // A/B iteration 2: --no-dispatch renders dispatch-topology.md's line from the budget.
     const noDispatch = buildAutoRunAnomaly({ capApplied: false, contextAnomalies: [], noDispatchAt: 0.8 });
     check("the no-dispatch line names the intent finder it could not isolate, with the effective thoroughness",
@@ -1933,6 +1941,21 @@ async function selfTest() {
   console.log("\n✓ finalize self-test: all checks passed");
 }
 
+/**
+ * The topology this run actually ran, for the trace. prepare-review.mjs records the BUDGET's
+ * topology when the run begins, before anyone knows whether an intent worker will arrive: a
+ * `hybrid` budget whose intent finder never came back as its own worker (no caller dispatched
+ * one, or the reviewer held no dispatch tool) ran that finder in-context, and the trace said
+ * `hybrid` anyway.
+ * @param {any} context
+ * @returns {string|undefined}
+ */
+export function effectiveTopology(context) {
+  const budgeted = context?.budget?.topology;
+  if (budgeted === "hybrid" && context?.intentIsolated !== true) return "in-context";
+  return budgeted;
+}
+
 /** When this process started — the `finalize` step span's start (review-telemetry.mjs). */
 const PROCESS_START_NS = BigInt(Date.now()) * 1_000_000n;
 
@@ -1942,7 +1965,7 @@ const PROCESS_START_NS = BigInt(Date.now()) * 1_000_000n;
  * trace. A context with no ledger (built by an older prepare-review.mjs, or `--no-telemetry`)
  * records nothing. Never throws: telemetry never fails a review.
  * @param {string} contextPath @param {any} result @param {any} judgments
- * @param {{ dryRun: boolean, failed: boolean }} how
+ * @param {{ dryRun: boolean, failed: boolean, topology?: string }} how
  * @returns {Promise<string|null>} the run dir, when a ledger exists
  */
 async function recordFinalizeTelemetry(contextPath, result, judgments, how) {
@@ -1962,6 +1985,7 @@ async function recordFinalizeTelemetry(contextPath, result, judgments, how) {
         posted_inline: Array.isArray(result?.inline) ? result.inline.length : undefined,
         deferred: Array.isArray(result?.deferred) ? result.deferred.length : undefined,
         dry_run: how.dryRun,
+        topology: how.topology,
       },
     });
     // A failed render is a failed STEP, not a finished run: every A/B arm that hit one fixed its
@@ -2182,7 +2206,7 @@ async function main() {
     historical: context?.historical || null,
     isolated: Boolean(context?.isolated),
   });
-  const telemetryRunDir = await recordFinalizeTelemetry(/** @type {string} */ (opts.context), result, judgments, { dryRun: isDryRun, failed: renderFailed });
+  const telemetryRunDir = await recordFinalizeTelemetry(/** @type {string} */ (opts.context), result, judgments, { dryRun: isDryRun, failed: renderFailed, topology: effectiveTopology(context) });
   // execute-write-plan.mjs records the `post` step and exports the trace; this is how it finds
   // the ledger. Absent when no ledger exists.
   if (telemetryRunDir && !isDryRun) writePlan.telemetry_run_dir = telemetryRunDir;
