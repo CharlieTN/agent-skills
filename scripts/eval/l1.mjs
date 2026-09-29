@@ -9261,9 +9261,11 @@ const isPollBlock = (block) =>
     s.check("G81 the preamble requires write-to-path/return-path-only", /Return ONLY that path/.test(preamble));
     s.check("G81 Step 2's worker dispatch links the preamble section",
       text.includes("[worker preamble](#worker-preamble--the-intent-worker)"));
-    // D8: the worker reviews the same historical commit the reviewer does.
-    s.check("G81 the intent worker carries --review-sha through when the flags do",
-      /add\s+`--review-sha <sha> --isolated` when the pass-through flags carry `--review-sha`/.test(text));
+    // D8: the worker reviews the same historical commit the reviewer does — now through the one
+    // prepare the caller runs for both (G84r), so the flag rides on that prepare.
+    s.check("G81 the shared prepare carries --review-sha through when the flags do, so the intent worker reads the same commit",
+      /add\s+`--review-sha <sha> --isolated`\s+when the pass-through flags carry `--review-sha`/.test(text)
+        && /Run prepare once, forwarding only the pass-through flags it takes/.test(text));
   }
 
   const TOPO = join(REPO_ROOT, "agents/pr-reviewer/rules/dispatch-topology.md");
@@ -9923,8 +9925,8 @@ const isPollBlock = (block) =>
     (topo.stdout || topo.stderr || "").trim().slice(0, 200));
   s.check("G84n the hybrid path is wired end to end: the body grammar knows --intent-from, SKILL.md Step 2 sends the intent worker in the same message, dispatch-topology.md says how to wait for it",
     /\| `--intent-from <path>` \|/.test(body)
-      && /In \*\*one message\*\*, dispatch both/.test(sk) && sk.includes("--intent-from <that path>")
-      && /check every 20 seconds, for at most 10 minutes/.test(dt) && /The review never loses the finder itself/.test(dt));
+      && /[Ii]n \*\*one message\*\*, dispatch both/.test(sk) && sk.includes("--intent-from <dir>/intent/intent.json")
+      && /polling every 2\s+seconds, for at most 10 minutes in total/.test(dt) && /The review never loses the finder itself/.test(dt));
 
   // (2) votes retired, stated where the old ladder lived.
   s.check("G84n votes are retired in route-depth.mjs and dispatch-topology.md",
@@ -9974,7 +9976,7 @@ const isPollBlock = (block) =>
   s.check("G84o a hybrid run starts at the caller's dispatch stamp, with the definition read as a `load` step",
     /a dispatch stamp starts the run and the worker at the dispatch, and the first gap is `load`/.test(out)
       && /dispatchTime reads the \/pr-review directory suffix/.test(out)
-      && /date \+%s > <dir>\/dispatched_at/.test(skillTxt)
+      && /date \+%s > <dir>\/intent\/dispatched_at/.test(skillTxt)
       && /dispatchTime reads a ms, a seconds, and a BSD `%3N` stamp/.test(out)
       && /worker import with only the stamp and the output file still folds the worker in/.test(out));
   s.check("G84o per-step tool calls come from the model's running count, and run-telemetry.md asks for it on every marker",
@@ -10131,6 +10133,104 @@ const isPollBlock = (block) =>
   s.check("G84q route-depth.mjs agrees: in-context at 0.39, hybrid at 0.4, and intent is the only isolated finder",
     probe.status === 0 && (probe.stdout || "").trim() === JSON.stringify(["in-context", "hybrid", ["intent"]]),
     (probe.stdout || probe.stderr || "").trim().slice(0, 200));
+}
+
+// ── G84r: hybrid never leaves the reviewer idle waiting for the intent worker ──
+// On dash0hq/dash0#20655 the reviewer idled ~125 s before Step 2.5 waiting for the intent file,
+// and the worker had re-run the whole prepare-review.mjs (8–30 s of GitHub reads, a leaked
+// worktree) to get context the reviewer already had. Four fixes, each guarded against the code or
+// the owning rule: (1) the caller prepares ONCE and hands both agents the same context, and cleans
+// up the workspace it made; (2) it dispatches the worker only on a `hybrid` budget; (3) a small
+// incremental re-review is `in-context` (an UNMEASURED default, and the rule must say so); (4) the
+// reviewer reads the intent file only after verifying its own candidates, with a bounded wait that
+// the trace records as `intent_wait_ms`.
+{
+  const rd = (/** @type {string} */ p) => readFileSync(join(REPO_ROOT, p), "utf8");
+  const DT = rd("agents/pr-reviewer/rules/dispatch-topology.md");
+  const SK = rd("skills/quality/pr-review/SKILL.md");
+  const RL = rd("skills/quality/review-loop/SKILL.md");
+  const BODY = rd("agents/pr-reviewer.md");
+  const RTD = rd("agents/pr-reviewer/rules/run-telemetry.md");
+  const PRSRC = rd("agents/pr-reviewer/scripts/prepare-review.mjs");
+  const TELSRC = rd("agents/pr-reviewer/scripts/review-telemetry.mjs");
+  const flat = (/** @type {string} */ t) => t.replace(/\s+/g, " ");
+  const probe = (/** @type {string} */ code) => spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", cwd: REPO_ROOT });
+
+  // (3) the small-incremental default, executed.
+  const topo = probe(`import { resolveBudget } from "./agents/pr-reviewer/scripts/route-depth.mjs";
+    const b = (i) => { const r = resolveBudget(i); return r.topology + "/" + r.topologyReason; };
+    console.log(JSON.stringify([
+      b({ routedTier: "standard", runMode: "incremental" }), b({ routedTier: "quick", runMode: "incremental-quick" }), // quick's 0.2 is already below 0.4
+      b({ routedTier: "standard", runMode: "full" }), b({ routedTier: "deep", runMode: "incremental" }),
+      b({ routedTier: "standard", runMode: "incremental", thoroughness: 0.8 })]));`);
+  s.check("G84r resolveBudget: a small incremental re-review (standard/quick, defaulted thoroughness) is in-context; a full run, a deep tier, or an explicit thoroughness stays hybrid",
+    topo.status === 0 && (topo.stdout || "").trim() === JSON.stringify(["in-context/small-incremental", "in-context/below-breakpoint", "hybrid/hybrid", "hybrid/hybrid", "hybrid/hybrid"]),
+    (topo.stdout || topo.stderr || "").trim().slice(0, 300));
+  s.check("G84r prepare-review.mjs hands resolveBudget the context's run mode",
+    /const budget = resolveBudget\(\{\n\s+runMode: contextMode,/.test(PRSRC) && /mode: contextMode,/.test(PRSRC));
+  const smallRow = DT.split("\n").find((l) => l.startsWith("| `in-context` |") && l.includes("small-incremental")) || "";
+  s.check("G84r dispatch-topology.md's table carries the small-incremental row and says it is unmeasured, against a deep 22-file A/B",
+    /\*\*Unmeasured\.\*\*/.test(smallRow) && /deep, full, 22-file review/.test(smallRow) && /no A\/B round ran an incremental re-review/.test(smallRow));
+
+  // (1)+(2) one prepare, shared, gated on the budget, cleaned up by whoever ran it.
+  const step2 = (() => { const a = SK.indexOf("## Step 2: Dispatch the agent"), b = SK.indexOf("### Worker preamble"); return a === -1 || b === -1 ? "" : SK.slice(a, b); })();
+  const preamble = (SK.match(/### Worker preamble[\s\S]*?```text\n([\s\S]*?)```/) || ["", ""])[1];
+  const iPrep = step2.indexOf('prepare-review.mjs" --pr <PR_REF> --out <dir>/context.json');
+  const iHybrid = step2.indexOf("On `hybrid`, in **one message**, dispatch both");
+  s.check("G84r /pr-review runs prepare once, before any dispatch, and hands the reviewer --context",
+    iPrep !== -1 && iHybrid !== -1 && iPrep < iHybrid && step2.includes("--context <dir>/context.json --intent-from <dir>/intent/intent.json"));
+  s.check("G84r /pr-review dispatches the intent worker only on a hybrid budget, and the reviewer alone otherwise",
+    /jq -r '\.budget\.topology' <dir>\/context\.json/.test(step2) && /On `in-context`[^\n]*\n\s*`pr-reviewer` alone with `--context/.test(step2)
+      && !/--thoroughness`\s+below 0\.4/.test(step2));
+  s.check("G84r the intent worker never runs prepare, and the caller that ran it owns the cleanup",
+    /Do NOT run prepare-review\.mjs/.test(preamble) && step2.includes("It never runs `prepare-review.mjs`.")
+      && step2.includes('prepare-review.mjs" --cleanup <dir>/context.json') && /the cleanup is yours,\s+never the reviewer's/.test(step2)
+      && !/told to run `prepare-review\.mjs/.test(SK));
+  s.check("G84r the agent body knows --context and leaves that workspace's cleanup to the caller",
+    /\| `--context <path>` \| The caller already ran `prepare-review\.mjs`: skip it, read `<path>` as the context, and never clean up its workspace/.test(BODY));
+  s.check("G84r review-loop's named dispatch shares one prepare, gates the worker on hybrid, and cleans up",
+    RL.includes("--context <dir>/context.json --intent-from <dir>/intent/intent.json") && RL.includes("prepare-review.mjs --cleanup <dir>/context.json")
+      && RL.includes("when `context.budget.topology` is `hybrid`"));
+  const prSelf = spawnSync(process.execPath, [join(REPO_ROOT, "agents/pr-reviewer/scripts/prepare-review.mjs"), "--self-test"], { encoding: "utf8" });
+  const prOut = (prSelf.stdout || "") + (prSelf.stderr || "");
+  s.check("G84r prepare-review.mjs --cleanup removes a worktree through git, rm-rfs only a scratch dir, and leaves `none` (self-test)",
+    prSelf.status === 0 && /✓ cleanupWorkspace removes a worktree through git, leaving no \.git\/worktrees entry, and is idempotent/.test(prOut)
+      && /✓ cleanupWorkspace rm-rfs an rm-rung dir, leaves cleanup:none alone, and refuses a dir outside the scratch root/.test(prOut),
+    prOut.split("\n").filter((l) => /FAIL|THREW/.test(l)).join(" | ").slice(0, 300));
+
+  // (4) the late read, positionally: own verification first, the intent file after.
+  const run = (() => { const a = DT.indexOf("**Running `hybrid`.**"), b = DT.indexOf("## Reading a budget into dispatch"); return a === -1 || b === -1 ? "" : DT.slice(a, b); })();
+  const iOwn = run.indexOf("Step 2.6b verification of");
+  const iRead = run.indexOf("Only then read the intent finder's output file.");
+  const iOwnB = run.indexOf("then Step 2.5 and Step 2.6b over your own candidates");
+  const iWait = run.indexOf("Then wait for `<path>`");
+  s.check("G84r dispatch-topology.md reads the intent file only after Step 2.5 + 2.6b over the reviewer's own candidates, on both hybrid paths",
+    iOwn !== -1 && iRead > iOwn && iOwnB !== -1 && iWait > iOwnB
+      && !/Before Step 2\.5(?: consolidation)?, read/.test(DT) && flat(run).includes("verify only the intent candidates that remain"));
+  s.check("G84r the wait is bounded at 10 minutes in the code and the rule, and a timeout runs intent in-context loudly",
+    /export const WAIT_TOTAL_S = 600;/.test(TELSRC) && run.includes("--wait 540")
+      && run.includes("intent worker returned no readable candidates — ran intent in-context") && run.includes("On `intent: timed out`"));
+  s.check("G84r the agent body's --intent-from row reads the file after Step 2.6b, never before Step 2.5",
+    /\| `--intent-from <path>` \|[^\n]*only after verifying your own candidates at Step 2\.6b/.test(BODY) && !/merge `<path>`'s candidates before Step 2\.5/.test(BODY));
+
+  // (5) the wait is measurable.
+  const steps = probe(`import { modelSteps, STEPS } from "./agents/pr-reviewer/scripts/review-telemetry.mjs";
+    console.log(JSON.stringify([modelSteps({ tier: "deep", topology: "hybrid" }), "intent-verify" in STEPS]));`);
+  const [hyb, hasIV] = (() => { try { return JSON.parse((steps.stdout || "").trim()); } catch { return [[], false]; } })();
+  s.check("G84r modelSteps puts intent-wait after verify and before judgments, followed by intent-verify",
+    hasIV === true && hyb.indexOf("verify") !== -1 && hyb.indexOf("intent-wait") === hyb.indexOf("verify") + 1
+      && hyb.indexOf("intent-verify") === hyb.indexOf("intent-wait") + 1 && hyb.indexOf("judgments") > hyb.indexOf("intent-verify"),
+    (steps.stdout || steps.stderr || "").trim().slice(0, 200));
+  const telSelf = spawnSync(process.execPath, [join(REPO_ROOT, "agents/pr-reviewer/scripts/review-telemetry.mjs"), "--self-test"], { encoding: "utf8" });
+  const telOut = telSelf.stdout || "";
+  s.check("G84r review-telemetry.mjs --self-test proves the wait is recorded, accumulates, and times out at the bound",
+    telSelf.status === 0 && /✓ --wait on an output already there returns at once, prints `ready`, and records intent_wait_ms/.test(telOut)
+      && /✓ waitForOutput returns once the worker's file appears mid-wait/.test(telOut)
+      && /✓ the wait accumulates across calls and times out at --wait-total, never past it/.test(telOut)
+      && /✓ a dispatch after `prepare` names the gap holding it `load`/.test(telOut),
+    telOut.split("\n").filter((l) => l.includes("✗")).join(" | ").slice(0, 300));
+  s.check("G84r run-telemetry.md names intent_wait_ms and the late intent-wait / intent-verify steps",
+    RTD.includes("`pr_review.intent_wait_ms`") && /\| `intent-wait` \| hybrid only: after `verify`/.test(RTD) && /\| `intent-verify` \|/.test(RTD));
 }
 
 // ── G82: pr-reviewer.md size ratchet + the L2-read sections stay byte-identical to base (D15,
