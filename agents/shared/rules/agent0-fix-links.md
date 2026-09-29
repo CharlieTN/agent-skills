@@ -24,6 +24,14 @@ review config at all, or one that never mentions Agent0, gets the buttons pointe
 (§ Environment). The single way to turn them off repo-wide is to say so — `agent0_fix_links: false`
 in `.github/review.yaml` — and `--no-fix-links` turns them off for one run.
 
+**`finalize.mjs` builds them** (`agents/pr-reviewer/scripts/finalize/fix-links.mjs`), so the default
+needs nobody to remember a step. It resolves the table in § Opt-in from its own `--no-fix-links` /
+`--fix-links` and from the `agent0_*` keys `prepare-review.mjs` reads into `context.agent0`, and fills
+the **Fix this** and **Fix all** templates below from `reviewerLogin` and the prior sticky id. A caller
+supplies a link only for the CI-only variant, and a supplied link is never overwritten. The links used
+to be built by hand at two steps. A run that skipped that posted no buttons, and nothing reported it
+(`mthines/agent-skills#213`).
+
 The buttons were off unless a flag was passed, then on only where an `agent0_environment` was
 named, and both defaults cost the same thing: the affordance that turns a review into an action was
 absent from every run nobody had remembered to configure — including the runs a screenshot gets

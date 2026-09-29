@@ -471,7 +471,10 @@ while ITERATION < CAP:
         # <dispatch> is the harness's sub-agent dispatch tool — Task, Agent, or
         # another spelling; Step 0 resolved which one. pr-reviewer is an AGENT,
         # so never Skill("pr-reviewer").
-        # REVIEWER_ROUTE == "named": the call above, unchanged.
+        # REVIEWER_ROUTE == "named": the call above, sent the way /pr-review sends it —
+        # one prepare-review.mjs run here first (--context), the intent worker in the
+        # same message only on a hybrid budget, a dispatch stamp, --repo-dir when a
+        # local clone exists, and --cleanup after. See "Sub-step A — the named dispatch".
         # REVIEWER_ROUTE == "agent0" (Step 0 row 2, or row 4 after the install):
         # AGENT0 == 1 (rules/agent0-runtime.md): subagent_type="general" with the
         # short bundle-pointing prompt from that rule — never pr-reviewer, and
@@ -564,6 +567,28 @@ if STOP_REASON in ("cap-reached", "no-progress"):
         CI_STATE = read check state   # never report a state you have not read at head
     if unresolved_thread_count() > 0 or CI_STATE == "red":   # CI_STATE stays "unread" under --no-ci
         report: <STOP_REASON>; surface remaining blockers/flags AND any red check
+```
+
+### Sub-step A — the named dispatch
+
+On `REVIEWER_ROUTE == "named"`, dispatch `pr-reviewer` exactly as the `pr-review` skill's Step 2 does, and never as a bare single call.
+That step owns the procedure: load the `pr-review` skill and follow it, never restate it.
+It adds four things a bare `<dispatch>(subagent_type="pr-reviewer", …)` loses:
+
+1. **One prepare, shared, and cleaned up here.** This loop runs `prepare-review.mjs` once per iteration and hands the reviewer `--context`; the intent worker reads the same context instead of preparing its own. Having run prepare, the loop runs `prepare-review.mjs --cleanup` once the iteration's dispatches return.
+2. **The intent worker, in the same message, when `context.budget.topology` is `hybrid`.** The dispatched reviewer holds no dispatch tool, so a bare call runs a `hybrid` budget's intent finder in-context — the setting A/B rounds 7–8 measured missing the highest-severity defect. A re-review that routes `standard` or `quick` is `in-context` and sends the reviewer alone.
+3. **A dispatch record and stamp** (`review-telemetry.mjs dispatch`, and `dispatched_at` in the intent dir). The time the agent spends loading its definition is then a `load` step instead of an unexplained gap after `prepare`.
+4. **`--repo-dir <path>`, when a local clone of the PR's repository exists** and this session's cwd is not one — this loop is often run from another checkout. Pass the clone's path (the session's own checkout when its `origin` is the PR's repo, or a clone the user named). Without it, the reviewer's workspace rung 0 is skipped and it clones over the network; one observed run fell through to a failed tarball and restarted.
+
+```text
+# RIGHT — one message, both dispatches, as /pr-review Step 2 sends them
+prepare-review.mjs --pr <PR-URL> --repo-dir <clone> --out <dir>/context.json → budget.topology == "hybrid"
+<dispatch>(subagent_type="pr-reviewer", prompt="<PR-URL> --context <dir>/context.json --intent-from <dir>/intent/intent.json --repo-dir <clone>")
+<dispatch>(subagent_type="general-purpose", prompt="<worker preamble> … read <dir>/context.json … act as the intent finder … write <dir>/intent/intent.json")
+prepare-review.mjs --cleanup <dir>/context.json
+
+# WRONG — a bare call: intent runs in-context, no load step, no local clone
+<dispatch>(subagent_type="pr-reviewer", prompt="<PR-URL>")
 ```
 
 ### Sub-step A — external-review mode
