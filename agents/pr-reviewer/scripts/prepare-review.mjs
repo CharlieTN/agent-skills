@@ -2610,7 +2610,9 @@ async function selfTest() {
     return r.ok === false && r.timedOut === true;
   });
   t("run(): a process that exits non-zero on its own (no kill) is NOT reported as a timeout", async () => {
-    const r = await run("node", ["-e", "process.exit(3)"], { timeoutMs: 5000 });
+    // A generous budget: this asserts a NON-kill, and a node cold start on a host whose endpoint
+    // agent scans each spawn (NODE_USE_SYSTEM_CA) measured ~5 s, which a 5 s budget read as a timeout.
+    const r = await run("node", ["-e", "process.exit(3)"], { timeoutMs: 30000 });
     return r.ok === false && r.timedOut === false && r.code === 3;
   });
   t("describeFailure(): a timed-out result reports 'timed out after Ns', never empty stderr", () => {
