@@ -321,7 +321,6 @@ export function compareShadow(judgments, proseDispositions, explained, context) 
 /** @param {any} c */
 function fpOf(c) {
   try {
-    // eslint-disable-next-line no-unused-vars
     return `${c.finder}:${c.defect_class}:${c.symbol || "-"}@${c.path}`;
   } catch {
     return `${c.path}:${c.line}`;
