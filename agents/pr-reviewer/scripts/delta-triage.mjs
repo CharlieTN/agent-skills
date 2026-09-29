@@ -143,7 +143,8 @@ export function authoredPrPaths(touched, prFiles, prFilesComplete) {
 /**
  * `git diff --numstat` + `--name-status` + the patch text (all `--no-renames`) → the PR-files row
  * shape `{filename, status, additions, deletions, patch}`. `patch` starts at the first `@@`, like
- * the API's; a binary file (`-` counts, no hunk) gets 0/0 and a null patch.
+ * the API's; a binary file (`-` counts, no hunk) gets 0/0 and a null patch. The patch must come from
+ * a diff run with `a/`/`b/` prefixes (the caller forces them over `diff.noprefix`).
  * @param {string} numstat @param {string} nameStatus @param {string} patch @returns {PrFile[]}
  */
 export function parseLocalDiff(numstat, nameStatus, patch) {
@@ -158,7 +159,8 @@ export function parseLocalDiff(numstat, nameStatus, patch) {
   /** @type {Map<string, string>} */
   const patchOf = new Map();
   for (const chunk of String(patch || "").split(/^(?=diff --git )/m)) {
-    const path = /^\+\+\+ b\/(.+)$/m.exec(chunk)?.[1] ?? /^--- a\/(.+)$/m.exec(chunk)?.[1];
+    // git appends a TAB to a ---/+++ header whose path contains a space; the path ends before it.
+    const path = /^\+\+\+ b\/(.+?)\t?$/m.exec(chunk)?.[1] ?? /^--- a\/(.+?)\t?$/m.exec(chunk)?.[1];
     const at = chunk.search(/^@@/m);
     if (path && at >= 0) patchOf.set(path, chunk.slice(at).replace(/\n$/, ""));
   }
@@ -374,6 +376,12 @@ async function selfTest() {
       && (rows[0].patch || "").startsWith("@@ -1,1 +1,3 @@") && rows[1].patch === null && rows[1].additions === 0
       && rows[2].status === "added" && (rows[2].patch || "").startsWith("@@ -0,0 +1,5 @@") && deltaCounts(rows).deltaLines === 9,
     JSON.stringify(rows));
+  // PR #213 (Less certain): a path with a space gets a TAB after its `+++ b/` header, which the
+  // header regex swallowed into the key, so the row's patch came back null.
+  const spaced = parseLocalDiff("1\t0\tsrc/my file.ts\n", "A\tsrc/my file.ts\n",
+    "diff --git a/src/my file.ts b/src/my file.ts\nnew file mode 100644\n--- /dev/null\n+++ b/src/my file.ts\t\n@@ -0,0 +1 @@\n+x\n");
+  ok("parseLocalDiff attaches the patch to a path containing a space (header ends in a TAB)",
+    spaced.length === 1 && (spaced[0].patch || "").startsWith("@@ -0,0 +1 @@"), JSON.stringify(spaced));
   ok("prFilesCompleteness flags a short list and a partial parse, passes a full one",
     prFilesCompleteness(30, 45, null).complete === false && prFilesCompleteness(45, 45, null).complete === true
       && prFilesCompleteness(45, 45, "1 unparseable line(s)").complete === false && prFilesCompleteness(10, undefined, null).complete === true);

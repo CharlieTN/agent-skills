@@ -938,7 +938,10 @@ export async function localAuthoredDelta({ dirs, from, to, baseSha, prFiles, prF
     }
     const paths = authoredPrPaths(touched, prFiles, prFilesComplete);
     if (!paths.length) return { ok: true, files: [], dir };
-    const base = ["diff", "--no-color", "--no-ext-diff", "--no-renames"];
+    // Fixed a/ and b/ prefixes and repo-root paths whatever the user's config says (diff.noprefix,
+    // diff.mnemonicPrefix, diff.relative): parseLocalDiff keys each patch on its `+++ b/` header.
+    const base = ["-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.relative=false",
+      "diff", "--no-color", "--no-ext-diff", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/"];
     const [numstat, nameStatus, patch] = await Promise.all([
       g([...base, "--numstat", from, to, "--", ...paths]),
       g([...base, "--name-status", from, to, "--", ...paths]),
@@ -2365,6 +2368,25 @@ async function selfTest() {
     rmSync(dir, { recursive: true, force: true });
     return r.ok && JSON.stringify(names) === JSON.stringify(["mine.ts", "sibling.ts", "teammate.ts"])
       && JSON.stringify(onlyNames) === JSON.stringify(["sibling.ts", "teammate.ts"]);
+  });
+  // PR #213 (Less certain): `diff.noprefix` in the user's config dropped the `b/` the patch parser
+  // keys on, and a space in a path put a TAB after the header — either way the row's patch was null.
+  t("localAuthoredDelta: patches survive diff.noprefix and a path with a space (real git repo)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "prr-noprefix-"));
+    /** @param {string[]} a */
+    const g = (a) => run("git", ["-C", dir, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...a]);
+    await g(["init", "-q", "-b", "main"]);
+    writeFileSync(join(dir, "base.ts"), "b\n"); await g(["add", "-A"]); await g(["commit", "-qm", "base"]);
+    await g(["config", "diff.noprefix", "true"]);
+    await g(["checkout", "-qb", "feat"]);
+    const prior = (await g(["rev-parse", "HEAD"])).stdout.trim();
+    writeFileSync(join(dir, "my file.ts"), "x\n"); writeFileSync(join(dir, "plain.ts"), "y\n");
+    await g(["add", "-A"]); await g(["commit", "-qm", "feat"]);
+    const head = (await g(["rev-parse", "HEAD"])).stdout.trim();
+    const prFiles = [{ filename: "my file.ts" }, { filename: "plain.ts" }];
+    const r = await localAuthoredDelta({ dirs: [dir], from: prior, to: head, baseSha: prior, prFiles, prFilesComplete: true });
+    rmSync(dir, { recursive: true, force: true });
+    return r.ok && r.files.length === 2 && r.files.every((f) => String(f.patch).startsWith("@@ -0,0 +1 @@"));
   });
   // PR #213 r4134280286: `--remerge-diff` on an octopus merge warns on stderr, lists nothing, and
   // exits 0 — so a hand edit made inside the octopus merge vanished instead of reaching `--cc`.
