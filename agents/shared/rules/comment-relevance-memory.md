@@ -389,8 +389,8 @@ must not produce a drop, downgrade, or promote; treat it as absent rather than g
 preview.
 
 **Budget.** A caller that bounds its memory reads should give this fetch the larger share. In
-`pr-reviewer` the two read sites draw on one shared `MEMORY_READ_BUDGET`: Step 1.2d (lesson bodies)
-may spend at most half of it, and this fetch may spend the whole remainder, including anything 1.2d
+`pr-reviewer` three read sites draw on one shared `MEMORY_READ_BUDGET`: Step 1.2a (knowledge
+expansions, ≤ 5) spends first, Step 1.2d (lesson bodies) may spend at most half of it, and this fetch may spend the whole remainder, including anything 1.2d
 left unused. The asymmetry is deliberate — a missing relevance verdict changes what gets POSTED,
 while a missing lesson only changes emphasis. When the pool is exhausted, the unfetched entries are
 simply absent, per the rule above.

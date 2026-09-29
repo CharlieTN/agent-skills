@@ -132,7 +132,7 @@ Relevance rules are **not** read here. They have their own tag-filtered pair of 
 **Call 1 is summary-only, and matched keys are expanded.**
 A full page of 50 knowledge records was about 101 KB on dash0#20655, which overflowed the tool output and left the model paging through a saved file for records the diff mostly does not touch.
 `view="summary"` returns each key with a 200-character preview, and a key is the match: `knowledge::<symbol>@<path>` and `hotspot::<path>` name exactly what the match table below looks up.
-Expand a matched key with `mcp__lorekit__memory_read` only when call 2 did not already return its full value, at most **5** per run, highest `blast_radius` first.
+Expand a matched key with `mcp__lorekit__memory_read` only when call 2 did not already return its full value, at most **5** per run, highest `blast_radius` first. Those reads are drawn from the agent's shared `MEMORY_READ_BUDGET` pool (spent first, before Step 1.2d), never an extra allowance.
 
 ```text
 # correct: the page is keys; only what matches the impact graph is read in full
@@ -152,7 +152,7 @@ On a repo whose `repo::` scope exceeds the `memory_list` page, the search is wha
 
 | Rule | Value |
 | --- | --- |
-| calls per run | exactly **2** — the `memory_list` above and the `memory_search` above — plus at most **5** `memory_read` expansions |
+| calls per run | exactly **2** — the `memory_list` above and the `memory_search` above — plus at most **5** `memory_read` expansions from the shared `MEMORY_READ_BUDGET` pool |
 | `memory_list` page | `limit=50`, **one page** |
 | `memory_search` page | `limit=25`, **one page** |
 | symbols in the search query | the **top 10** changed symbols by `blast_radius`, from `impact.json` |
