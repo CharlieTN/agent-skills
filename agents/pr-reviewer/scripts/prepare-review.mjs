@@ -918,8 +918,22 @@ export async function localAuthoredDelta({ dirs, from, to, baseSha, prFiles, prF
     /** @param {string[]} args */
     const g = (args) => run("git", ["-C", dir, "-c", "core.quotePath=false", "--literal-pathspecs", ...args], { timeoutMs });
     const have = async (/** @type {string} */ sha) => (await g(["cat-file", "-e", `${sha}^{commit}`])).ok;
-    if (!(await have(from)) || !(await have(to))) { lastReason = `${from.slice(0, 7)} or ${to.slice(0, 7)} not in ${dir}'s object store`; continue; }
-    if (!(await have(baseSha))) { lastReason = `base ${baseSha.slice(0, 7)} not in ${dir}'s object store`; continue; }
+    // PR #213 r4134545772: no workspace rung fetches the base tip (rung 0 fetches only
+    // pull/<n>/head, rung 1 is head-only, --repo-dir fetches nothing), so once main moves the
+    // PR's baseRefOid — and an old prior SHA — are usually absent. Fetch a missing one by SHA
+    // from origin, once; a successful fetch is silent, a failed one is the reason returned.
+    /** @param {string} sha @returns {Promise<string|null>} null when present, else why not */
+    const haveOrFetch = async (sha) => {
+      if (await have(sha)) return null;
+      const f = await run("git", [...GIT_CREDENTIAL_ARGS, "-C", dir, "fetch", "-q", "--no-tags", "origin", sha], { timeoutMs, env: GIT_NONINTERACTIVE_ENV });
+      if (f.ok && (await have(sha))) return null;
+      return `not in ${dir}'s object store and fetching it from origin failed (${f.ok ? "fetched, still absent" : describeFailure(f, timeoutMs)})`;
+    };
+    if (!(await have(to))) { lastReason = `${to.slice(0, 7)} not in ${dir}'s object store`; continue; }
+    const fromMiss = await haveOrFetch(from);
+    if (fromMiss) { lastReason = `${from.slice(0, 7)} ${fromMiss}`; continue; }
+    const baseMiss = await haveOrFetch(baseSha);
+    if (baseMiss) { lastReason = `base ${baseSha.slice(0, 7)} ${baseMiss}`; continue; }
     if (!(await g(["merge-base", "--is-ancestor", from, to])).ok) { lastReason = `${from.slice(0, 7)} is not an ancestor of ${to.slice(0, 7)} in ${dir}`; continue; }
     const range = [`${from}..${to}`, "--not", baseSha];
     const own = await g(["log", "--no-merges", "--no-renames", "--format=", "--name-only", ...range]);
@@ -2423,6 +2437,44 @@ async function selfTest() {
     const names = r.ok ? r.files.map((f) => f.filename).sort() : [];
     rmSync(dir, { recursive: true, force: true });
     return parents === 3 && r.ok && JSON.stringify(names) === JSON.stringify(["evil.ts", "t1.ts", "t2.ts"]);
+  });
+  // PR #213 r4134545772: the base tip is fetched by nothing upstream, so once origin's main moves
+  // past the local clone the local-git route must fetch it by SHA — or fall through, saying why.
+  t("localAuthoredDelta: fetches a base SHA the clone lacks after origin's main moves (real origin + clone)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "prr-fetch-base-"));
+    const origin = join(root, "origin"), clone = join(root, "clone"), dead = join(root, "dead");
+    /** @param {string} d @param {string[]} a */
+    const g = (d, a) => run("git", ["-C", d, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...a]);
+    /** @param {string} f @param {string} body @param {string} msg */
+    const commit = async (f, body, msg) => { writeFileSync(join(origin, f), body); await g(origin, ["add", "-A"]); await g(origin, ["commit", "-qm", msg]); };
+    const sha = async (/** @type {string} */ ref) => (await g(origin, ["rev-parse", ref])).stdout.trim();
+    mkdirSync(origin);
+    await g(origin, ["init", "-q", "-b", "main"]);
+    await commit("base.ts", "b\n", "base");
+    await g(origin, ["checkout", "-qb", "feat"]);
+    await commit("mine.ts", "m\n", "mine");
+    const prior = await sha("HEAD");
+    await commit("mine.ts", "m\nm2\n", "mine 2");
+    const head = await sha("HEAD");
+    for (const d of [clone, dead]) await g(root, ["clone", "-q", "--no-local", origin, d]);
+    await g(dead, ["remote", "set-url", "origin", join(root, "no-such-remote")]);
+    await g(origin, ["checkout", "-q", "main"]);
+    await commit("main-only.ts", "x\n", "main moves after the clone");
+    const baseSha = await sha("main");
+    const absentBefore = !(await g(clone, ["cat-file", "-e", `${baseSha}^{commit}`])).ok;
+    const prFiles = [{ filename: "mine.ts", sha: "x" }];
+    const r = await localAuthoredDelta({ dirs: [clone], from: prior, to: head, baseSha, prFiles, prFilesComplete: true });
+    const names = r.ok ? r.files.map((f) => f.filename) : [];
+    const deadRead = () => localAuthoredDelta({ dirs: [dead], from: prior, to: head, baseSha, prFiles, prFilesComplete: true });
+    const failed = await deadRead();
+    const fellThrough = await resolveIntactDelta({
+      compareFiles: [{ filename: "mine.ts", patch: "@@ -1 +1 @@\n+m" }, { filename: "main-only.ts", patch: "@@ -0,0 +1 @@\n+x" }],
+      prFiles, readLocal: deadRead, readPriorTree: async () => ({ ok: false, reason: "no tree" }),
+    });
+    rmSync(root, { recursive: true, force: true });
+    return absentBefore && r.ok && JSON.stringify(names) === JSON.stringify(["mine.ts"])
+      && failed.ok === false && /^base [0-9a-f]{7} not in .* fetching it from origin failed \(/.test(failed.reason)
+      && fellThrough.route === "full-pr" && /fetching it from origin failed/.test(String(fellThrough.anomaly));
   });
   t("Gate 4 over the resolved delta flags nothing in a merged-in base file", async () => {
     const secret = { filename: "main/test/fixture.test.ts", patch: "@@ -1,0 +1,1 @@\n+const password = \"hunter2hunter2hunter2\";" };
