@@ -572,10 +572,16 @@ export function finalizeReview({ context, judgments, profile = "balanced", flatO
 
   const tier = context?.routing?.tier;
   const depth = context?.workspace?.depthCapability || context?.depthCapability;
+  // prepare-review.mjs emits the prior SHA NESTED, as `context.priorRun.priorSha` (full 40-char);
+  // reading only the top-level `context.priorSha` (the AC-11 fixtures' shape, kept as the fallback)
+  // left RUN.prior_sha unset on every real incremental re-review, and render-report.mjs failed
+  // closed with "RUN.prior_sha is required when RUN.mode is incremental" (mthines/agent-skills#213).
+  // Normalised through sha7() like runSha, since the renderer requires exactly 7 lowercase hex.
+  const priorShaRaw = context?.priorSha ?? context?.priorRun?.priorSha;
   const run = {
     mode: context?.mode || "unknown",
     sha: runSha,
-    ...(context?.priorSha ? { prior_sha: context.priorSha } : {}),
+    ...(priorShaRaw ? { prior_sha: sha7(priorShaRaw) } : {}),
     // A SEVENTH field-bridging gap, the same class as headSha above and found the same way (a real
     // prepare-review.mjs context, not a hand-crafted fixture): prepare-review.mjs's context carries
     // this as `deltaLines` (camelCase — see prepare-review.mjs's own context object and CLI summary
@@ -1822,6 +1828,27 @@ async function selfTest() {
       const cfgOff = spawnFx("cfg-off", []);
       check("agent0_fix_links: false in the review config builds neither placement",
         cfgOff.status === 0 && !cfgOff.report.includes("goto/agent0"));
+    }
+
+    // An incremental re-review with a prepare-review-SHAPED context: the prior SHA lives only at
+    // `priorRun.priorSha` (full 40-char), never at a top-level `priorSha`. Before the fix the
+    // renderer failed closed on a missing RUN.prior_sha and no report rendered (#213).
+    {
+      const incDir = join(e2eDir, "incremental-nested-prior");
+      rmSync(incDir, { recursive: true, force: true });
+      mkdirSync(incDir, { recursive: true });
+      const incContextPath = join(incDir, "context.json");
+      writeFileSync(incContextPath, JSON.stringify({
+        ...e2eContext, mode: "incremental", routing: { tier: "standard" },
+        priorRun: { ...e2eContext.priorRun, priorSha: "1A2B3C4D5E6F7a8b9c0d1e2f3a4b5c6d7e8f9a0b" },
+      }, null, 2));
+      const ri = spawnSync(process.execPath, [join(HERE, "finalize.mjs"), "--context", incContextPath,
+        "--judgments", judgmentsPath, "--out-dir", join(incDir, "out"), "--dry-run"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+      const incReport = existsSync(join(incDir, "out", "report-body.md")) ? readFileSync(join(incDir, "out", "report-body.md"), "utf8") : "";
+      check("incremental context with priorRun.priorSha only (prepare-review's shape) exits 0 and renders report-body.md",
+        ri.status === 0 && incReport.length > 0, (ri.stderr || "").trim().slice(0, 300));
+      check("the nested 40-char prior sha reaches the report as its sha7 form",
+        incReport.includes("delta since `1a2b3c4`"));
     }
 
     // D8/D9 (plan feat/pr-reviewer-shrink-fanout-ab, AC-17): a HISTORICAL context.json (the
