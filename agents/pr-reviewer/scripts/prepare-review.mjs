@@ -214,15 +214,6 @@ export function priorShaFromBody(body) {
 }
 
 /**
- * Find the sticky report among the issue comments.
- *
- * Matched by MARKER ONLY, never by author login. The marker is the identity;
- * `ME` is unavailable on every access path where `/user` 401s, and a
- * login-keyed filter there silently matches nothing — after which every run
- * creates a fresh report instead of rewriting the one that exists.
- * `last` is defensive: there must only ever be one.
- */
-/**
  * The jq projection the issue-comments fetch applies. It flattens the author to a STRING
  * (`user: .user.login`), so a matched sticky carries `user: "<login>"`, not `user: { login }`.
  * Exported so the self-test builds its fixtures from the same projection the fetch uses.
@@ -243,6 +234,15 @@ export function stickyAuthorLogin(sticky) {
   return u?.login ?? null;
 }
 
+/**
+ * Find the sticky report among the issue comments.
+ *
+ * Matched by MARKER ONLY, never by author login. The marker is the identity;
+ * `ME` is unavailable on every access path where `/user` 401s, and a
+ * login-keyed filter there silently matches nothing — after which every run
+ * creates a fresh report instead of rewriting the one that exists.
+ * `last` is defensive: there must only ever be one.
+ */
 export function findSticky(comments) {
   const hits = (comments || []).filter((c) => String(c.body || "").includes(REPORT_MARKER));
   if (hits.length) return { ...hits[hits.length - 1], kind: "report", duplicates: hits.length - 1 };
