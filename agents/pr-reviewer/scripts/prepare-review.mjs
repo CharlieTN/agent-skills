@@ -51,7 +51,7 @@ import { tmpdir } from "node:os";
 import { join, dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Timing, beginRun, appendRecord, hostFacts, ledgerPath, markerCommand, modelSteps } from "./review-telemetry.mjs";
-import { classifyDivergence, blobDelta, deltaCounts, churnState, FULL_REFRESH_DELTA } from "./delta-triage.mjs";
+import { classifyDivergence, blobDelta, deltaCounts, churnState, restrictToPrFiles, prChurnLines, FULL_REFRESH_DELTA } from "./delta-triage.mjs";
 import { routeDepth, resolveBudget } from "./route-depth.mjs";
 import { buildReviewPacket, consumersByFile } from "./review-packet.mjs";
 import { discoverStandards, trivialSkip } from "./discover-standards.mjs";
@@ -874,7 +874,8 @@ const CLONE_TIMEOUT_FLOOR_MS = 300000;
  */
 /** Both compare reads' jq: the divergence fields plus what an intact range needs, in one call. */
 const DELTA_COMPARE_JQ = "{status, ahead_by, behind_by, files: [(.files // [])[] | {filename, additions, deletions, status, patch}]}";
-const CHURN_COMPARE_JQ = "{status, behind_by, lines: ([(.files // [])[] | .additions + .deletions] | add // 0)}";
+/** Per-file lines, not a pre-summed total: only the PR's own files may count toward D4 (prChurnLines). */
+const CHURN_COMPARE_JQ = "{status, behind_by, files: [(.files // [])[] | {filename, lines: (.additions + .deletions)}]}";
 
 /** One `compare/<from>...<to>` read that returns the divergence fields and the file data together.
  *  A range too large to return with files still has to classify, so a failed combined read falls
@@ -1542,7 +1543,12 @@ async function prepare(opts) {
       const divergence = classifyDivergence(cmp.value);
       if (divergence === "intact") {
         if (Array.isArray(cmp.value.files)) {
-          deltaFiles = cmp.value.files;
+          // An intact range is not proof the files are the PR's own: a head that merges the base
+          // in stays `ahead` while sweeping in the base's files. Filter rather than switch to the
+          // blob diff — the compare's per-file counts are the delta's, the blob route's are the PR's.
+          const own = restrictToPrFiles(cmp.value.files, files);
+          deltaFiles = own.files;
+          if (own.note) anomalies.push(own.note);
         } else {
           anomalies.push(`delta compare fetch failed: ${cmp.filesError} — falling back to full-PR delta`);
         }
@@ -1593,7 +1599,7 @@ async function prepare(opts) {
       if (cum.ok) {
         let cumLines = 0;
         if (classifyDivergence(cum.value) === "intact") {
-          cumLines = cum.value.lines === undefined ? FULL_REFRESH_DELTA + 1 : Number(cum.value.lines) || 0;
+          cumLines = Array.isArray(cum.value.files) ? prChurnLines(cum.value.files, files) : FULL_REFRESH_DELTA + 1;
         }
         cumDeltaLines = churnState({ hasLastFull: true, meta: cum.value, deltaLinesIfIntact: cumLines });
       } else {
@@ -1739,7 +1745,9 @@ async function prepare(opts) {
     filesPath: prFilesPath,
     diffablePaths: diffable,
     undiffablePaths: undiffable,
-    deltaLines: deltaLines(files),
+    // The delta's own count on an incremental run (what RUN.delta_lines renders as "N lines in
+    // delta"); the full-PR count otherwise — deltaCountsResult is initialised to it.
+    deltaLines: deltaCountsResult.deltaLines,
 
     checks: { raw: checksR.ok ? checksR.stdout.trim() : null, readable: checksR.ok },
     reviews: reviewsR.value || [],
@@ -2167,6 +2175,18 @@ async function selfTest() {
     const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
     const body = src.slice(src.indexOf("async function prepare("), src.indexOf("function selfTest("));
     return /historicalThreads\(\{/.test(body) && /threads_created_as_of/.test(body);
+  });
+  // ── dash0#20655: a head that merges the base in keeps compare/PRIOR...HEAD `ahead`, so the
+  // intact route swept main's files into the delta (routing D4/D7-D9/D12/D13, and Gate 4
+  // secret pre-candidates in main's test files). Both compares are restricted to the PR's diff. ──
+  t("prepare() restricts the intact delta and the churn compare to the PR's own files, and reports the delta count", () => {
+    const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
+    const body = src.slice(src.indexOf("async function prepare("), src.indexOf("function selfTest("));
+    return /deltaFiles = restrictToPrFiles\(cmp\.value\.files, files\)\.files|const own = restrictToPrFiles\(cmp\.value\.files, files\);\s*deltaFiles = own\.files;/.test(body)
+      && /anomalies\.push\(own\.note\)/.test(body)
+      && /prChurnLines\(cum\.value\.files, files\)/.test(body)
+      && /\n    deltaLines: deltaCountsResult\.deltaLines,\n\n    checks:/.test(body)
+      && /files: \[\(\.files \/\/ \[\]\)\[\] \| \{filename, lines/.test(CHURN_COMPARE_JQ);
   });
   t("buildThreads: carries the root comment's createdAt as created_at (the as-of filter's key)", () => {
     const out = buildThreads([{ id: "T", comments: { nodes: [{ databaseId: 1, createdAt: "2026-01-01T00:00:00Z" }] } }]);

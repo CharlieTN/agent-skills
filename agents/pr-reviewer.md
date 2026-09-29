@@ -1278,14 +1278,14 @@ Two halves with different scopes, and confusing them is how a `full` run ends up
 divergence pre-check, the delta shape classification, the cumulative-churn state (via
 `delta-triage.mjs`'s `churnState()`), and `routeDepth()` (`route-depth.mjs`) internally, binding the
 result on `context.routing` (`{tier, triggers, override, sizeExcluded, capApplied, why}`) and
-`context.deltaLines` / `context.shape`. The manual contract below is the fallback and the literal
-spec those functions implement.
+`context.deltaLines` (the delta's count on an incremental run) / `context.shape`. The manual
+contract below is the fallback those functions implement.
 
 #### Divergence pre-check — never trust `compare/<PRIOR>...<HEAD>` blind
 
-`compare/PRIOR_SHA...HEAD_SHA` is an authored delta only while branch history is intact. A rebase,
-force-push, or merge-commit head sweeps in unrelated base noise (observed: 300 files on a 1-commit
-change) — routine, not exceptional. Fetch the **summary fields first, never the full body**:
+`compare/PRIOR_SHA...HEAD_SHA` is an authored delta only while history is intact. A rebase or
+force-push sweeps in base noise (observed: 300 files on a 1-commit change). Fetch the **summary
+fields first, never the full body**:
 
 ```bash
 COMPARE_META=$(gh api repos/$RESOLVED_REPO/compare/$PRIOR_SHA...$HEAD_SHA \
@@ -1309,6 +1309,10 @@ jq '.files' <<< "$DELTA_JSON" > /tmp/pr-delta.json
 DELTA_SOURCE="compare"
 ```
 
+Then drop every row whose `filename` is absent from `/tmp/pr-files.json`, recount, and note the
+drop: a head that merges the base in stays `ahead` yet carries the base's files. The churn compare
+gets the same restriction (`restrictToPrFiles()` / `prChurnLines()`).
+
 **Diverged history** (anything else) — substitute the rebase-immune **blob-SHA authored delta**:
 
 ```bash
@@ -1328,14 +1332,14 @@ NEW_FILES=$(jq '[.[] | select(.status == "added")] | length' /tmp/pr-delta.json)
 DELTA_SOURCE="blob-diff (compare $COMPARE_STATUS, behind_by $BEHIND_BY)"
 ```
 
-Deliberate consequence: per-file line counts come from the PR-level patch, so `DELTA_LINES`
-over-counts toward `full` — the safe direction. A **zero authored delta** means the push was a
-rebase/amend/base-merge with no authored change; take the zero-delta short-circuit below. The
-pipeline is non-deterministic across passes, so a finding on unchanged code in a later run is
-expected and not a duplicate — **never write "expect no new findings" into any dispatch**.
+Per-file counts come from the PR-level patch, so `DELTA_LINES` over-counts toward `full` — the
+safe direction. A **zero authored delta** means the push was a
+rebase/amend/base-merge with no authored change; take the zero-delta short-circuit below. Passes
+are non-deterministic, so a finding on unchanged code later is not a duplicate — **never write
+"expect no new findings" into any dispatch**.
 
-If `/tmp/pr-files.json` rows are missing `sha`, or the tree read is truncated, upgrade
-`RUN_MODE = "full"` and announce why — never trust the diverged compare.
+If `/tmp/pr-files.json` rows lack `sha`, or the tree read is truncated, upgrade `RUN_MODE = "full"`
+and say why — never trust the diverged compare.
 
 #### Delta shape classification
 
@@ -1344,19 +1348,17 @@ DELTA_SHAPE_JSON=$(node "$CLASSIFY" /tmp/pr-delta.json $EXTRA_HS)
 ```
 
 Bind `DELTA_SHAPES`, `DELTA_RISKY_SHAPES`, `HIGH_STAKES_FILES` (`.high_stakes_files`), and
-`DELTA_PROPAGATION`. On failure, degrade as Step 1.2 does, and treat `HIGH_STAKES_FILES` as unknown
-(upgrades to `full` below — the safe direction).
+`DELTA_PROPAGATION`. On failure, degrade as Step 1.2 does; an unknown `HIGH_STAKES_FILES` upgrades
+to `full` (the safe direction).
 
 #### Cumulative churn since the last full pass
 
 `FULL_REFRESH_DELTA` (150) and `FULL_REFRESH_RUNS` (3) are owned by the scripts, not restated here —
 `delta-triage.mjs` and `route-depth.mjs` export them, and `route-depth.mjs`'s self-test asserts both
 against `depth-routing.md`'s stated numbers. `prepare-review.mjs` computes `CUM_DELTA_LINES` via
-`churnState()` automatically, applying the same divergence rule as above (a non-`ahead` cumulative
-compare reads as **over** the threshold, never a guessed authored-line count), and feeds it into
-`routeDepth()`. Manual fallback only: read the constants from the scripts rather than hardcoding
-them, then apply `churnState()`'s own rule to `LAST_FULL_SHA`/`HEAD_SHA`'s compare summary to bind
-`CUM_DELTA_LINES`.
+`churnState()` with the same divergence rule as above (a non-`ahead` cumulative compare reads as
+**over** the threshold, never guessed) and feeds it into `routeDepth()`. Manual fallback: read the
+constants from the scripts and apply `churnState()`'s rule to the `LAST_FULL_SHA` compare.
 
 **Upgrade rules — any one condition forces `RUN_MODE = "full"`:**
 - `DELTA_LINES > 100`

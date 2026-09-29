@@ -65,6 +65,42 @@ export function deltaCounts(files) {
   return { deltaLines, newFiles };
 }
 
+/**
+ * Restrict an intact compare's file list to the PR's own diff (`pulls/{n}/files`, i.e.
+ * base...head). An intact range (`ahead`, `behind_by` 0) is NOT proof that every file in it is
+ * authored by the PR: a head that merges the base branch in keeps PRIOR an ancestor of HEAD, so
+ * `compare/PRIOR...HEAD` stays `ahead` while carrying every file the merged-in base commits
+ * touched (dash0#20655: 1355 lines, CODEOWNERS.bak and gradle files, against 97 authored ones).
+ * Those files are not in the PR's own diff, so they are dropped here and reported, never routed on.
+ * @param {PrFile[]} compareFiles @param {PrFile[]} prFiles
+ * @returns {{files: PrFile[], dropped: string[], note: string|null}}
+ */
+export function restrictToPrFiles(compareFiles, prFiles) {
+  const inPr = new Set((prFiles || []).map((f) => f.filename));
+  /** @type {PrFile[]} */
+  const files = [];
+  /** @type {string[]} */
+  const dropped = [];
+  for (const f of compareFiles || []) {
+    if (inPr.has(f.filename)) files.push(f);
+    else dropped.push(f.filename);
+  }
+  const note = dropped.length
+    ? `delta compare included ${dropped.length} file(s) outside the PR's own diff (merged-in base commits) — dropped`
+    : null;
+  return { files, dropped, note };
+}
+
+/**
+ * Cumulative churn lines over the PR's own files only — the same restriction as
+ * `restrictToPrFiles`, applied to the churn compare's per-file `{filename, lines}` rows.
+ * @param {{filename: string, lines?: number}[] | undefined} perFile @param {PrFile[]} prFiles @returns {number}
+ */
+export function prChurnLines(perFile, prFiles) {
+  const inPr = new Set((prFiles || []).map((f) => f.filename));
+  return (perFile || []).reduce((n, f) => n + (inPr.has(f.filename) ? Number(f.lines) || 0 : 0), 0);
+}
+
 import { FULL_REFRESH_DELTA } from "./route-depth.mjs";
 export { FULL_REFRESH_DELTA };
 
@@ -142,6 +178,31 @@ function selfTest() {
     [{ path: "gone.ts", sha: "same-as-prior" }],
   );
   ok("blobDelta keeps a removed file even when its blob sha matches the prior tree", removedKept.length === 1);
+
+  // restrictToPrFiles — dash0#20655: a head that merges main in keeps the compare `ahead`, but
+  // the range carries main's files too; only the PR's own files may reach the delta.
+  const prOwn = [{ filename: "src/a.ts" }, { filename: "src/b.ts" }];
+  const merged = restrictToPrFiles(
+    [{ filename: "src/a.ts", additions: 5, deletions: 2 }, { filename: "CODEOWNERS.bak", additions: 900, deletions: 0 },
+      { filename: "build.gradle", additions: 400, deletions: 53 }],
+    prOwn,
+  );
+  ok("restrictToPrFiles drops intact-compare files outside the PR's own diff",
+    merged.files.length === 1 && merged.files[0].filename === "src/a.ts" && deltaCounts(merged.files).deltaLines === 7,
+    JSON.stringify(merged.files.map((f) => f.filename)));
+  ok("restrictToPrFiles names the dropped files and notes the count",
+    JSON.stringify(merged.dropped) === JSON.stringify(["CODEOWNERS.bak", "build.gradle"])
+      && merged.note === "delta compare included 2 file(s) outside the PR's own diff (merged-in base commits) — dropped",
+    String(merged.note));
+  const clean = restrictToPrFiles(compareIntact.files, compareIntact.files);
+  ok("restrictToPrFiles leaves an intact compare with no extra files unchanged (no note)",
+    clean.files.length === compareIntact.files.length && clean.files.every((f, i) => f === compareIntact.files[i])
+      && clean.dropped.length === 0 && clean.note === null);
+
+  // prChurnLines — the cumulative-churn compare (D4) gets the same restriction.
+  ok("prChurnLines sums only the PR's own files",
+    prChurnLines([{ filename: "src/a.ts", lines: 30 }, { filename: "src/b.ts", lines: 12 }, { filename: "build.gradle", lines: 1300 }], prOwn) === 42);
+  ok("prChurnLines is 0 for an empty/absent list", prChurnLines([], prOwn) === 0 && prChurnLines(undefined, prOwn) === 0);
 
   // churnState
   ok("churnState: no last-full SHA -> 0", churnState({ hasLastFull: false }) === 0);
