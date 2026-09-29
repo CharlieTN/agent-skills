@@ -1309,10 +1309,10 @@ DELTA_SOURCE="compare"
 ```
 
 A list of ≥ 300 rows (GitHub's cap), with a file absent from `/tmp/pr-files.json`, or over a
-range with a merge commit is untrusted — never filter it. Recompute from a local checkout holding both
-SHAs: files of `git log --no-merges PRIOR..HEAD --not BASE` plus each merge's `--remerge-diff`,
-∩ the PR's files, then `git diff PRIOR HEAD --` them; else the blob route below. The churn compare
-gets the same rule (`resolveIntactDelta()` / `resolveChurnLines()`).
+range with a merge commit or more commits than listed (250 cap) is untrusted — never filter it.
+Recompute from a local checkout: files of `git log --no-merges PRIOR..HEAD --not BASE` plus
+each merge's `--remerge-diff`, ∩ the PR's files, then `git diff PRIOR HEAD --` them; else the
+blob route below. Churn: same rule (`resolveIntactDelta()` / `resolveChurnLines()`).
 
 **Diverged history** (anything else) — substitute the rebase-immune **blob-SHA authored delta**:
 
