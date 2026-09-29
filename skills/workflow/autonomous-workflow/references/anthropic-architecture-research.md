@@ -84,7 +84,7 @@ The decision record, including the three costs the agent form was paying and the
 |---|---|---|
 | Phase 0 validation ↔ Phase 1 planning | Yes — same user intent + same codebase exploration | NO — Phase 0 lives WITH the planner |
 | Phase 1 planning ↔ Phase 3 implementation | No — exploration history is dead weight for the executor | YES — planner→executor split |
-| Phase 3 implementation ↔ Phase 6 review | Yes — executor already has the change history | NO — review-changes is a Skill called by the executor |
+| Phase 3 implementation ↔ Phase 6 review | Yes — executor already has the change history | NO — review-loop is a Skill called by the executor |
 
 This is the load-bearing decision: planner/executor is split along a real context boundary (exploration/design vs. implementation/test).
 Validation→planning is *not* split, because both phases share the same context (user intent + codebase exploration).
@@ -100,7 +100,7 @@ As of v3.3 the skill uses exactly ONE architecture: Planner + Executor (two agen
 The deprecated monolithic single-agent template still exists for backward compat, but is not the default.
 
 It does NOT have five roles (clarifier → planner → implementer → tester → reviewer as separate agents).
-The companion skills (`tdd`, `ux`, `code-quality`, `confidence`, `docs`, `review-changes`, `aw-create-plan`, `aw-create-walkthrough`, `create-pr`, `ci-auto-fix`) are advisory companions called by `Skill()`, not coordinator agents.
+The companion skills (`tdd`, `ux`, `code-quality`, `confidence`, `docs`, `review-loop`, `aw-create-plan`, `aw-create-walkthrough`, `create-pr`, `ci-auto-fix`) are advisory companions called by `Skill()`, not coordinator agents.
 A skill is a tool the agent reaches for — it does not own a context window of its own.
 
 ### 2.5 Three roles when complexity warrants: Planner, Generator, Evaluator
@@ -249,12 +249,12 @@ This is exactly why `confidence` is a separate skill, not a method on the planne
 It evaluates `plan.md` from cold — without the planner's exploration history.
 That cold read is what makes the score useful: if `confidence(plan)` cannot reconstruct the plan's intent from `plan.md` alone, the plan is not ready for the executor (who will also be reading it cold).
 
-The same property holds for `review-changes` (cold-reads the diff) and `confidence(analysis)` (cold-reads a stuck-loop description).
+The same property holds for `review-loop`'s `pr-reviewer` pass (cold-reads the diff) and `confidence(analysis)` (cold-reads a stuck-loop description).
 
 | Verifier skill | Cold input | Why minimal context matters |
 |---|---|---|
 | `confidence(plan)` | `plan.md` only | Forces the plan to be self-contained; if a cold reader cannot grade it, the executor (also cold-reading) will fail |
-| `review-changes` | Diff + `plan.md` | Independent perspective on whether the diff matches the contract |
+| `review-loop` (its `pr-reviewer` pass) | Diff + PR description | Independent perspective on whether the diff matches the contract |
 | `confidence(analysis)` | Stuck-loop description | Detects when the executor's mental model has drifted into a wrong frame |
 
 ---
@@ -290,7 +290,7 @@ autonomous-workflow keeps the *pipeline* to two agents (planner + executor), wit
 
 **Why rejected:**
 A reviewer that runs *in parallel* with the executor cannot preserve context — both agents need overlapping access to the same diff.
-`review-changes` is a Skill called by the executor agent at Phase 6, not a separate coordinator agent.
+`review-loop` is a Skill called by the executor agent at Phase 6, not a separate coordinator agent.
 The skill cold-reads the diff, which gives it the verifier independence Anthropic recommends (§2.13) without paying the parallel-agent coordination cost.
 
 ### 3.4 Detailed technical implementation in the plan — REJECTED

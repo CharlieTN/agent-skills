@@ -6,11 +6,11 @@ description: >
   for "review this PR" when you do not want an apply-and-converge loop. Also writes
   maintainer relevance rules via `/pr-review remember <fact>`. Invoke with /pr-review.
 disable-model-invocation: true
-argument-hint: '[<pr-url>|#<n>] [--critical] [--full] [--effort high] [--with a,b,c] [--no-holistic] [--no-escalate] [--no-optimize] [--no-standards] [--skip-gates] [--fix-links] | remember <fact>'
+argument-hint: '[<pr-url>|#<n>] [--critical] [--full] [--effort high] [--thoroughness 0..1] [--with a,b,c] [--no-holistic] [--no-escalate] [--no-optimize] [--no-standards] [--skip-gates] [--fix-links] | remember <fact>'
 license: MIT
 metadata:
   author: mthines
-  version: '1.1.0'
+  version: '2.0.0'
   workflow_type: command
 ---
 
@@ -47,7 +47,7 @@ Parse the **first token** of `$ARGUMENTS`.
 | anything else (or empty) | [review](#step-2-dispatch-the-agent) | one `pr-reviewer` dispatch, read-only |
 
 There is no third operation, and no mode flag that turns this command into an apply pass.
-A request to fix what the review found is [`/review-changes`](../review-changes/SKILL.md), below.
+A request to fix what the review found is `review-loop` (convergence) or [`/implement-suggestion`](../../workflow/implement-suggestion/SKILL.md), below.
 
 ## Step 0: Parse the argument
 
@@ -110,6 +110,93 @@ Dispatch **once**. This command does not loop: a second pass over an unchanged h
 same code and re-posts the same report, and iterating a review against fixes is what
 [`review-loop`](../review-loop/SKILL.md) exists for.
 
+**Prepare once, then send the intent worker in the same message when the budget says `hybrid`.**
+The dispatched agent holds no dispatch tool of its own, so the one sub-agent its budget isolates —
+the intent finder — is dispatched from here, alongside it.
+In A/B rounds 7–8 on sync-tray#72 the isolated intent finder flagged the highest-severity agreed
+defect in 3 of 3 runs, where the default setting in one context had missed it in 4 of 4.
+The two share one `prepare-review.mjs` run: a worker that ran its own repeated 8–30 s of GitHub reads
+and left a worktree behind.
+
+1. Settle [dispatch availability](#when-sub-agent-dispatch-is-unavailable) first: a skip must not
+   leave a prepared workspace behind.
+   Pick a run directory, `<scratchRoot()>/review-<PR number>-<unix seconds>/`, and create it.
+   Resolve `$AGENT_SUPPORT` as [`remember`](#the-key-must-be-an-fp-or-there-is-no-rule-to-write) does.
+2. Read the PR-state record exactly as the agent's Step 0.7 does — `mcp__lorekit__memory_read`,
+   scope `branch::<owner>/<repo>::<headRefName>`, key `ci-state::pr-review-<n>` — and save a hit to
+   `<dir>/state.json`. Skip it under `--isolated`; on a miss, or with no LoreKit tool, pass no `--state`.
+3. Run prepare once, forwarding only the pass-through flags it takes (`--full`, `--effort`,
+   `--thoroughness`, `--isolated`, `--pin-head`, `--repo-dir`; add `--review-sha <sha> --isolated`
+   when the pass-through flags carry `--review-sha`), and read the topology on the same command:
+
+   ```bash
+   node "$AGENT_SUPPORT/pr-reviewer/scripts/prepare-review.mjs" --pr <PR_REF> --out <dir>/context.json [--state <dir>/state.json] <prepare flags> \
+     && jq -r '.budget.topology' <dir>/context.json && node "$AGENT_SUPPORT/pr-reviewer/scripts/review-telemetry.mjs" dispatch --run-dir <dir> \
+     && mkdir -p <dir>/intent && date +%s > <dir>/intent/dispatched_at
+   ```
+
+   Write seconds: BSD `date` on macOS has no `%N`, so `%s%3N` there prints a literal `3N`.
+   The `dispatch` record and the stamp put the agent's definition read and the worker's own span in
+   the trace ([`run-telemetry.md`](../../../agents/pr-reviewer/rules/run-telemetry.md)).
+4. On `hybrid`, in **one message**, dispatch both:
+   - `pr-reviewer` with `<PR_REF> <pass-through flags> --context <dir>/context.json --intent-from <dir>/intent/intent.json`;
+   - a general-purpose worker (the harness's general sub-agent type) with the [worker preamble](#worker-preamble--the-intent-worker),
+     told to read `<dir>/context.json`, `finders.md`, and the review packet the context names, act as
+     the `intent` finder only, and write its candidates to `<dir>/intent/intent.json` as a JSON array.
+     It never runs `prepare-review.mjs`.
+5. On `in-context` — below thoroughness 0.4, or a small incremental re-review — dispatch
+   `pr-reviewer` alone with `--context <dir>/context.json`. The budget isolates nothing, so a worker
+   would be a sub-agent's base cost for a candidate list the reviewer builds itself.
+6. When every dispatch has returned, release the workspace: you ran prepare, so the cleanup is yours,
+   never the reviewer's.
+
+   ```bash
+   node "$AGENT_SUPPORT/pr-reviewer/scripts/prepare-review.mjs" --cleanup <dir>/context.json
+   ```
+
+If prepare exits non-zero, dispatch `pr-reviewer` alone with no `--context`: it runs prepare
+itself, owns that workspace's cleanup, and runs intent in-context.
+
+The agent reads the intent file only after verifying its own candidates, and runs intent itself if
+the worker failed
+([`dispatch-topology.md` § The two topologies](../../../agents/pr-reviewer/rules/dispatch-topology.md#the-two-topologies)).
+The two run concurrently, so the wall time is the reviewer's own.
+
+```text
+✅ RIGHT — prepare once, then one message, two dispatches
+Task(subagent_type="pr-reviewer", prompt="<PR_REF> --context /…/context.json --intent-from /…/intent/intent.json")
+Task(subagent_type="general-purpose", prompt="<worker preamble> … read /…/context.json … act as the intent finder … write /…/intent/intent.json")
+
+❌ WRONG — the worker in a second message: the reviewer's wait becomes the worker's full runtime
+❌ WRONG — a worker told to run prepare-review.mjs: a second set of GitHub reads, and a leaked worktree
+```
+
+### Worker preamble — the intent worker
+
+The intent worker Step 2 dispatches gets this preamble prepended to its prompt, verbatim:
+
+```text
+You are the intent worker for one pr-reviewer run, not the full pr-reviewer agent.
+- Read ONLY the file(s) named below, by their ABSOLUTE path — never a bare relative path; your
+  cwd is not guaranteed to be this repo's checkout.
+- Do NOT read agents/pr-reviewer.md. It is the full agent's own document; you are one finder of
+  its pipeline, dispatched with exactly the context that finder needs, and reading it would
+  re-derive context the dispatch already isolated you from (and burn the tokens doing it).
+- Do NOT call Skill(). Read the rule file(s) you were given instead.
+- Do NOT run prepare-review.mjs. The context file you were given is already prepared; read
+  context.packet.path from it.
+- Read the review packet first (context.packet.path): the PR description and every hunk widened
+  against the head file, with head line numbers you cite directly. Open a workspace file only for
+  what it does not show — a caller, a definition, or a file its index marks "listed".
+- Write your JSON output to the path you were given. Return ONLY that path in your final message
+  — never the payload inline. The reviewer reads the file from disk; a payload returned as text
+  spends context neither side needs to spend.
+```
+
+An explicit read-list plus a forbidden-file rule is what stops the worker from re-reading the full
+agent document on top of whatever the harness already loaded for that session — the dispatch prompt
+is the one part of a worker's context this skill controls.
+
 ### When sub-agent dispatch is unavailable
 
 Some harnesses expose no sub-agent dispatch tool at all. Establish that by
@@ -149,7 +236,7 @@ Gates: <one line naming any non-passing gate, or "all passing">
 <one line per blocking finding: path:line — the ask>
 
 Report: <URL of the sticky comment>
-Apply these: /review-changes <PR>   (or /implement-suggestion <PR>)
+Apply these: /implement-suggestion <PR>   (or Skill("review-loop", "<PR>") to converge)
 ```
 
 Surface **blocking findings and non-passing gates prominently**.
@@ -181,10 +268,31 @@ Classify the direction from the wording:
 The reviewer matches rules **by fingerprint** at read time, so a rule stored under any other key is
 never read again.
 
+The script lives in the `pr-reviewer` agent's support tree, not in the repository you are standing
+in, so a bare `node agents/…` exits `MODULE_NOT_FOUND` everywhere but this skill's own repository.
+Resolve the tree in the same Bash call. A Dash0 Agent0 install exports it from its `env.sh`;
+everywhere else resolve it the way the agent does (its § Locating this agent's own files):
+
 ```bash
-node agents/pr-reviewer/scripts/fingerprint.mjs build \
+[ -f /tmp/workspace/agent-skills/env.sh ] && . /tmp/workspace/agent-skills/env.sh   # Agent0: exports AGENT_SUPPORT
+if [ -z "$AGENT_SUPPORT" ]; then
+  resolve() {  # portable readlink -f
+    [ -e "$1" ] || return 1
+    ( cd "$(dirname "$1")" && t=$(basename "$1")
+      while [ -L "$t" ]; do d=$(readlink "$t"); cd "$(dirname "$d")" || return 1; t=$(basename "$d"); done
+      printf '%s/%s\n' "$(pwd -P)" "$t" )
+  }
+  AGENT_MD=$(resolve "${CLAUDE_AGENT_FILE:-$HOME/.claude/agents/pr-reviewer.md}" || echo "")
+  AGENT_SUPPORT="${AGENT_MD%/pr-reviewer.md}"
+fi
+[ -f "$AGENT_SUPPORT/pr-reviewer/scripts/fingerprint.mjs" ] || {
+  echo "pr-review remember: support tree unresolved (tried env.sh, ${CLAUDE_AGENT_FILE:-\$HOME/.claude/agents/pr-reviewer.md})" >&2; exit 1; }
+node "$AGENT_SUPPORT/pr-reviewer/scripts/fingerprint.mjs" build \
   --finder <finder> --defect-class <class> --symbol <symbol|-> --path <repo-relative path>
 ```
+
+An unresolved tree stops the write: without the script there is no `fp`, and a hand-built key is the
+failure the next paragraph forbids.
 
 That needs three things the prose may not carry: a `finder`, a `defect-class`, and a `path`
 (`--symbol -` covers a whole-file rule).
@@ -254,22 +362,20 @@ Both exemptions are the agent's, not this command's, so this refusal is a restat
 | Command | Reviews | Applies findings | Pushes | Loops |
 | --- | --- | --- | --- | --- |
 | **`/pr-review <PR>`** | yes | **no** | no | no — one dispatch |
-| [`/review-changes <PR>`](../review-changes/SKILL.md) | yes | yes | yes | yes, via `review-loop` |
-| [`/review-changes <PR> --report`](../review-changes/SKILL.md) | yes | no | no | no |
+| [`/implement-suggestion <PR>`](../../workflow/implement-suggestion/SKILL.md) | no — applies existing comments | yes | yes | no (`--watch` repeats) |
 | [`review-loop`](../review-loop/SKILL.md) | yes | yes | yes | yes, cap 5, converges on threads + CI |
 | [`/polish`](../polish/SKILL.md) | yes | mechanical only | no | no — one pass each |
 
-`/pr-review <PR>` and `/review-changes <PR> --report` reach the same place by design.
-This command is the direct name for it, and it is what the agent's own description, `depth-routing.md`,
-and `memory.md` all already tell the user to type; `--report` stays a flag on the convergence
-command for people already there.
+`/pr-review <PR>` is the one read-only entry point, and it is what the agent's own description,
+`depth-routing.md`, and `memory.md` all already tell the user to type. Inside the loop,
+`review-loop --no-feedback` is its report-only counterpart.
 
 ## Hard rules
 
 - **Read-only, always.** This command never edits a file, never commits, never pushes, and never resolves a thread. Applying is [`/implement-suggestion`](../../workflow/implement-suggestion/SKILL.md); applying-and-converging is [`review-loop`](../review-loop/SKILL.md).
 - **Never write to GitHub.** The agent posts its own sticky report and inline findings. This skill adds a terminal summary only — a second comment would duplicate a report that is rewritten in place precisely so a PR does not accumulate copies.
 - **Dispatch via the sub-agent dispatch tool, never `Skill()`.** `pr-reviewer` is an agent; `Skill("pr-reviewer", …)` errors with `Unknown skill`. The tool is named `Task` in some harnesses and `Agent` in others — use the one this session has.
-- **One dispatch per invocation. Do not loop.** Re-reviewing an unchanged head produces the same report at full cost.
+- **One prepare, one review dispatch per invocation, plus the intent worker in the same message when the budget is `hybrid`. Do not loop.** The caller that ran prepare runs `--cleanup`. Re-reviewing an unchanged head produces the same report at full cost.
 - **Absent sub-agent dispatch is a skip, not a fallback — and it is a CAPABILITY test, not a name test.** Conclude it only when no available tool dispatches a sub-agent under any name; the absence of `Task` alone is not evidence. Then never review in this context and label it a `pr-reviewer` review, and never retry the dispatch.
 - **Never validate the pass-through flags.** Forward the tail verbatim; the agent owns that grammar and rejects what it does not know.
 - **Never re-adjudicate the verdict.** Report `PASS` / `WARN` / `FAIL` as returned, with the blocking findings named.

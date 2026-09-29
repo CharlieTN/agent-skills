@@ -222,7 +222,7 @@ Everything else is a flag.
 | `--no-refresh` | Run the convergence loop as normal but skip the final PR-description refresh and Linear note. |
 | `--external-review` | Replace sub-step A: wait for an **out-of-process** reviewer instead of dispatching `pr-reviewer`. See [Sub-step A — external-review mode](#sub-step-a--external-review-mode). |
 | `--interval S` | Poll interval in seconds for `--external-review`, default `300`, **clamped to `540`**. Ignored without `--external-review`. |
-| `--no-ci` | Skip sub-step D (the CI pass). Callers that own their own CI phase pass this — `create-pr` (Steps 7–9) and `autonomous-workflow` (Phase 7) both do. |
+| `--no-ci` | Skip sub-step D (the CI pass). Callers that own their own CI phase pass this — `create-pr` (Steps 7–8) and `autonomous-workflow` (Phase 7) both do. |
 | `--no-preview-run` | Skip [Step 1.6](#step-16-ui-verify-run-report-only-once-on-exit), the report-only ui-verify run at exit. `autonomous-workflow` passes this because its Phase 7 spec rehearsal already runs the same specs against the preview; `create-pr` does **not**, so a hand-driven UI PR gets its authored spec verified here. |
 | `--merge` | Merge the PR (squash) on the first agent approval. After the loop, [Step 2.5](#step-25-merge-under---merge-on-approval) merges **only** when the run reached clean convergence (`all-threads-resolved` — every non-blocking comment fixed or answered), the final review is an approval (pr-reviewer `PASS`, or a GitHub `reviewDecision == APPROVED` under `--external-review`), and CI is green. It undrafts first (the one case that overrides *never undraft*). It never merges on a non-clean convergence, a non-PASS verdict, or pending/red CI — it reports why and stops. |
 
@@ -471,7 +471,10 @@ while ITERATION < CAP:
         # <dispatch> is the harness's sub-agent dispatch tool — Task, Agent, or
         # another spelling; Step 0 resolved which one. pr-reviewer is an AGENT,
         # so never Skill("pr-reviewer").
-        # REVIEWER_ROUTE == "named": the call above, unchanged.
+        # REVIEWER_ROUTE == "named": the call above, sent the way /pr-review sends it —
+        # one prepare-review.mjs run here first (--context), the intent worker in the
+        # same message only on a hybrid budget, a dispatch stamp, --repo-dir when a
+        # local clone exists, and --cleanup after. See "Sub-step A — the named dispatch".
         # REVIEWER_ROUTE == "agent0" (Step 0 row 2, or row 4 after the install):
         # AGENT0 == 1 (rules/agent0-runtime.md): subagent_type="general" with the
         # short bundle-pointing prompt from that rule — never pr-reviewer, and
@@ -566,6 +569,28 @@ if STOP_REASON in ("cap-reached", "no-progress"):
         report: <STOP_REASON>; surface remaining blockers/flags AND any red check
 ```
 
+### Sub-step A — the named dispatch
+
+On `REVIEWER_ROUTE == "named"`, dispatch `pr-reviewer` exactly as the `pr-review` skill's Step 2 does, and never as a bare single call.
+That step owns the procedure: load the `pr-review` skill and follow it, never restate it.
+It adds four things a bare `<dispatch>(subagent_type="pr-reviewer", …)` loses:
+
+1. **One prepare, shared, and cleaned up here.** This loop runs `prepare-review.mjs` once per iteration and hands the reviewer `--context`; the intent worker reads the same context instead of preparing its own. Having run prepare, the loop runs `prepare-review.mjs --cleanup` once the iteration's dispatches return.
+2. **The intent worker, in the same message, when `context.budget.topology` is `hybrid`.** The dispatched reviewer holds no dispatch tool, so a bare call runs a `hybrid` budget's intent finder in-context — the setting A/B rounds 7–8 measured missing the highest-severity defect. A re-review that routes `standard` or `quick` is `in-context` and sends the reviewer alone.
+3. **A dispatch record and stamp** (`review-telemetry.mjs dispatch`, and `dispatched_at` in the intent dir). The time the agent spends loading its definition is then a `load` step instead of an unexplained gap after `prepare`.
+4. **`--repo-dir <path>`, when a local clone of the PR's repository exists** and this session's cwd is not one — this loop is often run from another checkout. Pass the clone's path (the session's own checkout when its `origin` is the PR's repo, or a clone the user named). Without it, the reviewer's workspace rung 0 is skipped and it clones over the network; one observed run fell through to a failed tarball and restarted.
+
+```text
+# RIGHT — one message, both dispatches, as /pr-review Step 2 sends them
+prepare-review.mjs --pr <PR-URL> --repo-dir <clone> --out <dir>/context.json → budget.topology == "hybrid"
+<dispatch>(subagent_type="pr-reviewer", prompt="<PR-URL> --context <dir>/context.json --intent-from <dir>/intent/intent.json --repo-dir <clone>")
+<dispatch>(subagent_type="general-purpose", prompt="<worker preamble> … read <dir>/context.json … act as the intent finder … write <dir>/intent/intent.json")
+prepare-review.mjs --cleanup <dir>/context.json
+
+# WRONG — a bare call: intent runs in-context, no load step, no local clone
+<dispatch>(subagent_type="pr-reviewer", prompt="<PR-URL>")
+```
+
 ### Sub-step A — external-review mode
 
 Under `--external-review` the loop produces no review of its own. It waits for one.
@@ -612,7 +637,7 @@ gh pr checks "$PR_NUMBER" --repo "$RESOLVED_REPO"
 
 This is a **query, not a watch**: it adds no `gh … --watch` site and spends nothing
 from the watch budgets that
-[`create-pr` Step 9](../../delivery/create-pr/SKILL.md) and
+[`create-pr` Step 8](../../delivery/create-pr/SKILL.md) and
 [`phase-7-ci-gate.md`](../../workflow/autonomous-workflow/rules/phase-7-ci-gate.md)
 each count inside their own invocation. `ci-auto-fix` likewise keeps its own local
 counter, so delegating to it stays inside the existing contract — no budget is
@@ -691,11 +716,17 @@ Skip this step entirely when **any** of:
 - `NO_FEEDBACK == 1` — report-only mode applied nothing, so there is nothing new to verify.
 - the loop returned a dispatch skip (no dispatch tool, nested dispatch, `pr-reviewer` not a dispatchable agent type, Agent0 install failed) — no run happened.
 
-Otherwise dispatch it **once**, regardless of iteration count:
+Otherwise dispatch it **once**, regardless of iteration count, **always with `--unattended`**:
 
 ```text
-Skill("ui-verify", "run <PR-URL>")
+Skill("ui-verify", "run <PR-URL> --unattended")
 ```
+
+`--unattended` is mandatory here, not a host-specific choice: this step runs at the end of a
+loop the caller expects to finish on its own, and without the flag `ui-verify`'s `auto` driver
+stops to ask `AskUserQuestion` whenever Chrome is absent — blocking forever in an automation, and
+failing outright on a host that has no ask-user tool. Under the flag it runs Playwright or returns
+`inconclusive: no driver available (…)`, never a question.
 
 `ui-verify run` owns the whole procedure: it reads the committed
 `<!-- ui-verify:v1 -->` block (the **only** source — never the gitignored
@@ -726,7 +757,7 @@ Map its outcome into the report:
 | `no spec` (no block — not a UI PR, or `author` never ran) | `not run (no ui-verify block)` — log and continue |
 | `inconclusive: preview not deployed` | `inconclusive (preview not deployed at exit)` — note `re-run /ui-verify run <PR-URL> once the preview is up`. Never a red |
 | `inconclusive: no access path for deployment lookup (pass --url)` | `inconclusive (no deployment lookup on this access path)` — note `re-run /ui-verify run <PR-URL> --url <preview-url>`. Never a red, and never recorded as `preview not deployed`: no lookup ran, so waiting for the build fixes nothing and only an explicit URL changes the outcome |
-| any other `inconclusive: <reason>` (`preview building`, `no preview environment`, `preview deploy failed`, `preview URL not published`) | `inconclusive (<reason> at exit)` — log the reason verbatim and continue. Never a red |
+| any other `inconclusive: <reason>` (`preview building`, `no preview environment`, `preview deploy failed`, `preview URL not published`, `no driver available (unattended — …)`) | `inconclusive (<reason> at exit)` — log the reason verbatim and continue. Never a red |
 | `empty spec` (markers present, body empty) | `not run (empty ui-verify block)` — log and continue. Distinct from `no spec` on purpose: `author` **did** run and embedded nothing, which is a spec-authoring bug worth naming, not a PR that needed no spec |
 | `NOT RUN (<reason>)` (`chrome unavailable, user declined Playwright`, `sub-agent dispatch unavailable`, `no Chrome extension and no sub-agent dispatch available`) | `not run (<reason>)` — log the reason verbatim and continue. Never a red: no driver executed, so there is no verdict to be red about |
 | `green` | `green (<N> specs on <preview-url>)` |
@@ -759,7 +790,7 @@ the loop's fixes:
    )"
    ```
 
-Then, **best-effort**, note the linked Linear ticket (skip silently if any part is absent):
+Then, **best-effort**, note the linked Linear ticket (skip with one report line if any part is absent):
 
 - Detect a ticket from the branch name (`.../ABC-123-...`), the PR title/body, or `gh pr view`.
 - If a ticket id is found **and** the Linear MCP tools are connected, post a short comment on the ticket linking the PR and stating that review converged (e.g. `Review loop converged — PR <url> ready for review.`).
@@ -899,7 +930,6 @@ threads over a red build is not a review-ready PR.
 | `polish` (bare) | **Downstream, not a caller.** `polish`'s Pass A invokes `pr-reviewer` directly and never calls `review-loop`; this loop only invokes `Skill("polish", "simplify")`. |
 | `create-pr` | Upstream caller — delegates post-draft review to `review-loop` after opening the draft PR. |
 | `autonomous-workflow` Phase 6/7 | Invokes `review-loop` in place of the retired `reviewer` agent dispatches. |
-| `review-changes` | Routes to `review-loop` as the primary convergence entry point. |
 | `ci-auto-fix` | Sub-step D: dispatched as a subagent on a red check, capped at 2 handoffs per run. Owns the fix; this loop only classifies and delegates. Skipped under `--no-ci`. |
 | `ui-verify run` | Step 1.6: dispatched once at exit on a UI PR to run the committed spec against the preview deployment. Report-only — never gates convergence or undrafts. Skipped under `--no-preview-run` (which `autonomous-workflow` passes, its Phase 7 owning the same rehearsal) or when the skill is absent. Pairs with `create-pr` Step 6.4, which authored the spec. |
 | `review-activity-poll` | Shared rule owning the `--external-review` wait — [`agents/shared/rules/review-activity-poll.md`](../../../agents/shared/rules/review-activity-poll.md), co-owned with `implement-suggestion --watch`. |
