@@ -5155,6 +5155,12 @@ const isPollBlock = (block) =>
   // The second pattern read `memory_search\s+scope=` until G44a was written, so this guard
   // was asserting the broken call shape it was meant to bound — the parameter is `q`, and
   // `scopes` is the array. A guard that mirrors a call by hand can pin the wrong one.
+  // dash0#20655: the full page was ~101 KB and overflowed the tool output. The list is keys; a
+  // matched key is expanded with memory_read, capped, as the Step 1.0 lesson reads already do.
+  s.check("G41h the knowledge list is summary-only, in memory.md and at the agent body's call site, with a capped expansion",
+    /mcp__lorekit__memory_list\s+scope=[^\n]*codebase-knowledge[^\n]*limit=50\s+view="summary"/.test(mem)
+    && /mcp__lorekit__memory_list:\s+scope=[^\n]*codebase-knowledge[^\n]*view="summary"/.test(read("agents/pr-reviewer.md"))
+    && /at most \*\*5\*\* `memory_read` expansions/.test(mem));
   s.check("G41h both memory reads carry an explicit limit at the call site",
     /mcp__lorekit__memory_list\s+scope=[^\n]*limit=50/.test(mem)
     && /mcp__lorekit__memory_search\s+q=[^\n]*limit=25/.test(mem));
@@ -9967,7 +9973,9 @@ const isPollBlock = (block) =>
   s.check("G84o a hybrid run starts at the caller's dispatch stamp, with the definition read as a `load` step",
     /a dispatch stamp starts the run and the worker at the dispatch, and the first gap is `load`/.test(out)
       && /dispatchTime reads the \/pr-review directory suffix/.test(out)
-      && /date \+%s%3N > <dir>\/dispatched_at/.test(skillTxt));
+      && /date \+%s > <dir>\/dispatched_at/.test(skillTxt)
+      && /dispatchTime reads a ms, a seconds, and a BSD `%3N` stamp/.test(out)
+      && /worker import with only the stamp and the output file still folds the worker in/.test(out));
   s.check("G84o per-step tool calls come from the model's running count, and run-telemetry.md asks for it on every marker",
     /per-step tool calls come from consecutive model-reported counts/.test(out)
       && /\*\*Pass your running tool-call count on every marker\*\*/.test(rtDocEarly));

@@ -343,9 +343,10 @@ export function resolveContextMode({ runMode, zeroDelta, routing }) {
  * @param {{ isolated: boolean, stickyBody: string|null, headSha: string }} args
  * @returns {{ priorSha: string|null, zeroDelta: boolean }}
  */
-export function resolvePriorRun({ isolated, stickyBody, headSha }) {
+export function resolvePriorRun({ isolated, stickyBody, headSha, statePriorSha = null }) {
   if (isolated) return { priorSha: null, zeroDelta: false };
-  const priorSha = stickyBody ? priorShaFromBody(stickyBody) : null;
+  // The state record is the primary source (Step 0.7); the sticky's footer is the fallback rung.
+  const priorSha = statePriorSha || (stickyBody ? priorShaFromBody(stickyBody) : null);
   return { priorSha, zeroDelta: sameCommit(headSha, priorSha) };
 }
 
@@ -722,18 +723,36 @@ export function computeThreadOverlap(files, threads) {
  * "What it deliberately does NOT do" note above). Absent or unreadable
  * degrades to "no prior deep pass on record" — the SAFE direction per
  * depth-routing.md's D6 ("no prior full review is recorded").
- * @param {string|null} path @returns {{lastFullSha: string|null, incrRunsSinceFull: number}}
+ * Accepts the record as Step 4c writes it (`{v, commit, data: {runs[]}}`, or a LoreKit read's
+ * `{value: "<that JSON>"}`), or the flat `{priorSha, lastFullSha, incrRunsSinceFull}` shape.
+ * @param {string|null} path @returns {{priorSha: string|null, lastFullSha: string|null, incrRunsSinceFull: number}}
  */
 export function readStateFile(path) {
-  if (!path) return { lastFullSha: null, incrRunsSinceFull: 0 };
+  const none = { priorSha: null, lastFullSha: null, incrRunsSinceFull: 0 };
+  if (!path) return none;
   try {
-    const raw = JSON.parse(readFileSync(path, "utf8"));
+    let raw = JSON.parse(readFileSync(path, "utf8"));
+    // A LoreKit read returns the record's value as a string; accept the envelope as well.
+    if (typeof raw?.value === "string") raw = JSON.parse(raw.value);
+    // The record itself (Step 4c's shape): the same three bindings Step 0.7 derives with jq.
+    // On dash0#20655 a re-review that had read this record still ran as a first run, because the
+    // script took the prior SHA only from the sticky and could not read `data.runs[]` at all.
+    const runs = Array.isArray(raw?.data?.runs) ? raw.data.runs : null;
+    if (runs) {
+      const lastFull = runs.map((r) => r?.mode).lastIndexOf("full");
+      return {
+        priorSha: runs.length ? String(runs[runs.length - 1]?.sha || "") || null : null,
+        lastFullSha: lastFull < 0 ? null : String(runs[lastFull]?.sha || "") || null,
+        incrRunsSinceFull: lastFull < 0 ? runs.length : runs.length - 1 - lastFull,
+      };
+    }
     return {
+      priorSha: raw.priorSha || raw.prior_sha || null,
       lastFullSha: raw.lastFullSha || raw.last_full_sha || null,
       incrRunsSinceFull: Number(raw.incrRunsSinceFull ?? raw.incr_runs_since_full ?? 0) || 0,
     };
   } catch {
-    return { lastFullSha: null, incrRunsSinceFull: 0 };
+    return none;
   }
 }
 
@@ -1178,10 +1197,12 @@ async function prepare(opts) {
   // series (or, worse, an entirely earlier review of the same PR) left behind. A
   // sticky can still EXIST on the PR (duplicate-sticky detection above still runs),
   // but under `--isolated` this run never treats it as a prior run to diff against.
+  const state = readStateFile(runMode.stateIgnored ? null : (opts.state || null));
   const { priorSha, zeroDelta } = resolvePriorRun({
     isolated: runMode.isolated,
     stickyBody: sticky ? sticky.body : null,
     headSha,
+    statePriorSha: state.priorSha,
   });
 
   // Step 0.5 — review relation. Never from `gh api /user`: it is not repo-scoped
@@ -1355,7 +1376,6 @@ async function prepare(opts) {
   // unconditionally (`resolveRunMode`'s `stateIgnored`) — a caller-supplied state
   // file is itself carried state from a prior run, exactly the class of input an
   // isolated comparability run must not depend on.
-  const state = readStateFile(runMode.stateIgnored ? null : (opts.state || null));
   if (!opts.state && !runMode.isolated) {
     anomalies.push(
       "no --state file supplied — routing computed with lastFullSha=none, incrRunsSinceFull=0 " +
@@ -1617,7 +1637,7 @@ async function prepare(opts) {
       // judgment-affecting state. Because that target is the LIVE report, finalize.mjs refuses an
       // --isolated context without --dry-run and marks the plan `isolated`, which
       // execute-write-plan.mjs refuses on its own (A/B round 3; rules/pipeline.md § --isolated).
-      source: runMode.isolated ? "none" : (sticky ? "github-fallback-rung" : "none"),
+      source: runMode.isolated ? "none" : state.priorSha ? "state-record" : (sticky ? "github-fallback-rung" : "none"),
       stickyCommentId: sticky ? sticky.id : null,
       stickyUrl: sticky ? sticky.html_url : null,
       stickyKind: sticky ? sticky.kind : null,
@@ -2114,6 +2134,26 @@ async function selfTest() {
     writeFileSync(p, JSON.stringify({ lastFullSha: "abc1234", incrRunsSinceFull: 2 }), "utf8");
     const s = readStateFile(p);
     return s.lastFullSha === "abc1234" && s.incrRunsSinceFull === 2;
+  });
+  t("readStateFile: the record as Step 4c writes it binds the prior SHA, the last full SHA and the incremental count", () => {
+    const p = join(tmpdir(), `prr-state-rec-${process.pid}.json`);
+    const rec = { v: 1, commit: "ccc", data: { runs: [
+      { sha: "aaa", mode: "incremental" }, { sha: "bbb", mode: "full" }, { sha: "ccc", mode: "incremental" }, { sha: "ddd", mode: "incremental-quick" },
+    ] } };
+    writeFileSync(p, JSON.stringify(rec), "utf8");
+    const direct = readStateFile(p);
+    writeFileSync(p, JSON.stringify({ key: "ci-state::pr-review-1", value: JSON.stringify(rec) }), "utf8");
+    const envelope = readStateFile(p);
+    writeFileSync(p, JSON.stringify({ v: 1, data: { runs: [{ sha: "eee", mode: "incremental" }] } }), "utf8");
+    const noFull = readStateFile(p);
+    return [direct, envelope].every((s) => s.priorSha === "ddd" && s.lastFullSha === "bbb" && s.incrRunsSinceFull === 2)
+      && noFull.priorSha === "eee" && noFull.lastFullSha === null && noFull.incrRunsSinceFull === 1;
+  });
+  t("resolvePriorRun: the state record's prior SHA wins over the sticky footer, which stays the fallback", () => {
+    const body = "commit `abc1234`";
+    return resolvePriorRun({ isolated: false, stickyBody: body, headSha: "fff9999", statePriorSha: "def5678" }).priorSha === "def5678"
+      && resolvePriorRun({ isolated: false, stickyBody: body, headSha: "fff9999" }).priorSha === "abc1234"
+      && resolvePriorRun({ isolated: true, stickyBody: body, headSha: "fff9999", statePriorSha: "def5678" }).priorSha === null;
   });
   t("readStateFile: an unparseable file degrades to the safe default rather than throwing", () => {
     const p = join(tmpdir(), `prr-state-bad-${process.pid}.json`);

@@ -667,6 +667,8 @@ INCR_RUNS_SINCE_FULL=$(jq -r '
   | if $i == null then ($all | length) else (($all | length) - 1 - $i) end' <<< "$PR_STATE")
 ```
 
+Save `$PR_STATE` to a file and pass it as `prepare-review.mjs --state <file>`, or it routes a re-review as a first run.
+
 `PRIOR_SHA` is both the delta-triage baseline and the provenance of everything carried — one
 variable for both, now bound in every mode. `PRIOR_SHA_SHORT` (`${PRIOR_SHA:0:7}`) is what the
 `(carried from …)` suffix renders in every mode, so it can no longer degrade to `(carried from )`;
@@ -715,7 +717,7 @@ Step 1.0 consumes).
 
 ### What no longer happens here
 
-Retired deliberately, not lost: the `<!-- PR_REVIEWER_LEDGER … -->` body block and `DEGRADED_LEDGER`'s reduction ladder (the record holds the history now, written whatever the sticky does — Step 4c); the `pulls/{n}/reviews` legacy-report/pointer-ledger fetches and the `PRIOR_REVIEW` / `PRIOR_BODY` / `LEDGER_SOURCE` / `POINTER_LEDGER_BODY` names (one store, nothing left to re-parse); `PRIOR_REVIEW_SHA` (the record supplies the provenance SHA in every mode, so `PRIOR_SHA` no longer needs blanking under `--full`); `PRIOR_BLOCKING_FINGERPRINTS` (Step 4b has one posting condition); and `PRIOR_RUN_STATE_UNKNOWN` (`STATE_STATUS` + `STICKY_READ_FAILED` say it directly).
+Retired deliberately, not lost: the `<!-- PR_REVIEWER_LEDGER … -->` body block and `DEGRADED_LEDGER`'s reduction ladder (the record holds the history, written whatever the sticky does); the `pulls/{n}/reviews` legacy-report/pointer-ledger fetches and the `PRIOR_REVIEW` / `PRIOR_BODY` / `LEDGER_SOURCE` / `POINTER_LEDGER_BODY` names; `PRIOR_REVIEW_SHA` (the record supplies the SHA in every mode); `PRIOR_BLOCKING_FINGERPRINTS`; and `PRIOR_RUN_STATE_UNKNOWN` (`STATE_STATUS` + `STICKY_READ_FAILED` say it).
 
 ---
 
@@ -1248,7 +1250,7 @@ tool call:
 ```text
 # 1. Knowledge + hotspot records for this repo — the tag makes the page selective; relevance
 #    rules share the kind/host, so a kind/host filter alone mixes the two buckets.
-mcp__lorekit__memory_list:   scope="repo::{owner}/{repo}" tags=["codebase-knowledge"] kind="signal" host="reviewer" limit=50
+mcp__lorekit__memory_list:   scope="repo::{owner}/{repo}" tags=["codebase-knowledge"] kind="signal" host="reviewer" limit=50 view="summary"
 
 # 2. A targeted search on the top 10 changed symbols by blast radius, from impact.json.
 #    memory_search takes `q` + `scopes` (array), NOT `query` + `scope`.

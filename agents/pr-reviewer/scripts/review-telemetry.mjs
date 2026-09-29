@@ -742,8 +742,11 @@ export function dispatchTime(dir, firstSeen) {
   try {
     const f = join(dir, "dispatched_at");
     if (existsSync(f)) {
-      const ms = Number(String(readFileSync(f, "utf8")).trim());
-      if (Number.isFinite(ms) && ms > 0) at = BigInt(Math.round(ms)) * 1_000_000n;
+      // Epoch seconds (10 digits) or milliseconds (13). BSD `date +%s%3N` — macOS — prints the
+      // seconds followed by a literal `3N`, so only the leading 10 digits of such a value count.
+      const digits = /^(\d+)/.exec(String(readFileSync(f, "utf8")).trim())?.[1] || "";
+      if (digits.length === 13) at = BigInt(digits) * 1_000_000n;
+      else if (digits.length >= 10) at = BigInt(digits.slice(0, 10)) * 1_000_000_000n;
     }
     if (at === null) {
       const m = /-(\d{10})\/?$/.exec(dir);
@@ -869,10 +872,13 @@ async function main(argv) {
             theirs.push(BigInt(Math.round(doneMs - (Number(ctx.elapsedMs) || 0))) * 1_000_000n, BigInt(doneMs) * 1_000_000n);
           }
         }
-        if (!theirs.length) { warn(`worker ${unit} import: no ledger or context.json in ${JSON.stringify(from)}`); return; }
+        // A worker that wrote its context elsewhere still left its output: the output's mtime ends
+        // the worker and the dispatch stamp starts it, which is all the span needs.
+        const donePath = opts.done || "";
+        if (!theirs.length && donePath && existsSync(donePath)) theirs.push(BigInt(Math.round(statSync(donePath).mtimeMs)) * 1_000_000n);
+        if (!theirs.length) { warn(`worker ${unit} import: no ledger, context.json, or --done file in ${JSON.stringify(from)}`); return; }
         const firstSeen = theirs.reduce((a, b) => (b < a ? b : a));
         const last = theirs.reduce((a, b) => (b > a ? b : a));
-        const donePath = opts.done || "";
         const doneAt = donePath && existsSync(donePath) ? BigInt(Math.round(statSync(donePath).mtimeMs)) * 1_000_000n : last;
         // The caller's dispatch time, when it left one: the worker (and the reviewer, sent in the
         // same message) started then, not when the worker's own script began.
@@ -1161,6 +1167,27 @@ async function selfTest() {
         && dispatchTime("/x/intent-72-1790000300", 1_790_000_200n * S) === null
         && dispatchTime("/x/intent-72-1780000000", 1_790_000_200n * S) === null
         && dispatchTime("/x/intent", 1_790_000_200n * S) === null);
+    // The stamp as three shells write it: ms (GNU `date +%s%3N`, node), seconds (`date +%s`), and
+    // BSD `date +%s%3N`, which prints the seconds and a literal `3N` (dash0#20655, round 1).
+    const stampDir = join(dir, "stamps");
+    mkdirSync(stampDir, { recursive: true });
+    const readStamp = (/** @type {string} */ v) => { writeFileSync(join(stampDir, "dispatched_at"), v); return dispatchTime(stampDir, 1_790_000_200n * S); };
+    ok("dispatchTime reads a ms, a seconds, and a BSD `%3N` stamp, and rejects garbage",
+      readStamp("1790000100123\n") === 1_790_000_100_123n * 1_000_000n
+        && readStamp("1790000100") === 1_790_000_100n * S
+        && readStamp("17900001003N") === 1_790_000_100n * S
+        && readStamp("soon") === null);
+    // The worker wrote its context somewhere else: the stamp and the output file are enough.
+    const bareDir = join(dir, "intent-bare");
+    mkdirSync(bareDir, { recursive: true });
+    writeFileSync(join(bareDir, "intent.json"), "[]");
+    writeFileSync(join(bareDir, "dispatched_at"), String(Date.now() - 60_000));
+    const bRun = join(dir, "bare");
+    beginRun(bRun, facts);
+    const imp3 = spawnSync(process.execPath, [self, "worker", "intent", "import", "--from", bareDir, "--done", join(bareDir, "intent.json"), "--run-dir", bRun], { encoding: "utf8" });
+    const bBuilt = /** @type {BuiltRun} */ (buildRun(readLedger(bRun)));
+    ok("worker import with only the stamp and the output file still folds the worker in and starts the run at the dispatch",
+      bBuilt.workers.length === 1 && bBuilt.steps[0].name === "load" && /starts at the dispatch/.test(imp3.stderr), imp3.stderr);
     // The marker prepare-review.mjs prints: filled in and run as written, it records the step.
     ok("modelSteps lists intent-wait only for hybrid, lenses except on quick, and never state",
       modelSteps({ tier: "deep", topology: "hybrid" }).join() === "memory,gates,finders,intent-wait,lenses,consolidate,verify,judgments,validate,assert"

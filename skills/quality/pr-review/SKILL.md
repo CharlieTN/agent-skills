@@ -118,13 +118,14 @@ defect in 3 of 3 runs, where the default setting in one context had missed it in
 
 1. Pick a scratch path: `<scratchRoot()>/intent-<PR number>-<unix seconds>/intent.json`.
    Create its directory and stamp the dispatch time in it on a command you already run before
-   dispatching: `mkdir -p <dir> && date +%s%3N > <dir>/dispatched_at`. The reviewer's run telemetry
-   starts the run there, so the time the agent spends reading its definition is in the trace
-   ([`run-telemetry.md`](../../../agents/pr-reviewer/rules/run-telemetry.md)).
+   dispatching: `mkdir -p <dir> && date +%s > <dir>/dispatched_at`.
+   Write seconds: BSD `date` on macOS has no `%N`, so `%s%3N` there prints a literal `3N`.
+   The reviewer's run telemetry starts the run there, so the time the agent spends reading its
+   definition is in the trace ([`run-telemetry.md`](../../../agents/pr-reviewer/rules/run-telemetry.md)).
 2. In **one message**, dispatch both:
    - `pr-reviewer` with `<PR_REF> <pass-through flags> --intent-from <that path>`;
    - a general-purpose worker (the harness's general sub-agent type) with the [worker preamble](#worker-preamble--the-intent-worker),
-     told to run `prepare-review.mjs --pr <PR_REF> --no-telemetry --out <scratch dir>/context.json` (add
+     told to run `prepare-review.mjs --pr <PR_REF> --no-telemetry --out <dir>/context.json` (add
      `--review-sha <sha> --isolated` when the pass-through flags carry `--review-sha`), read
      `finders.md` and the review packet it wrote, act as the `intent` finder only, and write its
      candidates to that path as a JSON array.
