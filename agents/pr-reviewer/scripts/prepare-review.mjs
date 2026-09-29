@@ -343,6 +343,25 @@ export function resolveContextMode({ runMode, zeroDelta, routing }) {
  * @param {{ isolated: boolean, stickyBody: string|null, headSha: string }} args
  * @returns {{ priorSha: string|null, zeroDelta: boolean }}
  */
+/**
+ * Where `priorSha` came from, stated in the artifact's own words. A non-isolated run whose
+ * `--state` record supplied `priorSha` must not be told that value is the GitHub fallback rung
+ * — the two rungs carry different guarantees, and a consumer reads these strings literally.
+ * @param {{ fromState: boolean }} args
+ * @returns {{ loreKitNotCovered: string, note: string }}
+ */
+export function priorShaProvenance({ fromState }) {
+  return fromState
+    ? {
+      loreKitNotCovered: "LoreKit reads (Steps 1.0, 1.2c, 1.2d) — priorSha below is from the --state record (Step 0.7), and carries no PRIOR_DIAGNOSTICS",
+      note: "priorSha is from the --state record. PRIOR_DIAGNOSTICS is not carried into context.json — read it off that record before taking Step 0.8's fast path.",
+    }
+    : {
+      loreKitNotCovered: "LoreKit reads (Steps 0.7, 1.0, 1.2c, 1.2d) — priorSha below is the GitHub FALLBACK rung only, and carries no PRIOR_DIAGNOSTICS",
+      note: "PRIOR_DIAGNOSTICS is NOT recoverable from the fallback rung. Read the LoreKit state record before taking Step 0.8's fast path.",
+    };
+}
+
 export function resolvePriorRun({ isolated, stickyBody, headSha, statePriorSha = null }) {
   if (isolated) return { priorSha: null, zeroDelta: false };
   // The state record is the primary source (Step 0.7); the sticky's footer is the fallback rung.
@@ -1574,7 +1593,7 @@ async function prepare(opts) {
     notCovered: [
       runMode.isolated
         ? "LoreKit reads — Step 0.7 (the state record) is SKIPPED entirely under --isolated, and priorSha below is null (pipeline.md § --isolated). Steps 1.0/1.2c/1.2d (codebase-knowledge/lesson reads) are NOT skipped by --isolated — those are project memory, not run-comparability state, and persist by design across PRs and across runs; a comparability run (A/B, shadow) that wants a clean memory baseline must arrange that itself, --isolated does not guarantee it."
-        : "LoreKit reads (Steps 0.7, 1.0, 1.2c, 1.2d) — priorSha below is the GitHub FALLBACK rung only, and carries no PRIOR_DIAGNOSTICS",
+        : priorShaProvenance({ fromState: !!state.priorSha }).loreKitNotCovered,
       "routing{} below is only as accurate as the --state file the caller passed — no --state means lastFullSha/incrRunsSinceFull default to none/0 (see anomalies[] when this fired)",
       "Phases D and E, Steps 2.4*, 2.7, 2.9c — the Gate 4 SCAN below is mechanical pre-candidates only; confirm/exempt disposition and any AI-stub findings are judgment",
       "every write: the sticky, the review, the state record",
@@ -1662,7 +1681,7 @@ async function prepare(opts) {
       priorDiagnostics: null,
       note: runMode.isolated
         ? "--isolated: first-run semantics — no prior-run diagnostics, no delta triage, no fallback-rung priorSha (pipeline.md § --isolated)."
-        : "PRIOR_DIAGNOSTICS is NOT recoverable from the fallback rung. Read the LoreKit state record before taking Step 0.8's fast path.",
+        : priorShaProvenance({ fromState: !!state.priorSha }).note,
     },
 
     workspace: {
@@ -1957,6 +1976,15 @@ async function selfTest() {
   t("resolvePriorRun: non-isolated recovers priorSha from the sticky footer, as before", () => {
     const r = resolvePriorRun({ isolated: false, stickyBody: "commit `abc1234`", headSha: "abc1234def56789" });
     return r.priorSha === "abc1234" && r.zeroDelta === true;
+  });
+  t("priorShaProvenance: a --state priorSha is named as the state record, never the fallback rung", () => {
+    const p = priorShaProvenance({ fromState: true });
+    return p.loreKitNotCovered.includes("from the --state record") && !/FALLBACK rung/i.test(p.loreKitNotCovered)
+      && p.loreKitNotCovered.includes("carries no PRIOR_DIAGNOSTICS") && !/fallback rung/i.test(p.note);
+  });
+  t("priorShaProvenance: without a --state priorSha the fallback-rung wording stands", () => {
+    const p = priorShaProvenance({ fromState: false });
+    return p.loreKitNotCovered.includes("GitHub FALLBACK rung only") && p.note.includes("fallback rung");
   });
   t("resolvePriorRun: non-isolated with no sticky is a genuine first run", () => {
     const r = resolvePriorRun({ isolated: false, stickyBody: null, headSha: "abc1234def56789" });
