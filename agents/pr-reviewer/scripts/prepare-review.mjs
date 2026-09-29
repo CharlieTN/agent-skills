@@ -32,8 +32,11 @@
  *
  * Usage
  *   node prepare-review.mjs --pr <url|owner/repo#n|n> [--repo owner/repo]
- *        [--out <file>] [--workdir <dir>] [--reviewer-login <login>]
- *        [--no-workspace] [--no-impact] [--timeout-ms N] [--quiet]
+ *        [--out <file>] [--workdir <dir>] [--repo-dir <dir>] [--reviewer-login <login>]
+ *        [--no-workspace] [--no-impact] [--no-telemetry] [--inline-payloads]
+ *        [--timeout-ms N] [--quiet] [--pin-head <sha>] [--isolated] [--full]
+ *        [--state <file>] [--effort high] [--thoroughness 0..1] [--no-threads]
+ *        [--review-sha <sha>]
  *   node prepare-review.mjs --self-test
  *
  * Exit codes: 0 ok · 1 unrecoverable (no PR reference resolved, metadata
@@ -2367,8 +2370,8 @@ async function main(argv) {
   if (!opts.pr) {
     process.stderr.write(
       "usage: prepare-review.mjs --pr <url|owner/repo#n|n> [--repo owner/repo] [--out file] " +
-        "[--workdir dir] [--reviewer-login login] [--no-workspace] [--no-impact] " +
-        "[--inline-payloads] [--timeout-ms N] [--quiet] [--pin-head sha] [--isolated] [--full] " +
+        "[--workdir dir] [--repo-dir dir] [--reviewer-login login] [--no-workspace] [--no-impact] " +
+        "[--no-telemetry] [--inline-payloads] [--timeout-ms N] [--quiet] [--pin-head sha] [--isolated] [--full] " +
         "[--state file] [--effort high] [--thoroughness 0..1] [--no-threads] [--review-sha sha] | --self-test\n",
     );
     process.exit(2);
