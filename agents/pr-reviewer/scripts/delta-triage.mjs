@@ -101,8 +101,144 @@ export function prChurnLines(perFile, prFiles) {
   return (perFile || []).reduce((n, f) => n + (inPr.has(f.filename) ? Number(f.lines) || 0 : 0), 0);
 }
 
+/** GitHub truncates a compare's `files` at 300 entries; a list that long cannot be trusted as complete. */
+export const COMPARE_FILES_CAP = 300;
+
+/**
+ * Whether an INTACT compare's file list may be used as the delta. It may not when it is
+ * truncated (length >= COMPARE_FILES_CAP — the authored files can be the ones cut off: on
+ * dash0#20655 the 300 returned were main's, and the 4 authored files were absent), nor when
+ * `restrictToPrFiles()` dropped anything (a merged-in base polluted the range, and the kept rows
+ * are PR files the base ALSO touched, not the author's delta). An untrusted list is never
+ * filtered into a delta; the caller recomputes it from local git or the blob-SHA route.
+ * @param {PrFile[]} compareFiles @param {PrFile[]} prFiles
+ * @returns {{trusted: true, files: PrFile[], reason: null} | {trusted: false, files: null, reason: string}}
+ */
+export function compareTrust(compareFiles, prFiles) {
+  const list = compareFiles || [];
+  const own = restrictToPrFiles(list, prFiles);
+  const truncated = list.length >= COMPARE_FILES_CAP;
+  if (!truncated && !own.note) return { trusted: true, files: own.files, reason: null };
+  const parts = [];
+  if (truncated) parts.push(`delta compare returned ${list.length} files (GitHub's ${COMPARE_FILES_CAP}-file cap) — truncated`);
+  if (own.note) parts.push(own.note);
+  return { trusted: false, files: null, reason: parts.join("; ") };
+}
+
+/**
+ * Paths the author touched in `prior..head` (first-parent non-merge commits plus files a
+ * first-parent merge resolved by hand, i.e. conflict resolutions), kept to the PR's
+ * own files when that list is complete. A complete PR list excludes a file the author touched and
+ * later reverted out of the PR; an incomplete one would wrongly drop authored files, so it is not
+ * applied then. Order follows the PR list, then the rest sorted, so output is stable.
+ * @param {Iterable<string>} touched @param {PrFile[]} prFiles @param {boolean} prFilesComplete
+ * @returns {string[]}
+ */
+export function authoredPrPaths(touched, prFiles, prFilesComplete) {
+  const t = new Set([...touched].filter(Boolean));
+  if (!prFilesComplete) return [...t].sort();
+  return (prFiles || []).map((f) => f.filename).filter((n) => t.has(n));
+}
+
+/**
+ * `git diff --numstat` + `--name-status` + the patch text (all `--no-renames`) → the PR-files row
+ * shape `{filename, status, additions, deletions, patch}`. `patch` starts at the first `@@`, like
+ * the API's; a binary file (`-` counts, no hunk) gets 0/0 and a null patch.
+ * @param {string} numstat @param {string} nameStatus @param {string} patch @returns {PrFile[]}
+ */
+export function parseLocalDiff(numstat, nameStatus, patch) {
+  /** @type {Record<string, string>} */
+  const STATUS = { A: "added", D: "removed", M: "modified", T: "changed" };
+  /** @type {Map<string, string>} */
+  const statusOf = new Map();
+  for (const line of String(nameStatus || "").split("\n")) {
+    const m = /^([A-Z])\d*\t(.+)$/.exec(line);
+    if (m) statusOf.set(m[2], STATUS[m[1]] || "modified");
+  }
+  /** @type {Map<string, string>} */
+  const patchOf = new Map();
+  for (const chunk of String(patch || "").split(/^(?=diff --git )/m)) {
+    const path = /^\+\+\+ b\/(.+)$/m.exec(chunk)?.[1] ?? /^--- a\/(.+)$/m.exec(chunk)?.[1];
+    const at = chunk.search(/^@@/m);
+    if (path && at >= 0) patchOf.set(path, chunk.slice(at).replace(/\n$/, ""));
+  }
+  /** @type {PrFile[]} */
+  const rows = [];
+  for (const line of String(numstat || "").split("\n")) {
+    const m = /^(-|\d+)\t(-|\d+)\t(.+)$/.exec(line);
+    if (!m) continue;
+    const filename = m[3];
+    rows.push({
+      filename,
+      status: statusOf.get(filename) || "modified",
+      additions: m[1] === "-" ? 0 : Number(m[1]),
+      deletions: m[2] === "-" ? 0 : Number(m[2]),
+      patch: patchOf.get(filename) ?? null,
+    });
+  }
+  return rows;
+}
+
+/**
+ * `pulls/{n}/files` is paginated and capped at 3000 files; a short or partially-parsed list is
+ * reported, never silently trusted as the PR's whole diff.
+ * @param {number} listed @param {number|undefined} changedFiles @param {string|null} parseError
+ * @returns {{complete: boolean, note: string|null}}
+ */
+export function prFilesCompleteness(listed, changedFiles, parseError) {
+  if (parseError) return { complete: false, note: `PR files list partially unreadable (${parseError}) — delta restriction treats it as incomplete` };
+  if (Number.isInteger(changedFiles) && listed < /** @type {number} */ (changedFiles)) {
+    return { complete: false, note: `PR files list incomplete: ${listed} of ${changedFiles} changed files (pulls/{n}/files caps at 3000) — delta restriction treats it as incomplete` };
+  }
+  return { complete: true, note: null };
+}
+
 import { FULL_REFRESH_DELTA } from "./route-depth.mjs";
 export { FULL_REFRESH_DELTA };
+/** @typedef {{ok: true, files: PrFile[]} | {ok: false, reason: string}} LocalDeltaResult */
+/** @typedef {{ok: true, tree: TreeEntry[]} | {ok: false, reason: string}} PriorTreeResult */
+
+/**
+ * The delta for an INTACT compare, with the I/O injected so the decision is testable. A trusted
+ * compare list is the delta as-is. An untrusted one (compareTrust) is replaced — never filtered —
+ * by the local-git authored delta when a checkout holds both SHAs (no truncation), else by the
+ * blob-SHA route over the PR's own files (safe over-count), else the full PR list. Every
+ * replacement returns an anomaly naming the route and why.
+ * @param {{compareFiles: PrFile[], prFiles: PrFile[], readLocal: () => Promise<LocalDeltaResult>,
+ *   readPriorTree: () => Promise<PriorTreeResult>}} input
+ * @returns {Promise<{files: PrFile[], route: "compare"|"local-git"|"blob-diff"|"full-pr", anomaly: string|null}>}
+ */
+export async function resolveIntactDelta({ compareFiles, prFiles, readLocal, readPriorTree }) {
+  const trust = compareTrust(compareFiles, prFiles);
+  if (trust.trusted) return { files: trust.files, route: "compare", anomaly: null };
+  const local = await readLocal();
+  if (local.ok) {
+    return { files: local.files, route: "local-git", anomaly: `${trust.reason}; delta computed from local git (authored first-parent commits, prior..head, over the PR's files)` };
+  }
+  if ((prFiles || []).every((f) => f.sha)) {
+    const tree = await readPriorTree();
+    if (tree.ok) {
+      return { files: blobDelta(prFiles, tree.tree), route: "blob-diff", anomaly: `${trust.reason}; local git unavailable (${local.reason}) — delta from the blob-SHA route (over-counts toward full)` };
+    }
+    return { files: prFiles, route: "full-pr", anomaly: `${trust.reason}; local git unavailable (${local.reason}) and prior tree read failed (${tree.reason}) — full-PR delta` };
+  }
+  return { files: prFiles, route: "full-pr", anomaly: `${trust.reason}; local git unavailable (${local.reason}) and PR rows lack sha — full-PR delta` };
+}
+
+/**
+ * Cumulative churn lines (D4) from the churn compare's per-file `{filename, lines}` rows. A
+ * trusted list sums over the PR's files; an untrusted one (truncated or polluted) is replaced by
+ * the local-git authored delta's lines, else read as OVER the refresh threshold — never guessed.
+ * @param {{perFile: {filename: string, lines?: number}[], prFiles: PrFile[], readLocal: () => Promise<LocalDeltaResult>}} input
+ * @returns {Promise<{lines: number, anomaly: string|null}>}
+ */
+export async function resolveChurnLines({ perFile, prFiles, readLocal }) {
+  const trust = compareTrust(/** @type {PrFile[]} */ (perFile), prFiles);
+  if (trust.trusted) return { lines: prChurnLines(perFile, prFiles), anomaly: null };
+  const local = await readLocal();
+  if (local.ok) return { lines: deltaCounts(local.files).deltaLines, anomaly: null };
+  return { lines: FULL_REFRESH_DELTA + 1, anomaly: `cumulative-churn compare untrusted (${trust.reason}) and local git unavailable (${local.reason}) — treated as over the refresh threshold` };
+}
 
 /**
  * Cumulative churn since the last full pass (the deep-lens-refresh input,
@@ -130,7 +266,7 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIX = join(HERE, "..", "..", "..", "scripts", "eval", "fixtures", "delta-triage");
 
-function selfTest() {
+async function selfTest() {
   /** @type {string[]} */
   const fails = [];
   /** @param {string} label @param {boolean} cond @param {string} [detail] */
@@ -204,11 +340,81 @@ function selfTest() {
     prChurnLines([{ filename: "src/a.ts", lines: 30 }, { filename: "src/b.ts", lines: 12 }, { filename: "build.gradle", lines: 1300 }], prOwn) === 42);
   ok("prChurnLines is 0 for an empty/absent list", prChurnLines([], prOwn) === 0 && prChurnLines(undefined, prOwn) === 0);
 
+  // compareTrust — dash0#20655 read-only re-check: the compare returned exactly 300 files, all
+  // main's but 4 PR files main also touched; the 4 authored files were cut off. Filtering that list
+  // produced a small, WRONG delta. A truncated or polluted list must never become the delta.
+  const pr20655 = [{ filename: "agent0/store.ts", status: "modified", sha: "new1" }, { filename: "agent0/page.tsx", status: "modified", sha: "new2" },
+    { filename: "gen/attributes.gen.ts", status: "modified", sha: "new3" }];
+  const truncatedCmp = Array.from({ length: 299 }, (_, i) => ({ filename: `main/f${i}.ts`, additions: 1, deletions: 0 }))
+    .concat([{ filename: "gen/attributes.gen.ts", additions: 400, deletions: 94 }]);
+  const tr = compareTrust(truncatedCmp, pr20655);
+  ok("compareTrust: a 300-file compare is untrusted (truncated), never filtered into a delta",
+    tr.trusted === false && tr.files === null && /300-file cap/.test(tr.reason || ""), JSON.stringify(tr.reason));
+  const polluted = compareTrust([{ filename: "agent0/store.ts" }, { filename: "CODEOWNERS.bak" }], pr20655);
+  ok("compareTrust: an under-cap compare that dropped a non-PR file is untrusted (polluted) and says so",
+    polluted.trusted === false && /outside the PR's own diff/.test(polluted.reason || ""), JSON.stringify(polluted.reason));
+  const trusted = compareTrust(compareIntact.files, compareIntact.files);
+  ok("compareTrust: an under-cap compare with no extra files is trusted and unchanged",
+    trusted.trusted === true && trusted.files.length === compareIntact.files.length && trusted.files.every((f, i) => f === compareIntact.files[i]));
+
+  // authoredPrPaths / parseLocalDiff / prFilesCompleteness
+  ok("authoredPrPaths keeps touched PR files in PR order, drops touched non-PR files",
+    JSON.stringify(authoredPrPaths(["agent0/page.tsx", "main/x.ts", "agent0/store.ts"], pr20655, true)) === JSON.stringify(["agent0/store.ts", "agent0/page.tsx"]));
+  ok("authoredPrPaths skips the PR restriction when the PR list is incomplete",
+    JSON.stringify(authoredPrPaths(["b.ts", "a.ts"], [{ filename: "a.ts" }], false)) === JSON.stringify(["a.ts", "b.ts"]));
+  const rows = parseLocalDiff("3\t1\tsrc/a.ts\n-\t-\tlogo.png\n5\t0\tsrc/new.ts\n", "M\tsrc/a.ts\nM\tlogo.png\nA\tsrc/new.ts\n",
+    "diff --git a/src/a.ts b/src/a.ts\nindex 1..2 100644\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,1 +1,3 @@\n-x\n+y\n+z\n+w\n"
+    + "diff --git a/logo.png b/logo.png\nBinary files a/logo.png and b/logo.png differ\n"
+    + "diff --git a/src/new.ts b/src/new.ts\nnew file mode 100644\n--- /dev/null\n+++ b/src/new.ts\n@@ -0,0 +1,5 @@\n+1\n+2\n+3\n+4\n+5\n");
+  ok("parseLocalDiff builds API-shaped rows (counts, status, @@-first patch, binary null)",
+    rows.length === 3 && rows[0].additions === 3 && rows[0].deletions === 1 && rows[0].status === "modified"
+      && (rows[0].patch || "").startsWith("@@ -1,1 +1,3 @@") && rows[1].patch === null && rows[1].additions === 0
+      && rows[2].status === "added" && (rows[2].patch || "").startsWith("@@ -0,0 +1,5 @@") && deltaCounts(rows).deltaLines === 9,
+    JSON.stringify(rows));
+  ok("prFilesCompleteness flags a short list and a partial parse, passes a full one",
+    prFilesCompleteness(30, 45, null).complete === false && prFilesCompleteness(45, 45, null).complete === true
+      && prFilesCompleteness(45, 45, "1 unparseable line(s)").complete === false && prFilesCompleteness(10, undefined, null).complete === true);
+
   // churnState
   ok("churnState: no last-full SHA -> 0", churnState({ hasLastFull: false }) === 0);
   ok("churnState: intact compare -> the real summed delta", churnState({ hasLastFull: true, meta: { status: "ahead", behind_by: 0 }, deltaLinesIfIntact: 42 }) === 42);
   ok("churnState: diverged compare -> FULL_REFRESH_DELTA + 1, never guessed",
     churnState({ hasLastFull: true, meta: { status: "diverged" }, deltaLinesIfIntact: 5 }) === FULL_REFRESH_DELTA + 1);
+
+  // resolveIntactDelta — the decision prepare-review.mjs runs, with the I/O injected.
+  const priorTree20655 = [{ path: "agent0/store.ts", sha: "old1" }, { path: "agent0/page.tsx", sha: "old2" }, { path: "gen/attributes.gen.ts", sha: "new3" }];
+  /** @type {string[]} */
+  let calls = [];
+  const noLocal = async () => { calls.push("local"); return /** @type {LocalDeltaResult} */ ({ ok: false, reason: "no checkout" }); };
+  const tree = async () => { calls.push("tree"); return /** @type {PriorTreeResult} */ ({ ok: true, tree: priorTree20655 }); };
+  const viaBlob = await resolveIntactDelta({ compareFiles: truncatedCmp, prFiles: pr20655, readLocal: noLocal, readPriorTree: tree });
+  ok("truncated compare, no local git: the blob route runs and keeps every PR file whose blob changed",
+    viaBlob.route === "blob-diff" && ["agent0/store.ts", "agent0/page.tsx"].every((n) => viaBlob.files.some((f) => f.filename === n))
+      && !viaBlob.files.some((f) => f.filename.startsWith("main/")) && /300-file cap.*blob-SHA route/.test(viaBlob.anomaly || ""),
+    JSON.stringify({ route: viaBlob.route, files: viaBlob.files.map((f) => f.filename), anomaly: viaBlob.anomaly }));
+  calls = [];
+  const authored = [{ filename: "agent0/store.ts", status: "modified", additions: 60, deletions: 10, patch: "@@ -1 +1 @@" }];
+  const viaLocal = await resolveIntactDelta({
+    compareFiles: [{ filename: "gen/attributes.gen.ts" }, { filename: "CODEOWNERS.bak" }], prFiles: pr20655,
+    readLocal: async () => { calls.push("local"); return { ok: true, files: authored }; }, readPriorTree: tree,
+  });
+  ok("polluted (dropped) compare routes to the truncation-immune local-git delta and names it",
+    viaLocal.route === "local-git" && viaLocal.files === authored && JSON.stringify(calls) === JSON.stringify(["local"])
+      && /outside the PR's own diff.*local git/.test(viaLocal.anomaly || ""), JSON.stringify(viaLocal));
+  calls = [];
+  const viaCompare = await resolveIntactDelta({ compareFiles: compareIntact.files, prFiles: compareIntact.files, readLocal: noLocal, readPriorTree: tree });
+  ok("clean intact compare: used as-is, no local or tree read, no anomaly",
+    viaCompare.route === "compare" && viaCompare.anomaly === null && calls.length === 0 && viaCompare.files.length === compareIntact.files.length);
+
+  // resolveChurnLines
+  const churnTrusted = await resolveChurnLines({ perFile: [{ filename: "agent0/store.ts", lines: 30 }], prFiles: pr20655, readLocal: noLocal });
+  ok("resolveChurnLines: trusted list sums PR files", churnTrusted.lines === 30 && churnTrusted.anomaly === null);
+  const churnTrunc = await resolveChurnLines({ perFile: truncatedCmp.map((f) => ({ filename: f.filename, lines: 1 })), prFiles: pr20655, readLocal: noLocal });
+  ok("resolveChurnLines: truncated list with no local git reads as over the threshold",
+    churnTrunc.lines === FULL_REFRESH_DELTA + 1 && /untrusted/.test(churnTrunc.anomaly || ""));
+  const churnLocal = await resolveChurnLines({ perFile: [{ filename: "CODEOWNERS.bak", lines: 900 }, { filename: "agent0/store.ts", lines: 5 }], prFiles: pr20655,
+    readLocal: async () => ({ ok: true, files: authored }) });
+  ok("resolveChurnLines: polluted list uses the local-git authored lines", churnLocal.lines === 70 && churnLocal.anomaly === null);
 
   console.log(`${fails.length === 0 ? "✓" : "✗"} delta-triage self-test: ${fails.length === 0 ? "all checks passed" : `${fails.length} failed`}`);
   for (const f of fails) console.log(`    ✗ ${f}`);

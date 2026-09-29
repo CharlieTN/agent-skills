@@ -1267,19 +1267,18 @@ from a repository that learned nothing.
 
 ### 1.2b Delta triage and depth routing (Phase C)
 
-Two halves with different scopes, and confusing them is how a `full` run ends up unrouted:
+Two halves with different scopes (confusing them leaves a `full` run unrouted):
 
 - **Delta triage** (through *Tier rules* below) — **incremental modes only**, skipped when
   `RUN_MODE == "full"`. `PRIOR_SHA` and `HEAD_SHA` must both be set.
 - **Depth routing** (*Bind `DEPTH_TIER`*) — **every mode, always**, including `full` and the
   zero-delta short-circuit. It is what binds the tier the whole review is priced and reported at.
 
-**Mechanical home for everything through *Bind `DEPTH_TIER`*:** `prepare-review.mjs` computes the
-divergence pre-check, the delta shape classification, the cumulative-churn state (via
-`delta-triage.mjs`'s `churnState()`), and `routeDepth()` (`route-depth.mjs`) internally, binding the
-result on `context.routing` (`{tier, triggers, override, sizeExcluded, capApplied, why}`) and
-`context.deltaLines` (the delta's count on an incremental run) / `context.shape`. The manual
-contract below is the fallback those functions implement.
+**Mechanical home through *Bind `DEPTH_TIER`*:** `prepare-review.mjs` computes the divergence
+pre-check, delta shape, cumulative churn (`delta-triage.mjs`), and `routeDepth()`, binding
+`context.routing` (`{tier, triggers, override, sizeExcluded, capApplied, why}`), `context.deltaLines`
+(the delta's count when incremental), `context.deltaRoute`, and `context.shape`. The manual contract
+below is the fallback.
 
 #### Divergence pre-check — never trust `compare/<PRIOR>...<HEAD>` blind
 
@@ -1309,15 +1308,16 @@ jq '.files' <<< "$DELTA_JSON" > /tmp/pr-delta.json
 DELTA_SOURCE="compare"
 ```
 
-Then drop every row whose `filename` is absent from `/tmp/pr-files.json`, recount, and note the
-drop: a head that merges the base in stays `ahead` yet carries the base's files. The churn compare
-gets the same restriction (`restrictToPrFiles()` / `prChurnLines()`).
+A list of ≥ 300 rows (GitHub's cap) or with a file absent from `/tmp/pr-files.json` (a merged-in
+base stays `ahead`) is untrusted — never filter it. Recompute from a local checkout holding both
+SHAs: files of `git log --first-parent --no-merges PRIOR..HEAD` plus each merge's `--remerge-diff`,
+∩ the PR's files, then `git diff PRIOR HEAD --` them; else the blob route below. The churn compare
+gets the same rule (`resolveIntactDelta()` / `resolveChurnLines()`).
 
 **Diverged history** (anything else) — substitute the rebase-immune **blob-SHA authored delta**:
 
 ```bash
-# The PR's files at the live head already carry their blob SHAs (/tmp/pr-files.json, Step 1.2).
-# One recursive tree read at PRIOR_SHA gives the same files' blobs as last reviewed.
+# /tmp/pr-files.json (Step 1.2) carries head blob SHAs; one tree read at PRIOR_SHA gives the prior ones.
 gh api "repos/$RESOLVED_REPO/git/trees/$PRIOR_SHA?recursive=1" \
   --jq '[.tree[] | select(.type == "blob") | {path, sha}]' > /tmp/tree-prior.json
 

@@ -46,12 +46,12 @@
  */
 
 import { execFile, spawn } from "node:child_process";
-import { writeFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, openSync, closeSync, statSync } from "node:fs";
+import { writeFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, openSync, closeSync, statSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Timing, beginRun, appendRecord, hostFacts, ledgerPath, markerCommand, modelSteps } from "./review-telemetry.mjs";
-import { classifyDivergence, blobDelta, deltaCounts, churnState, restrictToPrFiles, prChurnLines, FULL_REFRESH_DELTA } from "./delta-triage.mjs";
+import { classifyDivergence, blobDelta, deltaCounts, churnState, resolveIntactDelta, resolveChurnLines, authoredPrPaths, parseLocalDiff, prFilesCompleteness, FULL_REFRESH_DELTA } from "./delta-triage.mjs";
 import { routeDepth, resolveBudget } from "./route-depth.mjs";
 import { buildReviewPacket, consumersByFile } from "./review-packet.mjs";
 import { discoverStandards, trivialSkip } from "./discover-standards.mjs";
@@ -874,7 +874,7 @@ const CLONE_TIMEOUT_FLOOR_MS = 300000;
  */
 /** Both compare reads' jq: the divergence fields plus what an intact range needs, in one call. */
 const DELTA_COMPARE_JQ = "{status, ahead_by, behind_by, files: [(.files // [])[] | {filename, additions, deletions, status, patch}]}";
-/** Per-file lines, not a pre-summed total: only the PR's own files may count toward D4 (prChurnLines). */
+/** Per-file lines, not a pre-summed total: resolveChurnLines() needs the list to judge truncation/pollution. */
 const CHURN_COMPARE_JQ = "{status, behind_by, files: [(.files // [])[] | {filename, lines: (.additions + .deletions)}]}";
 
 /** One `compare/<from>...<to>` read that returns the divergence fields and the file data together.
@@ -890,6 +890,58 @@ async function compareRange(repo, from, to, jq, metaJq, timeoutMs) {
   if (both.ok) return both;
   const meta = await ghJson(["api", path, "--jq", metaJq], { timeoutMs });
   return meta.ok ? { ...meta, filesError: both.error } : meta;
+}
+
+/**
+ * The authored delta `from..to` read from a LOCAL git checkout — no 300-file compare cap. Tries
+ * each candidate dir in order and uses the first whose object store holds both SHAs with `from`
+ * an ancestor of `to`. "Authored" = files changed by first-parent non-merge commits in the range,
+ * plus files a first-parent merge resolved differently from git's automatic re-merge (conflicts),
+ * kept to the PR's own files (authoredPrPaths). Main's commits arrive on a merge's second parent,
+ * so they never count. Residual: a PR file the author and the merged-in base both touched carries
+ * the base's hunks too (the diff is `from..to` per file), which over-counts — the safe direction.
+ * @param {{dirs: (string|null|undefined)[], from: string, to: string, prFiles: any[], prFilesComplete: boolean, timeoutMs?: number}} input
+ * @returns {Promise<{ok: true, files: any[], dir: string} | {ok: false, reason: string}>}
+ */
+export async function localAuthoredDelta({ dirs, from, to, prFiles, prFilesComplete, timeoutMs = 60000 }) {
+  const candidates = [...new Set(dirs.filter((d) => d && existsSync(/** @type {string} */ (d))))];
+  if (!candidates.length) return { ok: false, reason: "no local git checkout" };
+  /** @param {string} out */
+  const lines = (out) => out.split("\n").map((l) => l.trim()).filter(Boolean);
+  let lastReason = "no candidate checkout holds both SHAs";
+  for (const dir of /** @type {string[]} */ (candidates)) {
+    /** @param {string[]} args */
+    const g = (args) => run("git", ["-C", dir, "-c", "core.quotePath=false", "--literal-pathspecs", ...args], { timeoutMs });
+    const haveBoth = (await g(["cat-file", "-e", `${from}^{commit}`])).ok && (await g(["cat-file", "-e", `${to}^{commit}`])).ok;
+    if (!haveBoth) { lastReason = `${from.slice(0, 7)} or ${to.slice(0, 7)} not in ${dir}'s object store`; continue; }
+    if (!(await g(["merge-base", "--is-ancestor", from, to])).ok) { lastReason = `${from.slice(0, 7)} is not an ancestor of ${to.slice(0, 7)} in ${dir}`; continue; }
+    const range = `${from}..${to}`;
+    const own = await g(["log", "--first-parent", "--no-merges", "--no-renames", "--format=", "--name-only", range]);
+    const merges = await g(["rev-list", "--first-parent", "--merges", range]);
+    if (!own.ok || !merges.ok) return { ok: false, reason: `git log failed in ${dir}: ${(own.stderr || merges.stderr).trim().slice(0, 160)}` };
+    const touched = new Set(lines(own.stdout));
+    for (const m of lines(merges.stdout)) {
+      // `--remerge-diff` (git >= 2.36) names only files the recorded merge differs from git's own
+      // automatic re-merge — conflict resolutions and hand edits. `--cc` also lists every file a
+      // CLEAN merge combined from both sides (dash0#20655: dozens of main's files), so it is only
+      // the fallback for an older git, over-counting in the safe direction.
+      let res = await g(["show", "--remerge-diff", "--no-renames", "--format=", "--name-only", m]);
+      if (!res.ok) res = await g(["diff-tree", "--cc", "--no-commit-id", "--name-only", "-r", m]);
+      if (!res.ok) return { ok: false, reason: `reading merge ${m.slice(0, 7)} failed` };
+      for (const f of lines(res.stdout)) touched.add(f);
+    }
+    const paths = authoredPrPaths(touched, prFiles, prFilesComplete);
+    if (!paths.length) return { ok: true, files: [], dir };
+    const base = ["diff", "--no-color", "--no-ext-diff", "--no-renames"];
+    const [numstat, nameStatus, patch] = await Promise.all([
+      g([...base, "--numstat", from, to, "--", ...paths]),
+      g([...base, "--name-status", from, to, "--", ...paths]),
+      g([...base, from, to, "--", ...paths]),
+    ]);
+    if (!numstat.ok || !nameStatus.ok || !patch.ok) return { ok: false, reason: `git diff failed in ${dir}` };
+    return { ok: true, files: parseLocalDiff(numstat.stdout, nameStatus.stdout, patch.stdout), dir };
+  }
+  return { ok: false, reason: lastReason };
 }
 
 async function materializeWorkspace({ repo, number, headSha, timeoutMs, anomalies, isolated = false, repoDir = null }) {
@@ -1295,6 +1347,10 @@ async function prepare(opts) {
   if (!commentsR.ok) anomalies.push(`issue comments unreadable: ${commentsR.error} — prior-run detection degrades to first run`);
 
   const files = filesR.value || [];
+  // pulls/{n}/files is paginated and capped at 3000: a short list would make the delta's PR-file
+  // restriction drop authored files, so it is reported and the restriction is relaxed.
+  const prFilesState = wantHistorical || !filesR.ok ? { complete: false, note: null } : prFilesCompleteness(files.length, meta.changedFiles, filesR.error);
+  if (prFilesState.note) anomalies.push(prFilesState.note);
   const { diffable, undiffable } = partitionUndiffable(files);
   const comments = commentsR.value || [];
   const sticky = findSticky(comments);
@@ -1530,6 +1586,10 @@ async function prepare(opts) {
   }
 
   let deltaFiles = diffable.length ? files.filter((f) => diffable.includes(f.filename)) : files;
+  /** @type {string} */ let deltaRoute = hasPriorRun ? "full-pr" : "none";
+  // Checkouts that may hold both SHAs for the truncation-immune local-git delta: the materialized
+  // workspace (rung 0 worktree / caller --workdir), then the --repo-dir clone.
+  const localGitDirs = [workspace.depthCapability === "checkout" ? workspace.dir : null, opts.repoDir ? pathResolve(opts.repoDir) : null];
   let deltaShape = shape;
   let deltaCountsResult = { deltaLines: deltaLines(files), newFiles: files.filter((f) => f.status === "added").length };
   let cumDeltaLines = 0;
@@ -1543,12 +1603,25 @@ async function prepare(opts) {
       const divergence = classifyDivergence(cmp.value);
       if (divergence === "intact") {
         if (Array.isArray(cmp.value.files)) {
-          // An intact range is not proof the files are the PR's own: a head that merges the base
-          // in stays `ahead` while sweeping in the base's files. Filter rather than switch to the
-          // blob diff — the compare's per-file counts are the delta's, the blob route's are the PR's.
-          const own = restrictToPrFiles(cmp.value.files, files);
-          deltaFiles = own.files;
-          if (own.note) anomalies.push(own.note);
+          // An intact range is not proof the list is the author's delta: a head that merges the
+          // base in stays `ahead` while sweeping in the base's files, and GitHub cuts the list at
+          // 300 — on dash0#20655 the authored files were the ones cut off. A truncated or polluted
+          // list is REPLACED (local git, else blob route), never filtered (resolveIntactDelta).
+          const resolved = await resolveIntactDelta({
+            compareFiles: cmp.value.files,
+            prFiles: files,
+            readLocal: () => localAuthoredDelta({ dirs: localGitDirs, from: /** @type {string} */ (priorSha), to: headSha, prFiles: files, prFilesComplete: prFilesState.complete, timeoutMs }),
+            readPriorTree: async () => {
+              const tree = await ghJson(
+                ["api", `repos/${repo}/git/trees/${priorSha}?recursive=1`, "--jq", '[.tree[] | select(.type == "blob") | {path, sha}]'],
+                { timeoutMs },
+              );
+              return tree.ok ? { ok: true, tree: tree.value || [] } : { ok: false, reason: String(tree.error) };
+            },
+          });
+          deltaFiles = resolved.files;
+          deltaRoute = resolved.route;
+          if (resolved.anomaly) anomalies.push(resolved.anomaly);
         } else {
           anomalies.push(`delta compare fetch failed: ${cmp.filesError} — falling back to full-PR delta`);
         }
@@ -1561,6 +1634,7 @@ async function prepare(opts) {
           );
           if (tree.ok) {
             deltaFiles = blobDelta(files, tree.value || []);
+            deltaRoute = "blob-diff";
           } else {
             anomalies.push(`diverged-history tree read failed: ${tree.error} — upgrading to full-PR delta, never trusting the diverged compare`);
           }
@@ -1599,7 +1673,17 @@ async function prepare(opts) {
       if (cum.ok) {
         let cumLines = 0;
         if (classifyDivergence(cum.value) === "intact") {
-          cumLines = Array.isArray(cum.value.files) ? prChurnLines(cum.value.files, files) : FULL_REFRESH_DELTA + 1;
+          if (Array.isArray(cum.value.files)) {
+            const churn = await resolveChurnLines({
+              perFile: cum.value.files,
+              prFiles: files,
+              readLocal: () => localAuthoredDelta({ dirs: localGitDirs, from: /** @type {string} */ (state.lastFullSha), to: headSha, prFiles: files, prFilesComplete: prFilesState.complete, timeoutMs }),
+            });
+            cumLines = churn.lines;
+            if (churn.anomaly) anomalies.push(churn.anomaly);
+          } else {
+            cumLines = FULL_REFRESH_DELTA + 1;
+          }
         }
         cumDeltaLines = churnState({ hasLastFull: true, meta: cum.value, deltaLinesIfIntact: cumLines });
       } else {
@@ -1748,6 +1832,8 @@ async function prepare(opts) {
     // The delta's own count on an incremental run (what RUN.delta_lines renders as "N lines in
     // delta"); the full-PR count otherwise — deltaCountsResult is initialised to it.
     deltaLines: deltaCountsResult.deltaLines,
+    // Which route produced the incremental delta: compare | local-git | blob-diff | full-pr | none.
+    deltaRoute,
 
     checks: { raw: checksR.ok ? checksR.stdout.trim() : null, readable: checksR.ok },
     reviews: reviewsR.value || [],
@@ -2176,29 +2262,69 @@ async function selfTest() {
     const body = src.slice(src.indexOf("async function prepare("), src.indexOf("function selfTest("));
     return /historicalThreads\(\{/.test(body) && /threads_created_as_of/.test(body);
   });
-  // ── dash0#20655: a head that merges the base in keeps compare/PRIOR...HEAD `ahead`, so the
-  // intact route swept main's files into the delta (routing D4/D7-D9/D12/D13, and Gate 4
-  // secret pre-candidates in main's test files). Both compares are restricted to the PR's diff. ──
-  t("prepare() restricts the intact delta and the churn compare to the PR's own files, and reports the delta count", () => {
+  // ── dash0#20655: a head that merges the base in keeps compare/PRIOR...HEAD `ahead`, and GitHub
+  // cuts the compare at 300 files — so the intact list was main's files, with the authored ones
+  // cut off. prepare() hands both compares to resolveIntactDelta/resolveChurnLines, which REPLACE
+  // an untrusted list (local git, else blob route) instead of filtering it. ──
+  t("prepare() routes the intact delta and the churn compare through the truncation-aware resolvers, and reports the delta count", () => {
     const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
     const body = src.slice(src.indexOf("async function prepare("), src.indexOf("function selfTest("));
-    return /deltaFiles = restrictToPrFiles\(cmp\.value\.files, files\)\.files|const own = restrictToPrFiles\(cmp\.value\.files, files\);\s*deltaFiles = own\.files;/.test(body)
-      && /anomalies\.push\(own\.note\)/.test(body)
-      && /prChurnLines\(cum\.value\.files, files\)/.test(body)
-      && /\n    deltaLines: deltaCountsResult\.deltaLines,\n\n    checks:/.test(body)
+    return /const resolved = await resolveIntactDelta\(\{\s*compareFiles: cmp\.value\.files,/.test(body)
+      && /deltaFiles = resolved\.files;/.test(body) && /if \(resolved\.anomaly\) anomalies\.push\(resolved\.anomaly\)/.test(body)
+      && /readLocal: \(\) => localAuthoredDelta\(\{ dirs: localGitDirs, from: \/\*\* @type \{string\} \*\/ \(priorSha\), to: headSha/.test(body)
+      && /const churn = await resolveChurnLines\(\{\s*perFile: cum\.value\.files,/.test(body)
+      && /readLocal: \(\) => localAuthoredDelta\(\{ dirs: localGitDirs, from: \/\*\* @type \{string\} \*\/ \(state\.lastFullSha\)/.test(body)
+      && /prFilesCompleteness\(files\.length, meta\.changedFiles, filesR\.error\)/.test(body)
+      && /\n    deltaLines: deltaCountsResult\.deltaLines,\n/.test(body)
       && /files: \[\(\.files \/\/ \[\]\)\[\] \| \{filename, lines/.test(CHURN_COMPARE_JQ);
   });
-  t("Gate 4 over the restricted delta flags nothing in a merged-in base file", () => {
-    const own = restrictToPrFiles(
-      [{ filename: "src/a.ts", patch: "@@ -1,0 +1,1 @@\n+export const a = 1;" },
-        { filename: "main/test/fixture.test.ts", patch: "@@ -1,0 +1,1 @@\n+const password = \"hunter2hunter2hunter2\";" }],
-      [{ filename: "src/a.ts" }],
-    );
-    const unrestricted = scanGate4([{ filename: "main/test/fixture.test.ts", patch: "@@ -1,0 +1,1 @@\n+const password = \"hunter2hunter2hunter2\";" }]);
+  t("localAuthoredDelta: a head that merges main in yields only the authored files (real git repo)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "prr-local-delta-"));
+    /** @param {string[]} a */
+    const g = (a) => run("git", ["-C", dir, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...a]);
+    await g(["init", "-q", "-b", "main"]);
+    const lines10 = Array.from({ length: 10 }, (_, i) => `l${i}`);
+    writeFileSync(join(dir, "shared.ts"), "one\n"); writeFileSync(join(dir, "main-only.ts"), "m\n");
+    writeFileSync(join(dir, "both.ts"), lines10.join("\n") + "\n"); writeFileSync(join(dir, "conflict.ts"), "c\n");
+    await g(["add", "-A"]); await g(["commit", "-qm", "base"]);
+    await g(["checkout", "-qb", "feat"]);
+    writeFileSync(join(dir, "feat.ts"), "f1\n"); writeFileSync(join(dir, "shared.ts"), "one\nfeat\n");
+    writeFileSync(join(dir, "both.ts"), ["FEAT", ...lines10.slice(1)].join("\n") + "\n"); writeFileSync(join(dir, "conflict.ts"), "feat\n");
+    await g(["add", "-A"]); await g(["commit", "-qm", "feat 1"]);
+    const prior = (await g(["rev-parse", "HEAD"])).stdout.trim();
+    await g(["checkout", "-q", "main"]);
+    writeFileSync(join(dir, "main-only.ts"), "m\nm2\n"); writeFileSync(join(dir, "main-new.ts"), "n\n");
+    // both.ts: main edits a far line, so the merge combines it CLEANLY — `--cc` would list it,
+    // `--remerge-diff` does not. conflict.ts: same line, so the author resolves it by hand.
+    writeFileSync(join(dir, "both.ts"), [...lines10.slice(0, 9), "MAIN"].join("\n") + "\n"); writeFileSync(join(dir, "conflict.ts"), "main\n");
+    await g(["add", "-A"]); await g(["commit", "-qm", "main moves"]);
+    await g(["checkout", "-q", "feat"]);
+    writeFileSync(join(dir, "feat.ts"), "f1\nf2\nf3\n");
+    await g(["add", "-A"]); await g(["commit", "-qm", "feat 2"]);
+    await g(["merge", "-q", "--no-edit", "main"]);
+    writeFileSync(join(dir, "conflict.ts"), "resolved\n");
+    await g(["add", "-A"]); await g(["commit", "-qm", "merge main", "--no-edit"]);
+    const head = (await g(["rev-parse", "HEAD"])).stdout.trim();
+    const prFiles = [{ filename: "shared.ts" }, { filename: "feat.ts" }, { filename: "both.ts" }, { filename: "conflict.ts" }];
+    const r = await localAuthoredDelta({ dirs: [null, "/nonexistent-prr", dir], from: prior, to: head, prFiles, prFilesComplete: true });
+    const names = r.ok ? r.files.map((f) => f.filename).sort() : [];
+    const feat = r.ok ? r.files.find((f) => f.filename === "feat.ts") : null;
+    const missing = await localAuthoredDelta({ dirs: [dir], from: "0".repeat(40), to: head, prFiles, prFilesComplete: true });
+    rmSync(dir, { recursive: true, force: true });
+    return r.ok && JSON.stringify(names) === JSON.stringify(["conflict.ts", "feat.ts"]) && feat?.additions === 2 && feat?.deletions === 0
+      && String(feat?.patch).startsWith("@@") && missing.ok === false;
+  });
+  t("Gate 4 over the resolved delta flags nothing in a merged-in base file", async () => {
+    const secret = { filename: "main/test/fixture.test.ts", patch: "@@ -1,0 +1,1 @@\n+const password = \"hunter2hunter2hunter2\";" };
+    const authored = [{ filename: "src/a.ts", patch: "@@ -1,0 +1,1 @@\n+export const a = 1;" }];
+    const resolved = await resolveIntactDelta({
+      compareFiles: [authored[0], secret], prFiles: [{ filename: "src/a.ts", sha: "x" }],
+      readLocal: async () => ({ ok: true, files: authored }), readPriorTree: async () => ({ ok: false, reason: "unused" }),
+    });
     const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
     const body = src.slice(src.indexOf("async function prepare("), src.indexOf("function selfTest("));
-    // prepare() must scan the (restricted) delta, never the raw compare list.
-    return unrestricted.some((c) => c.category === "secret") && scanGate4(own.files).length === 0 && own.dropped.length === 1
+    // prepare() must scan the resolved delta, never the raw compare list.
+    return scanGate4([secret]).some((c) => c.category === "secret") && scanGate4(resolved.files).length === 0
       && /const gate4Precandidates = scanGate4\(deltaFiles\);/.test(body);
   });
   t("buildThreads: carries the root comment's createdAt as created_at (the as-of filter's key)", () => {
@@ -2591,7 +2717,7 @@ async function main(argv) {
           `context: ${outPath}  (${context.elapsedMs} ms)`,
           `  PR        ${context.target.repo}#${context.target.number} · ${context.meta.state}${context.meta.isDraft ? " (draft)" : ""} · @${context.meta.author}`,
           `  head      ${context.headSha.slice(0, 7)}  base ${context.baseSha.slice(0, 7)}`,
-          `  delta     ${context.deltaLines} lines across ${context.files.length} files (${context.undiffablePaths.length} undiffable)`,
+          `  delta     ${context.deltaLines} lines via ${context.deltaRoute} · PR ${context.files.length} files (${context.undiffablePaths.length} undiffable)`,
           `  relation  ${context.reviewRelation} (identity: ${context.identitySource})`,
           `  depth     ${w.depthCapability} via rung ${w.rung} · tier2 ${w.tier2Checker || "none"} · cleanup ${w.cleanup}`,
           `  prior     ${context.priorRun.priorSha ? `${context.priorRun.priorSha} (${context.priorRun.source})` : "none"}${context.priorRun.zeroDelta ? " · ZERO DELTA" : ""}`,
