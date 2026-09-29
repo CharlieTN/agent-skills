@@ -2188,6 +2188,19 @@ async function selfTest() {
       && /\n    deltaLines: deltaCountsResult\.deltaLines,\n\n    checks:/.test(body)
       && /files: \[\(\.files \/\/ \[\]\)\[\] \| \{filename, lines/.test(CHURN_COMPARE_JQ);
   });
+  t("Gate 4 over the restricted delta flags nothing in a merged-in base file", () => {
+    const own = restrictToPrFiles(
+      [{ filename: "src/a.ts", patch: "@@ -1,0 +1,1 @@\n+export const a = 1;" },
+        { filename: "main/test/fixture.test.ts", patch: "@@ -1,0 +1,1 @@\n+const password = \"hunter2hunter2hunter2\";" }],
+      [{ filename: "src/a.ts" }],
+    );
+    const unrestricted = scanGate4([{ filename: "main/test/fixture.test.ts", patch: "@@ -1,0 +1,1 @@\n+const password = \"hunter2hunter2hunter2\";" }]);
+    const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
+    const body = src.slice(src.indexOf("async function prepare("), src.indexOf("function selfTest("));
+    // prepare() must scan the (restricted) delta, never the raw compare list.
+    return unrestricted.some((c) => c.category === "secret") && scanGate4(own.files).length === 0 && own.dropped.length === 1
+      && /const gate4Precandidates = scanGate4\(deltaFiles\);/.test(body);
+  });
   t("buildThreads: carries the root comment's createdAt as created_at (the as-of filter's key)", () => {
     const out = buildThreads([{ id: "T", comments: { nodes: [{ databaseId: 1, createdAt: "2026-01-01T00:00:00Z" }] } }]);
     return out[0].created_at === "2026-01-01T00:00:00Z";
