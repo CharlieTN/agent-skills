@@ -716,6 +716,15 @@ export function computeThreadOverlap(files, threads) {
   return matched / hunks.length;
 }
 
+/** `gh pr checks` exits 1 when a check failed and 8 while one is pending, printing the table
+ *  either way — a red CI is a read, not a failure to read. On dash0#20655 a failing "Generate
+ *  types" check was reported as "gh pr checks unreadable".
+ *  @param {{ ok: boolean, code?: number|string, stdout?: string, timedOut?: boolean }} r */
+export function checksReadable(r) {
+  if (r.ok) return true;
+  return !r.timedOut && (r.code === 1 || r.code === 8) && String(r.stdout || "").trim().length > 0;
+}
+
 /**
  * Reads the `--state` file (D10) — the caller's already-fetched LoreKit
  * state record `data`, read by the AGENT before invoking this script
@@ -741,6 +750,7 @@ export function readStateFile(path) {
     if (runs) {
       const lastFull = runs.map((r) => r?.mode).lastIndexOf("full");
       return {
+        stickyCommentId: raw.data.sticky_comment_id ?? null,
         priorSha: runs.length ? String(runs[runs.length - 1]?.sha || "") || null : null,
         lastFullSha: lastFull < 0 ? null : String(runs[lastFull]?.sha || "") || null,
         incrRunsSinceFull: lastFull < 0 ? runs.length : runs.length - 1 - lastFull,
@@ -1119,7 +1129,7 @@ async function prepare(opts) {
     wantHistorical ? Promise.resolve({ ok: false, error: null, value: [] }) : fetchFiles(repo, number, timeoutMs),
   ]);
   /** @type {any} */ let diffR = diffR0;
-  /** @type {any} */ let checksR = checksR0;
+  /** @type {any} */ let checksR = checksReadable(checksR0) ? { ...checksR0, ok: true } : checksR0;
   /** @type {any} */ let filesR = filesR0;
 
   timing.end(); // fetch
@@ -1497,7 +1507,9 @@ async function prepare(opts) {
     // --isolated item 2), regardless of whether a sticky happens to already exist on
     // the PR from an earlier, non-comparability review — `!sticky` alone missed exactly
     // that case (a re-review of an already-reviewed PR run under `--isolated`).
-    firstRun: runMode.isolated || !sticky,
+    // A state record with runs is a prior review even when no sticky carries the marker
+    // (dash0#20655's sticky held a file path, not a report, and D1 fired on its seventh run).
+    firstRun: runMode.isolated || (!sticky && !state.priorSha),
     full: runMode.full,
     effortHigh: opts.effort === "high",
     cumDeltaLines,
@@ -1638,7 +1650,9 @@ async function prepare(opts) {
       // --isolated context without --dry-run and marks the plan `isolated`, which
       // execute-write-plan.mjs refuses on its own (A/B round 3; rules/pipeline.md § --isolated).
       source: runMode.isolated ? "none" : state.priorSha ? "state-record" : (sticky ? "github-fallback-rung" : "none"),
-      stickyCommentId: sticky ? sticky.id : null,
+      // The record's id when no marker was found: a real run then PATCHes that comment — which
+      // repairs a sticky whose body lost its marker — instead of posting a second report.
+      stickyCommentId: sticky ? sticky.id : (runMode.isolated ? null : state.stickyCommentId ?? null),
       stickyUrl: sticky ? sticky.html_url : null,
       stickyKind: sticky ? sticky.kind : null,
       priorSha,
@@ -2154,6 +2168,18 @@ async function selfTest() {
     return resolvePriorRun({ isolated: false, stickyBody: body, headSha: "fff9999", statePriorSha: "def5678" }).priorSha === "def5678"
       && resolvePriorRun({ isolated: false, stickyBody: body, headSha: "fff9999" }).priorSha === "abc1234"
       && resolvePriorRun({ isolated: true, stickyBody: body, headSha: "fff9999", statePriorSha: "def5678" }).priorSha === null;
+  });
+  t("checksReadable: a red (1) or pending (8) table is a read; an empty, timed-out or other failure is not", () =>
+    checksReadable({ ok: false, code: 1, stdout: "Generate types\tfail\t1m\n" })
+      && checksReadable({ ok: false, code: 8, stdout: "build\tpending\n" })
+      && checksReadable({ ok: true, code: 0, stdout: "" })
+      && !checksReadable({ ok: false, code: 1, stdout: "" })
+      && !checksReadable({ ok: false, code: 1, stdout: "x", timedOut: true })
+      && !checksReadable({ ok: false, code: 4, stdout: "x" }));
+  t("readStateFile: the record's sticky_comment_id is returned for a sticky the marker scan cannot find", () => {
+    const p = join(tmpdir(), `prr-state-sticky-${process.pid}.json`);
+    writeFileSync(p, JSON.stringify({ v: 1, data: { sticky_comment_id: 5876011167, runs: [{ sha: "aaa", mode: "full" }] } }), "utf8");
+    return readStateFile(p).stickyCommentId === 5876011167;
   });
   t("readStateFile: an unparseable file degrades to the safe default rather than throwing", () => {
     const p = join(tmpdir(), `prr-state-bad-${process.pid}.json`);

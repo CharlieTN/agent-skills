@@ -342,6 +342,10 @@ export function beginRun(runDir, facts, opts = {}) {
       return String(existing.run_id);
     }
     renameSync(ledgerPath(runDir), join(runDir, `telemetry.${String(existing.run_id)}.jsonl`));
+    // Its summary goes with it: a summary left in place says "already exported" to this run's
+    // finish, and on dash0#20655 a second review in a reused directory was never exported.
+    const summary = join(runDir, SUMMARY_FILE);
+    if (existsSync(summary)) renameSync(summary, join(runDir, `telemetry-summary.${String(existing.run_id)}.json`));
   }
   const runId = randomBytes(8).toString("hex");
   appendRecord(runDir, { t: "run", run_id: runId, facts: clean, ...(opts.ns === undefined ? {} : { ns: opts.ns }) });
@@ -679,7 +683,8 @@ export async function finishRun(runDir, opts = {}, env = process.env) {
     const summaryPath = join(runDir, SUMMARY_FILE);
     if (!opts.force && existsSync(summaryPath)) {
       const prev = JSON.parse(readFileSync(summaryPath, "utf8"));
-      if (prev && prev.exported === true) return { ...prev, skipped: "already exported" };
+      const current = readLedger(runDir).find((r) => r.t === "run");
+      if (prev && prev.exported === true && (!current || prev.run_id === String(current.run_id))) return { ...prev, skipped: "already exported" };
     }
     const records = readLedger(runDir);
     if (!records.some((r) => r.t === "run")) return { exported: false, reason: `no run in ${ledgerPath(runDir)}` };
@@ -1188,6 +1193,22 @@ async function selfTest() {
     const bBuilt = /** @type {BuiltRun} */ (buildRun(readLedger(bRun)));
     ok("worker import with only the stamp and the output file still folds the worker in and starts the run at the dispatch",
       bBuilt.workers.length === 1 && bBuilt.steps[0].name === "load" && /starts at the dispatch/.test(imp3.stderr), imp3.stderr);
+    // A second review in a directory whose previous run was exported is exported too.
+    const reuse = join(dir, "reuse");
+    const firstId = beginRun(reuse, facts);
+    await finishRun(reuse, {}, {});
+    writeFileSync(join(reuse, SUMMARY_FILE), JSON.stringify({ run_id: firstId, exported: true }));
+    const secondId = beginRun(reuse, facts);
+    const second = await finishRun(reuse, {}, {});
+    ok("a new run in a reused directory rotates the old summary aside and is finished, not skipped",
+      !("skipped" in second) && JSON.parse(readFileSync(join(reuse, SUMMARY_FILE), "utf8")).run_id === secondId
+        && existsSync(join(reuse, `telemetry-summary.${firstId}.json`)));
+    // A summary another run left behind (a directory written before the rotation) never skips this one.
+    writeFileSync(join(reuse, SUMMARY_FILE), JSON.stringify({ run_id: "someone-else", exported: true }));
+    const notMine = await finishRun(reuse, {}, {});
+    writeFileSync(join(reuse, SUMMARY_FILE), JSON.stringify({ run_id: secondId, exported: true }));
+    ok("finishRun skips only when the exported summary is this run's own",
+      !("skipped" in notMine) && "skipped" in (await finishRun(reuse, {}, {})));
     // The marker prepare-review.mjs prints: filled in and run as written, it records the step.
     ok("modelSteps lists intent-wait only for hybrid, lenses except on quick, and never state",
       modelSteps({ tier: "deep", topology: "hybrid" }).join() === "memory,gates,finders,intent-wait,lenses,consolidate,verify,judgments,validate,assert"
