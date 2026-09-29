@@ -292,13 +292,18 @@ export function isGithubLogin(s) {
 /**
  * The reviewer identity, first match wins: a valid supplied login (`--reviewer-login`, then
  * PR_REVIEWER_LOGIN), then the state record's `bot_login` (pr-reviewer.md's identity ladder),
- * else unknown. A supplied login always outranks the record.
- * @param {{ suppliedLogin: string, fromFlag: boolean, stateBotLogin: string|null }} input
+ * then the matched prior sticky's own `user.login` (the GitHub fallback rung — whoever posted the
+ * report is the reviewer, so a re-review with no `--state` still knows itself and still builds
+ * Fix-this buttons), else unknown. A supplied login always outranks the record, and the record
+ * outranks the sticky's author. The caller passes `null` for the sticky author under `--isolated`,
+ * where the sticky is never read as prior-run state.
+ * @param {{ suppliedLogin: string, fromFlag: boolean, stateBotLogin: string|null, stickyAuthorLogin?: string|null }} input
  * @returns {{ me: string, identitySource: string }}
  */
-export function resolveReviewerIdentity({ suppliedLogin, fromFlag, stateBotLogin }) {
+export function resolveReviewerIdentity({ suppliedLogin, fromFlag, stateBotLogin, stickyAuthorLogin = null }) {
   if (isGithubLogin(suppliedLogin)) return { me: suppliedLogin, identitySource: fromFlag ? "--reviewer-login" : "PR_REVIEWER_LOGIN" };
   if (isGithubLogin(stateBotLogin)) return { me: /** @type {string} */ (stateBotLogin), identitySource: "state-record" };
+  if (isGithubLogin(stickyAuthorLogin)) return { me: /** @type {string} */ (stickyAuthorLogin), identitySource: "prior-report-author" };
   return { me: "", identitySource: "unknown" };
 }
 
@@ -1282,12 +1287,13 @@ async function prepare(opts) {
   const suppliedLogin = opts.reviewerLogin || process.env.PR_REVIEWER_LOGIN || "";
   const { me, identitySource } = resolveReviewerIdentity({
     suppliedLogin, fromFlag: Boolean(opts.reviewerLogin), stateBotLogin: state.botLogin ?? null,
+    stickyAuthorLogin: runMode.isolated ? null : (sticky?.user?.login ?? null),
   });
   const authorLogin = meta.author?.login || "";
   const reviewRelation = me ? (normalizeLogin(me) === normalizeLogin(authorLogin) ? "self" : "cross") : "cross";
   if (suppliedLogin && !isGithubLogin(suppliedLogin)) {
     anomalies.push(
-      `reviewer login rejected — ${JSON.stringify(String(suppliedLogin).slice(0, 40))} is not a GitHub login; ${me ? "identity taken from the state record's bot_login" : "relation defaulted to cross"}`,
+      `reviewer login rejected — ${JSON.stringify(String(suppliedLogin).slice(0, 40))} is not a GitHub login; ${me ? `identity taken from ${identitySource === "state-record" ? "the state record's bot_login" : "the prior report's author"}` : "relation defaulted to cross"}`,
     );
   } else if (!me) {
     anomalies.push(
@@ -2282,6 +2288,16 @@ async function selfTest() {
       && b.me === "dash0-dev[bot]" && b.identitySource === "state-record"
       && c.me === "" && c.identitySource === "unknown"
       && d.identitySource === "PR_REVIEWER_LOGIN";
+  });
+  t("resolveReviewerIdentity: the prior sticky's author is the last rung, below the state record and any supplied login, validated", () => {
+    const e = resolveReviewerIdentity({ suppliedLogin: "", fromFlag: false, stateBotLogin: null, stickyAuthorLogin: "dash0-dev[bot]" });
+    const f = resolveReviewerIdentity({ suppliedLogin: "", fromFlag: false, stateBotLogin: "state-bot[bot]", stickyAuthorLogin: "dash0-dev[bot]" });
+    const g = resolveReviewerIdentity({ suppliedLogin: "mthines", fromFlag: true, stateBotLogin: null, stickyAuthorLogin: "dash0-dev[bot]" });
+    const h = resolveReviewerIdentity({ suppliedLogin: "", fromFlag: false, stateBotLogin: null, stickyAuthorLogin: "{\"message\":\"Bad credentials\"}" });
+    return e.me === "dash0-dev[bot]" && e.identitySource === "prior-report-author"
+      && f.me === "state-bot[bot]" && f.identitySource === "state-record"
+      && g.me === "mthines" && g.identitySource === "--reviewer-login"
+      && h.me === "" && h.identitySource === "unknown";
   });
   t("readStateFile: an unparseable file degrades to the safe default rather than throwing", () => {
     const p = join(tmpdir(), `prr-state-bad-${process.pid}.json`);
