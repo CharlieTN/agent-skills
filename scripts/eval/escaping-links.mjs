@@ -23,6 +23,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, relative, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import { REPO_ROOT, walk } from "./lib.mjs";
 
 export const BASELINE_FILE = join(REPO_ROOT, "scripts/eval/escaping-links.baseline.json");
@@ -80,7 +81,9 @@ function selfTest() {
   process.exit(ok ? 0 : 1);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// pathToFileURL, not a `file://` template: a path with a space percent-encodes in import.meta.url,
+// and the template would then never match — `--self-test` would silently do nothing and exit 0.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const argv = process.argv.slice(2);
   if (argv.includes("--self-test")) selfTest();
   const now = counts(escapingLinks());
