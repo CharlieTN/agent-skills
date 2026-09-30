@@ -16,6 +16,7 @@ It changes no spec grammar, no verdict mapping, and no resolution rule.
 
 Detection, the generic substitutions, and the setup script are owned by [`agents/shared/rules/agent0-host.md`](../../../../agents/shared/rules/agent0-host.md) and are not restated here.
 Agent0 mode is on iff `/tmp/workspace/agent-skills/env.sh` exists; source it at the start of every Bash call.
+Rationale for the on-demand browser install below — the two-stage design, the time budget, the Chrome-for-Testing fallback, and the consent reasoning — lives in [`../references/agent0-browser-install.md`](../references/agent0-browser-install.md).
 
 ## Contents
 
@@ -47,7 +48,7 @@ A clone that fails is `inconclusive: no checkout of <owner>/<repo> (<error>)` �
 
 | `--driver` | Agent0 outcome |
 | --- | --- |
-| `auto` (default) | **`playwright`, with no `AskUserQuestion`.** The prompt in [`runner.md § The auto-mode Playwright prompt`](./runner.md#the-auto-mode-playwright-prompt) exists so a person is never surprised by a headless run they did not ask for. Here nobody is present to ask, and the automation's setup script installing Playwright is that decision, made in advance |
+| `auto` (default) | **`playwright`, with no `AskUserQuestion`.** The prompt in [`runner.md § The auto-mode Playwright prompt`](./runner.md#the-auto-mode-playwright-prompt) exists so a person is never surprised by a headless run they did not ask for. Here nobody is present to ask, and Playwright is the only driver on an Agent0 host — provided by the setup script or by [the on-demand install](../SKILL.md#on-demand-browser-install--run-and-verify) — so choosing it is a decision already made |
 | `playwright` | `playwright` |
 | `chrome` | `NOT RUN (chrome driver unavailable on this host — no browser extension)`. A forced driver is never substituted |
 
@@ -56,7 +57,8 @@ It is the Agent0 case of the general `--unattended` flag (`SKILL.md § --unatten
 
 ## The browser precondition
 
-The setup script installs and smoke-tests Chromium once, and records the outcome in `UI_VERIFY_BROWSER`.
+The setup script, or — when the sandbox skipped it or has none — [`SKILL.md`'s own on-demand browser install](../SKILL.md#on-demand-browser-install--run-and-verify), installs and smoke-tests Chromium and records the outcome in `UI_VERIFY_BROWSER`.
+This precondition runs **after** that on-demand block, so any top-up it just performed is already reflected here.
 Check it before dispatching:
 
 ```bash

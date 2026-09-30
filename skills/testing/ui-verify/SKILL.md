@@ -110,7 +110,7 @@ Skill("ui-verify", "run <PR-URL> --unattended")    # Playwright, or an inconclus
 ```
 
 **In a Dash0 Agent0 Automation sandbox** (`/tmp/workspace/agent-skills/env.sh` exists), read [`rules/agent0-runtime.md`](./rules/agent0-runtime.md) before Step 0.
-It works from a checkout of the PR head, resolves `auto` to Playwright without the prompt (no user is present, and the automation's setup script installing Playwright is that decision), checks the browser the setup installed, and dispatches `aw-tester` as a `general` sub-agent that reads its definition file — the host cannot dispatch the custom type.
+It works from a checkout of the PR head, resolves `auto` to Playwright without the prompt (no user is present, and Playwright is the only driver on an Agent0 host — installed by the automation's setup script or by the [on-demand install below](#on-demand-browser-install--run-and-verify)), checks the browser the setup installed, and dispatches `aw-tester` as a `general` sub-agent that reads its definition file — the host cannot dispatch the custom type.
 `setup` is interactive and stops there as `blocked (needs a human …)`.
 Agent0 mode implies [`--unattended`](#--unattended--never-ask-never-hang) whether or not the caller passed it.
 
@@ -120,11 +120,108 @@ Whenever `/tmp/workspace/agent-skills/env.sh` exists, source it (`. /tmp/workspa
 When `$AGENT_SKILLS_ROOT/skills/ui-verify/SKILL.md` differs from the copy you are running, or you cannot compare them, follow the installed copy: **the installed copy at `$AGENT_SKILLS_COMMIT` wins**, because the rules it links come from that commit, and an import is a snapshot that goes stale.
 
 **An unprepared Agent0 host** has no `env.sh` but has `/tmp/workspace`, `/tmp/.opencode/skills/`, or `/tmp/.opencode/agents/general.md`.
-`ui-verify` does not install on demand: it needs a Playwright browser, which only the setup script installs.
+`run` and `verify` install the Playwright browser themselves on this host — see [On-demand browser install — run and verify](#on-demand-browser-install--run-and-verify) below — and report `NOT RUN (Agent0 sandbox not prepared: …)` only when that install itself fails, never a question and never a `red`.
 Check for this host first, before Step 0 and before running any script this skill links.
-There, `run` and `verify` stop with `NOT RUN (Agent0 sandbox not prepared: add scripts/agent0-setup.sh as the automation's sandbox.setupScript)`, never a question and never a `red`.
-There, `author` stops with `not authored (Agent0 sandbox not prepared: add scripts/agent0-setup.sh as the automation's sandbox.setupScript)`, because its Step 0 runs `scripts/is-ui-diff.mjs`, which a `SKILL.md`-only import does not contain.
-`verify` therefore never reaches its author-if-needed step on this host.
+There, `author` stops with `not authored (Agent0 sandbox not prepared: add scripts/agent0-setup.sh as the automation's sandbox.setupScript)`, because its Step 0 runs `scripts/is-ui-diff.mjs`, which a `SKILL.md`-only import does not contain, and `author` needs no browser, so it never runs the on-demand block.
+`verify` runs the on-demand block's stage (a) — the base install — before Step 0, so by the time `author`'s own `is-ui-diff.mjs` gate would run, the host already has `env.sh` and the scripts that install copies alongside it: `author`'s `not authored (Agent0 sandbox not prepared: …)` line above fires only when that base install itself fails, not on every unprepared host.
+
+#### On-demand browser install — run and verify
+
+This block is owned here, not in a linked file, because a `SKILL.md`-only import must still reach it.
+It runs only for `run` and `verify`, never under `--driver chrome` and never for `author` — none of those need a Playwright browser.
+Why each line here is shaped the way it is: [`references/agent0-browser-install.md`](./references/agent0-browser-install.md).
+Run it with the Bash tool's `timeout: 600000` — the worst case sits close to it.
+
+```bash
+# ui-verify run/verify: the host is Agent0 and the recorded browser isn't ok
+# (or there is no marker at all). Two stages: a fast base install when the
+# marker is entirely absent, then a bounded top-up that installs the browser
+# itself — at most once per sandbox (the sentinel below).
+M=/tmp/workspace/agent-skills/env.sh
+B=/tmp/workspace/.agent-skills-install
+SENT=/tmp/workspace/.agent-skills-install/playwright.attempted
+if [ -d /tmp/workspace ] || [ -d /tmp/.opencode/skills ] || [ -f /tmp/.opencode/agents/general.md ]; then A0=1; else A0=0; fi
+if [ "$A0" = 1 ]; then
+  if [ ! -f "$M" ]; then
+    mkdir -p /tmp/workspace "$B" && rm -f "$B/AGENTS.md.before"
+    [ -e /tmp/workspace/AGENTS.md ] && cp -p /tmp/workspace/AGENTS.md "$B/AGENTS.md.before"
+    rc=1
+    if curl -fsSL --max-time 30 -o "$B/agent0-setup.sh" \
+         https://raw.githubusercontent.com/mthines/agent-skills/main/scripts/agent0-setup.sh; then
+      WITH_PLAYWRIGHT=0 timeout 200 bash "$B/agent0-setup.sh" > "$B/setup.log" 2>&1
+      rc=$?
+    else
+      echo "could not download scripts/agent0-setup.sh" > "$B/setup.log"
+    fi
+    if [ -e "$B/AGENTS.md.before" ]; then
+      cp -p "$B/AGENTS.md.before" /tmp/workspace/AGENTS.md
+    else
+      rm -f /tmp/workspace/AGENTS.md
+    fi
+    [ "$rc" = 0 ] || rm -f "$M"
+  fi
+  if [ ! -f "$M" ]; then
+    echo "BROWSER: not prepared — $(tail -n 1 "$B/setup.log" 2>/dev/null)"
+  else
+    . "$M"
+    if [ "$UI_VERIFY_BROWSER" = ok ]; then
+      echo "BROWSER: ok (prepared)"
+    elif [ -f "$SENT" ]; then
+      echo "BROWSER: unavailable — $(cat "$SENT")"
+    else
+      mkdir -p "$B"
+      start=$SECONDS
+      # Prefer the $HOST copy agent0-setup.sh already placed and verified
+      # (D-B) — a prepared-then-degraded sandbox needs no second download.
+      # Fall back to curling from main only when that copy is absent (an
+      # install from an older commit).
+      SCRIPT=/tmp/workspace/agent-skills/agent0-playwright.sh
+      if [ ! -f "$SCRIPT" ]; then
+        SCRIPT="$B/agent0-playwright.sh"
+        if ! curl -fsSL --max-time 30 -o "$SCRIPT" \
+             https://raw.githubusercontent.com/mthines/agent-skills/main/scripts/agent0-playwright.sh; then
+          echo "could not download scripts/agent0-playwright.sh" > "$B/playwright.log"
+          SCRIPT=""
+        fi
+      fi
+      if [ -n "$SCRIPT" ]; then
+        BUDGET=280 timeout 300 bash "$SCRIPT" > "$B/playwright.log" 2>&1
+        rc=$?
+        . "$M"
+      else
+        rc=1
+      fi
+      if [ "$rc" = 0 ] && [ "$UI_VERIFY_BROWSER" = ok ]; then
+        echo "BROWSER: ok (installed on demand, $((SECONDS - start))s)"
+      else
+        # rc != 0 means agent0-playwright.sh never ran (no script) or the
+        # outer `timeout 300` killed it before it rewrote $M — either way
+        # $M's reason (if any) is stale, so never trust it here: read the
+        # run log directly instead of falling back to a leftover env value.
+        if [ "$rc" = 0 ]; then
+          reason="${UI_VERIFY_BROWSER_REASON:-$(tail -n 1 "$B/playwright.log" 2>/dev/null)}"
+        else
+          reason="$(tail -n 1 "$B/playwright.log" 2>/dev/null)"
+        fi
+        echo "$reason" > "$SENT"
+        echo "BROWSER: unavailable — $reason"
+      fi
+    fi
+  fi
+else
+  echo "BROWSER: not run (not an Agent0 host)"
+fi
+```
+
+Read the outcome from the last line:
+
+| Last line | Do |
+| --- | --- |
+| `BROWSER: ok (prepared)` | Continue exactly as the prepared-host path already does. |
+| `BROWSER: ok (installed on demand, <N>s)` | Continue the same way, and report the browser source as `installed on demand (<N>s)`. |
+| `BROWSER: unavailable — <reason>` | Stop with `NOT RUN (playwright browser unavailable in this sandbox: <reason>)`. The sentinel means a second `run`/`verify` in the same sandbox reports this immediately — never a second multi-minute attempt. |
+| `BROWSER: not prepared — <reason>` | Stop with `NOT RUN (Agent0 sandbox not prepared: on-demand install failed: <reason>)`. |
+| `BROWSER: not run (not an Agent0 host)` | Not Agent0 — continue the local, non-sandbox path unchanged. |
 
 ## Step 0: Resolve your GitHub access path
 
