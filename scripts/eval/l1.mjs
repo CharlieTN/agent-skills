@@ -9730,9 +9730,23 @@ const isPollBlock = (block) =>
 
       const drPath = join(REPO_ROOT, "agents/pr-reviewer/rules/depth-routing.md");
       const drSrc = existsSync(drPath) ? readFileSync(drPath, "utf8") : "";
+      // Exact, not substring: the three values are read off the code and must appear verbatim in
+      // the doc's defaults line, so a default changed on one side only fails here.
+      const tierDefaults = /export const TIER_DEFAULT_THOROUGHNESS = \{ quick: ([\d.]+), standard: ([\d.]+), deep: ([\d.]+) \};/.exec(rdSrc);
       s.check("G84e depth-routing.md's Thoroughness budget section exists and states the same three tier defaults route-depth.mjs's TIER_DEFAULT_THOROUGHNESS carries",
-        /## Thoroughness budget/.test(drSrc)
-          && /quick.*0\.2/.test(drSrc) && /standard.*0\.5/.test(drSrc) && /deep.*0\.8/.test(drSrc));
+        /## Thoroughness budget/.test(drSrc) && Boolean(tierDefaults)
+          && drSrc.includes(`**quick → ${tierDefaults[1]}, standard → ${tierDefaults[2]}, deep → ${tierDefaults[3]}.**`),
+        tierDefaults ? `expected "quick → ${tierDefaults[1]}, standard → ${tierDefaults[2]}, deep → ${tierDefaults[3]}" in depth-routing.md` : "TIER_DEFAULT_THOROUGHNESS not found in route-depth.mjs");
+      // standard's default (0.7) sets optimalityLens, so § 2.4c's incremental-mode skip is the only
+      // thing keeping the lens off delta re-reviews, where its own rationale says it answers wrong.
+      const bodyFor24c = readFileSync(join(REPO_ROOT, "agents/pr-reviewer.md"), "utf8");
+      const sec24c = (bodyFor24c.split(/^### 2\.4c /m)[1] || "").split(/^### /m)[0];
+      s.check("G84e pr-reviewer.md § 2.4c skips the optimality lens on incremental re-reviews whatever budget.optimalityLens says",
+        /`RUN_MODE` is `incremental` or `incremental-quick` \(logged `skipped \(incremental\)`\)/.test(sec24c)
+          && /whatever\s+`budget\.optimalityLens` says/.test(sec24c));
+      const reviewCfg = readFileSync(join(REPO_ROOT, "agents/shared/rules/review-config.md"), "utf8");
+      s.check("G84e review-config.md's thoroughness comment names the same three tier defaults",
+        Boolean(tierDefaults) && reviewCfg.includes(`(quick=${tierDefaults[1]}, standard=${tierDefaults[2]}, deep=${tierDefaults[3]})`));
 
       const dtPath = join(REPO_ROOT, "agents/pr-reviewer/rules/dispatch-topology.md");
       const dtSrc = existsSync(dtPath) ? readFileSync(dtPath, "utf8") : "";
@@ -10343,11 +10357,11 @@ const isPollBlock = (block) =>
   const topo = probe(`import { resolveBudget } from "./agents/pr-reviewer/scripts/route-depth.mjs";
     const b = (i) => { const r = resolveBudget(i); return r.topology + "/" + r.topologyReason; };
     console.log(JSON.stringify([
-      b({ routedTier: "standard", runMode: "incremental" }), b({ routedTier: "quick", runMode: "incremental-quick" }), // quick's 0.2 is already below 0.4
+      b({ routedTier: "standard", runMode: "incremental" }), b({ routedTier: "quick", runMode: "incremental-quick" }), // quick's 0.4 default reaches the hybrid breakpoint, so the carve-out is what keeps it in-context
       b({ routedTier: "standard", runMode: "full" }), b({ routedTier: "deep", runMode: "incremental" }),
       b({ routedTier: "standard", runMode: "incremental", thoroughness: 0.8 })]));`);
   s.check("G84r resolveBudget: a small incremental re-review (standard/quick, defaulted thoroughness) is in-context; a full run, a deep tier, or an explicit thoroughness stays hybrid",
-    topo.status === 0 && (topo.stdout || "").trim() === JSON.stringify(["in-context/small-incremental", "in-context/below-breakpoint", "hybrid/hybrid", "hybrid/hybrid", "hybrid/hybrid"]),
+    topo.status === 0 && (topo.stdout || "").trim() === JSON.stringify(["in-context/small-incremental", "in-context/small-incremental", "hybrid/hybrid", "hybrid/hybrid", "hybrid/hybrid"]),
     (topo.stdout || topo.stderr || "").trim().slice(0, 300));
   s.check("G84r prepare-review.mjs hands resolveBudget the context's run mode",
     /const budget = resolveBudget\(\{\n\s+runMode: contextMode,/.test(PRSRC) && /mode: contextMode,/.test(PRSRC));
