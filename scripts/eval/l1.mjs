@@ -11033,4 +11033,146 @@ const isPollBlock = (block) =>
     `still named in: ${regrown.join(", ") || "none"}${/--interval|\bINTERVAL\b|POLL_RESULT/.test(RL) ? "; review-loop still parses --interval / POLL_RESULT" : ""}`);
 }
 
+// ── G91: intent specs — one format owner, both runners, ui-verify writes v2 and still reads v1 ──
+//
+// `ui-verify author` writes a Markdown intent spec (`Format: intent`) under `<!-- ui-verify:v2 -->`;
+// both runners explore it, grade every Expected item with evidence, and cache the route. The format
+// is only one format if (a) its field tokens are DERIVED from the template that owns them and every
+// one is restated in the ui-verify authoring table, (b) the contract's § 6 carries the grading table,
+// the closed unreachable list, and the verdict keys, (c) both runners detect `Format: intent` and use
+// the route cache, (d) the Playwright probe refuses an ambiguous locator and never writes the bypass
+// secret, and (e) ui-verify's writers and readers agree on the marker order — the embedded template
+// carries the v2 markers and no legacy one.
+// break-shape: drop a field row from spec-format.md, swap runner.md's v2/v1 order, put
+// `preview-spec:v1` back in the embedded template, delete a grading row, swap two grading rows,
+// delete an unreachable cause, drop the probe's `locator matched` guard, drop the probe's
+// `if (s.dry)` guard, § 6.4's route-drift cause, a heal case that re-explores after a performed
+// mutation, or a runner's `# mutations:` writer or heal rule —
+// the matching sub-check flips red.
+{
+  const readOr = (r) => { try { return readFileSync(join(REPO_ROOT, r), "utf8"); } catch { return ""; } };
+  const sectionOr = (file, heading) => { try { return extractSection(file, heading); } catch { return ""; } };
+  const AW = "skills/workflow/autonomous-workflow";
+  const TPL = readOr(`${AW}/templates/intent-spec.md.template`);
+  const CONTRACT_FILE = `${AW}/rules/spec-run-contract.md`;
+  const C6 = sectionOr(CONTRACT_FILE, "## 6. Intent specs");
+  const AWT = readOr(`${AW}/templates/aw-tester.agent.md`);
+  const CHR = readOr(`${AW}/aw-tester-chrome/SKILL.md`);
+  const FMT = readOr("skills/testing/ui-verify/rules/spec-format.md");
+  const EMB = readOr("skills/testing/ui-verify/templates/embedded-spec.md.template");
+  const RUN1 = sectionOr("skills/testing/ui-verify/rules/runner.md", "## Step 1: Get the spec");
+  const UV = readOr("skills/testing/ui-verify/SKILL.md");
+  const DC = readOr("skills/delivery/create-pr/rules/description-contract.md");
+  const RL = readOr("skills/quality/review-loop/SKILL.md");
+
+  // (a) the field tokens are derived from the template's own format comment, never re-encoded here.
+  const fields = [...new Set([...TPL.matchAll(/^#\s+(\*\*[A-Z][A-Za-z ]+:\*\*)/gm)].map((m) => m[1]))];
+  s.check("G91a the intent template declares its header line and its seven fields",
+    /^Format: intent\b/m.test(TPL) && fields.length === 7 && /\[must-follow\]/.test(TPL),
+    `derived ${fields.length} field(s): ${fields.join(" ") || "none"} — the restatement check below is vacuous unless the owner defines them`);
+  const fmtTable = sectionOr("skills/testing/ui-verify/rules/spec-format.md", "## Writing an intent spec (v2)");
+  const unrestated = fields.filter((f) => !fmtTable.split("\n").some((l) => l.startsWith(`| \`${f}\` |`)));
+  s.check("G91a ui-verify's authoring table restates every field the template owns (none missing)",
+    fields.length === 7 && unrestated.length === 0 && /\[must-follow\]/.test(fmtTable),
+    `fields with no row in spec-format.md § Writing an intent spec (v2): ${unrestated.join(" ") || "none"}`);
+
+  // (b) contract § 6 — the grading table, the closed unreachable list, the evidence forms, the keys.
+  // First-match order is the contract, so each row is pinned to its number: a swap regrades specs.
+  const gradeRows = ["`[must-follow]` step was missing", "is `not-observed`", "is `unreachable`", "`changed: not-exercised`", "otherwise"];
+  const missingGrade = gradeRows.filter((r, i) => !C6.split("\n").some((l) => l.startsWith(`| ${i + 1} |`) && l.includes(r)));
+  s.check("G91b contract § 6.5 grades by a first-match table with all five rows, in order",
+    C6.length > 2000 && missingGrade.length === 0,
+    `grading rows missing or out of order: ${missingGrade.join(" · ") || "none"}`);
+  const unreach = sectionOr(CONTRACT_FILE, "### 6.4 Unreachable — the closed list");
+  const causes = (unreach.match(/^[1-9]\. \*\*/gm) || []).length;
+  // Pinned at the live count, not a floor: a cause folded into another's bullet would stay green
+  // under a floor, so a new cause must be numbered — and must move this number on purpose.
+  s.check("G91b contract § 6.4's unreachable list is closed at exactly six causes, and everything else fails",
+    causes === 6 && /Every other reason[^\n]*`not-observed`, and fails the spec/.test(unreach),
+    `found ${causes} cause(s); the list is pinned at six — another cause widens what can hide a failure as inconclusive, so add it here deliberately`);
+  s.check("G91b contract § 6 carries the evidence forms, the route-cache path, and the verdict keys",
+    ["`locator: <single-braces locator> — <state>`", "`network: METHOD /path → NNN`", ".agent/{branch}/.aw-tester/routes/<spec-id>-<sha8>.md",
+      "route: explored | replayed | healed", "changed: exercised | not-exercised", "result: observed | not-observed | unreachable"].every((t) => C6.includes(t)),
+    "contract § 6 lost an evidence form, the cache path, or one of the § 6.7 verdict keys");
+
+  // (c) both runners detect the format, follow the contract's § 6, and use the same cache.
+  for (const [label, t] of [["aw-tester.agent.md", AWT], ["aw-tester-chrome/SKILL.md", CHR]]) {
+    s.check(`G91c ${label} detects Format: intent and runs it with the shared route cache and evidence keys`,
+      /header[\s\S]{0,120}carries the line `Format: intent`/.test(t) && t.includes(".aw-tester/routes/") && t.includes("[must-follow]")
+        && t.includes("not-exercised") && /route: (explored|`replayed`|replayed)/.test(t) && /§ ?6/.test(t),
+      `${label} is missing the format detection, the routes/ cache, the must-follow rule, or the route/changed keys`);
+  }
+
+  // (d) the probe refuses an ambiguous match and never writes the bypass secret to disk.
+  const probe = (AWT.match(/```ts\n\/\/ \$AW_DIR\/probe\.spec\.ts[\s\S]*?```/) || [""])[0];
+  s.check("G91d aw-tester's probe refuses a locator that matches more than one element and never takes the first",
+    probe.includes("locator matched ${n} elements") && !/\.first\(\)/.test(probe),
+    "the probe can silently act on the wrong instance — the false-completion intent specs exist to stop");
+  s.check("G91d aw-tester's probe reads the bypass header value from the environment, never from probe-in.json",
+    /process\.env\[bypass\.env\]/.test(probe) && !/bypass\.value/.test(probe),
+    "the bypass secret would be written to disk in probe-in.json");
+
+  // (f) mutations run once, and a heal never repeats one — the rules the probe loop depends on.
+  // Each G91f predicate reads the section or sentence it guards: a phrase that also appears
+  // elsewhere in the file would otherwise keep the check true after the guarded copy is deleted.
+  const S62 = sectionOr(CONTRACT_FILE, "### 6.2 Execution — explore the route");
+  const S64 = sectionOr(CONTRACT_FILE, "### 6.4 Unreachable — the closed list");
+  const S66 = sectionOr(CONTRACT_FILE, "### 6.6 Route cache — replay first, heal on failure");
+  s.check("G91f contract § 6.2 runs each mutation once, § 6.4 names route drift, and § 6.6 writes and heals by # mutations:",
+    S62.includes("**Mutations run once.**")
+      && /fired a `POST`, `PUT`, `PATCH`, or `DELETE` was a mutation/.test(S62)
+      && S64.includes("route drifted after a mutation")
+      && /on a `# mutations:` line/.test(S66) && /cause `route drifted after a mutation`/.test(S66)
+      && /every route step ran\*\* → never explore again/.test(S66)
+      && /a later route step failed\*\* → never explore again/.test(S66)
+      && S66.includes("**A route is written only from a full exploration from `start`.**"),
+    "contract § 6 lost the mutation-once rule, its request evidence, § 6.4's route-drift cause, the # mutations: writer or heal, or the full-exploration-only cache rule");
+  s.check("G91f aw-tester's probe dry-resolves a mutation, records issued mutating requests, writes # mutations:, and heals by it",
+    probe.includes("if (s.dry)") && probe.includes("page.on('request'") && probe.includes("apiOrigins")
+      && probe.includes("settleMs") && probe.includes("fired: mutations.slice(before)")
+      && AWT.includes("**commit launch**")
+      && /heal by the route's\s+`# mutations:` line/.test(AWT)
+      && /skipped: route drifted after a mutation/.test(AWT)
+      && /every route step ran → re-judge[\s\S]{0,120}without launching again/.test(AWT)
+      && /a later route step failed → delete the\s+route file/.test(AWT)
+      && /comment lines —\s+`# mutations:` lists the `WHEN` positions/.test(AWT),
+    "a probe that replays a performed mutation or reads `fired` from responses, or a runner that stops writing # mutations: or heals past a performed mutation, would pass L1");
+  s.check("G91f aw-tester-chrome writes # mutations:, heals by it, never repeats a performed mutation, and never caches a continued heal",
+    /heals by the route's `# mutations:` line/.test(CHR) && /never repeat it/.test(CHR) && /writes no route/.test(CHR)
+      && /and `# mutations:` — the `WHEN` positions/.test(CHR)
+      && /re-judge the failed assertions on the current page when every route step\s+ran/.test(CHR)
+      && /continue exploring in this same tab from the\s+failed step/.test(CHR),
+    "the Chrome runner could stop writing # mutations:, repeat a mutation on heal, or cache a route that skips the steps before the cut");
+
+  // (e) ui-verify: writers and readers agree on the marker versions and their order.
+  const iV2 = RUN1.indexOf("<!-- ui-verify:v2 -->"), iV1 = RUN1.indexOf("<!-- ui-verify:v1 -->"), iLeg = RUN1.indexOf("<!-- preview-spec:v1 -->");
+  s.check("G91e runner.md Step 1 reads v2, then v1, then the legacy preview-spec:v1 marker",
+    iV2 >= 0 && iV1 > iV2 && iLeg > iV1,
+    `marker positions in Step 1 — v2@${iV2}, v1@${iV1}, legacy@${iLeg}`);
+  s.check("G91e the embedded template writes the v2 markers and the intent header, and no older marker",
+    EMB.includes("<!-- ui-verify:v2 -->") && EMB.includes("<!-- /ui-verify:v2 -->") && /^Format: intent$/m.test(EMB)
+      && /^Target: preview$/m.test(EMB) && !/<!-- \/?(preview-spec|ui-verify):v1 -->/.test(EMB),
+    "author starts from this file — a v1 or legacy marker here writes the wrong block on every PR");
+  s.check("G91e spec-format.md defines all three marker pairs and SKILL.md's verify keeps any of them",
+    ["<!-- ui-verify:v2 -->", "<!-- /ui-verify:v2 -->", "<!-- ui-verify:v1 -->", "<!-- preview-spec:v1 -->"].every((m) => FMT.includes(m))
+      && ["`<!-- ui-verify:v2 -->`", "`<!-- ui-verify:v1 -->`", "`<!-- preview-spec:v1 -->`"].every((m) => UV.includes(m)),
+    "a marker version the runner reads is undefined in spec-format.md, or verify would overwrite a block of that version");
+  s.check("G91e ui-verify's hard rules keep the outcome strict while the route flexes",
+    UV.includes("**A route may change; an outcome may not.**") && UV.includes("**Never fork either spec format.**"),
+    "ui-verify SKILL.md lost the rule that an intent spec passes only with evidence for every Expected item");
+  // Each of the description contract's four rule sites must know v2 on its own line — one mention
+  // elsewhere in the file must not cover for a site that still only knows v1.
+  const dcLine = (re) => DC.split("\n").find((l) => re.test(l)) ?? "";
+  const dcSites = [
+    ["the length-budget exemption", dcLine(/^\*\*One region is exempt/), (l) => l.includes("<!-- ui-verify:v2 -->")],
+    ["the single owned region", dcLine(/^- \*\*The block is a single owned region\*\*/), (l) => l.includes("<!-- ui-verify:v2 -->")],
+    ["the refresh rule", dcLine(/^\*\*On refresh \(the `review-loop` case\):\*\*/), (l) => /whichever marker version/.test(l)],
+    ["the Step 5 line count", dcLine(/Count the rendered lines of the body/), (l) => l.includes("<!-- ui-verify:v2 -->")],
+  ];
+  const dcStale = dcSites.filter(([, l, ok]) => !ok(l)).map(([n]) => n);
+  s.check("G91e create-pr's description contract knows the v2 block at every rule site, and review-loop reads it",
+    dcStale.length === 0 && /`<!-- ui-verify:v2 -->` \(or `v1`\) block/.test(RL),
+    `description-contract.md sites still v1-only: ${dcStale.join(" · ") || "none"} — a v1-only site counts the v2 block against the budget or drops it on refresh`);
+}
+
 process.exit(s.report() ? 0 : 1);

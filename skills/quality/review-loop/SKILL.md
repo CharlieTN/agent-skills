@@ -782,7 +782,7 @@ host that has no ask-user tool. Under the flag it runs Chrome or Playwright, or 
 `inconclusive: no driver available (…)`, never a question.
 
 `ui-verify run` owns the whole procedure: it reads the committed
-`<!-- ui-verify:v1 -->` block (the **only** source — never the gitignored
+`<!-- ui-verify:v2 -->` (or `v1`) block (the **only** source — never the gitignored
 `.agent/{branch}/specs.md`, so it works on this or any checkout), resolves the
 preview URL via the GitHub deployments API, dispatches `aw-tester --all`, and
 returns a verdict. This loop only records the outcome.
@@ -1019,7 +1019,7 @@ threads over a red build is not a review-ready PR.
 - **Iteration 1 skips the review only when the last review still stands.** All five [apply-first conditions](#iteration-1--apply-first-when-the-last-review-still-stands) must hold — iteration 1, not `--no-feedback`, `context.json` `.mode == "zero-delta"`, at least one open thread, and no open thread with a reply — and any read that fails fails the check. A skipped review never lets iteration 1 converge: `NEW_FINDINGS` is `true`, so convergence and `--merge` always follow a review pass.
 - **Cap is a hard limit.** If threads are still open at the cap, surface them and stop. Do not extend the cap silently.
 - **Convergence requires CI settled, not just threads resolved.** Unless `--no-ci` is set, a red check blocks the clean-convergence exit. Reporting zero open threads over a red build is the CI-shaped version of green-washing.
-- **The ui-verify run is report-only and never part of convergence.** Step 1.6 runs after the loop has already decided convergence (threads-resolved + CI-settled); its verdict is surfaced for the human, never gates the loop, and never undrafts — matching `autonomous-workflow` Phase 7. It runs at most once per invocation, reads only the committed `ui-verify:v1` block (never `.agent/{branch}/specs.md`), and `autonomous-workflow` opts out via `--no-preview-run` because Phase 7 rehearses the same specs. A missing `ui-verify` is a silent skip, not a failure.
+- **The ui-verify run is report-only and never part of convergence.** Step 1.6 runs after the loop has already decided convergence (threads-resolved + CI-settled); its verdict is surfaced for the human, never gates the loop, and never undrafts — matching `autonomous-workflow` Phase 7. It runs at most once per invocation, reads only the committed ui-verify block, `v2` or `v1` (never `.agent/{branch}/specs.md`), and `autonomous-workflow` opts out via `--no-preview-run` because Phase 7 rehearses the same specs. A missing `ui-verify` is a silent skip, not a failure.
 - **Never fix CI in this context.** Sub-step D classifies and delegates to `ci-auto-fix`; it applies no fix itself, and every `ci-auto-fix` refusal (no `--no-verify`, no `continue-on-error`, no skipped suites, no weakened assertions) holds transitively.
 - **Never carry CI watch state — query it.** Sub-step D reads check state statelessly at the current remote head and writes nothing; it never records a verdict or a spent budget for another phase to inherit, and it never reintroduces a cross-phase watch-state file ([`diagnostic-surface.md`](../../workflow/autonomous-workflow/rules/diagnostic-surface.md) — *watch state is queried, never carried*). `CI_HANDOFFS` is counted inside this run only.
 

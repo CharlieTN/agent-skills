@@ -4,6 +4,8 @@ description: >
   Spec-driven UI verification agent for the autonomous-workflow (`aw-` namespace).
   Reads a specs.md file and an aw-target.yml, runs each spec against a live app
   via Playwright (headless by default), and returns a compact pass/fail verdict.
+  Runs both spec formats: the WHEN/THEN grammar, and Markdown intent specs
+  (`Format: intent`), whose route it explores, caches, replays, and heals.
   Designed to run inside the executor's Phase 4 iteration loop — before
   lint/type/test gates — so the executor can verify UI correctness autonomously.
   Invoke with a specs.md path and an aw-target name or path. Use `--bail-on-first-red`
@@ -45,8 +47,8 @@ semantics, and the verdict schema below are the **engine-agnostic spec-run
 contract** ([`rules/spec-run-contract.md`](../rules/spec-run-contract.md)) that
 both runners implement — keep them engine-neutral. Everything else in this file
 is Playwright-specific: the binary resolution, the batch-compiled `last-run.spec.ts`,
-the one-context-per-batch run, and the `hot_loop:` handoff. The `hot_loop:` block
-is yours alone; the Chrome runner omits it.
+the one-context-per-batch run, the intent-spec probe loop, and the `hot_loop:`
+handoff. The `hot_loop:` block is yours alone; the Chrome runner omits it.
 
 ---
 
@@ -90,8 +92,14 @@ Read the aw-target file at `aw_target_path` — the explicit `Aw-Target file:` p
 - `auth.strategy` and `auth.storage_state` (if strategy is `storage-state`)
 - `fixtures.references` (for placeholder resolution)
 - `constraints.parallelism` and `constraints.reset_between_specs`
+- `adversarial.allowed_origins`, when present — an intent spec's probe passes it as `apiOrigins`
 
 ### 4. Parse specs.md
+
+**Detect the format first.** When the file's header — the lines before the first
+`## Spec N:` heading — carries the line `Format: intent`, it is an intent spec:
+parse and run it per [Intent specs](#intent-specs-format-intent) below and skip
+the rest of this step. Otherwise it is a grammar spec.
 
 Parse each `## Spec N:` block. Extract:
 - title
@@ -223,6 +231,8 @@ Every cold-pass invocation works against a stable per-branch directory:
 ├── last-run.spec.ts        # Generated Playwright spec — persisted so the executor's hot loop can re-run it directly
 ├── last-run.meta.json      # { specs_mtime, aw_target_path, generated_at, failing_spec_id, last_locator_error }
 ├── playwright-bin          # Plain-text file: the resolved Playwright binary path (project / branch-local / cached install)
+├── routes/                 # Intent specs only: compiled routes, Spec-N-<sha8>.md — replayed before exploring (contract § 6.6)
+├── probe.spec.ts           # Intent specs only: the exploration probe; probe-in.json / probe-out.json are deleted after the run
 └── node_modules/           # Only populated when the project has no Playwright install and a branch-local one was needed
 ```
 
@@ -444,6 +454,209 @@ error/warning lines for the diagnostic blob.
 
 ---
 
+## Intent specs (`Format: intent`)
+
+An intent spec names what the user does and what must be true; you work out the
+route. The engine-agnostic rules — parsing, the must-follow and detour rules, the
+evidence forms, the closed `unreachable` list, grading, the route cache, and the
+verdict keys — are [contract § 6](../rules/spec-run-contract.md#6-intent-specs).
+This section is how Playwright carries them out. Auth, the bypass header, bail
+mode, auto-capture, and lessons work exactly as for a grammar spec.
+
+For each `## Spec N:` block, in order:
+
+1. **Look up its route.** Compute its `<sha8>` with the command in
+   [contract § 6.6](../rules/spec-run-contract.md#66-route-cache--replay-first-heal-on-failure)
+   and look for `$AW_DIR/routes/Spec-N-<sha8>.md` — the route cache,
+   `.agent/<branch>/.aw-tester/routes/`, which persists across runs in this
+   worktree like `last-run.spec.ts` does.
+2. **Hit → replay, in one launch.** Run the route through the probe below once:
+   its `url:` as `start`, its `WHEN` actions as `steps`, and as `checks` every
+   `THEN` locator plus a locator for each `# uncompiled:` item. Grade the spec
+   from that single launch — `THEN`s and network items from `checks` and
+   `requests`, the uncompiled items from `checks` and `aria`. Never launch a
+   second time to judge an item: the route's mutations run exactly once
+   (contract § 6.2). All pass → `route: replayed`, copy the file's
+   `# deviations:` line into `deviations`. Any fail → heal by the route's
+   `# mutations:` line (contract § 6.6): performed none of the listed
+   mutations → go to step 3 once and report `route: healed`; performed one
+   and every route step ran → re-judge the failed assertions from that
+   launch's `aria` and `checks` without launching again (`route:
+   replayed`); performed one and a later route step failed → delete the
+   route file and grade the spec `skipped: route drifted after a mutation`.
+3. **Miss (or heal) → explore with the probe loop below**, grade per contract
+   § 6.5, and on a pass write the compiled route to
+   `$AW_DIR/routes/Spec-N-<sha8>.md` with its five comment lines —
+   `# mutations:` lists the `WHEN` positions whose step was a mutation (item
+   4's commit launches) — unless an action needed a `within` scope or was a
+   `goto` after `start`, neither of which the grammar can express: then cache
+   nothing and note that the spec explores every run.
+
+After every spec ran, rebuild `last-run.spec.ts` from the compiled routes so the
+`hot_loop:` handle re-runs the passing specs deterministically. A spec with no
+route (it failed or was skipped) is absent from that file; say so in `notes`.
+
+### The probe loop
+
+You cannot see the page between steps of a batch script, so explore by
+re-launching a small probe: it replays the actions resolved so far, then reports
+the page. Write the probe once per run:
+
+```ts
+// $AW_DIR/probe.spec.ts — reads $AW_PROBE_DIR/probe-in.json on every launch
+import { test } from '@playwright/test';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const DIR = process.env.AW_PROBE_DIR as string;
+const cfg = JSON.parse(readFileSync(join(DIR, 'probe-in.json'), 'utf8'));
+const rx = (v: any) => {
+  const m = typeof v === 'string' ? v.match(/^\/(.*)\/([a-z]*)$/) : null;
+  return m ? new RegExp(m[1], m[2]) : v;
+};
+
+test('probe', async ({ browser }) => {
+  test.setTimeout(120_000); // a multi-step replay outlives the 30 s default
+  const bypass = cfg.bypassHeader; // { name, env } — the value is read from the env, never written to disk
+  const context = await browser.newContext({
+    baseURL: cfg.baseURL,
+    storageState: cfg.storageState || undefined,
+    extraHTTPHeaders: bypass ? { [bypass.name]: process.env[bypass.env] ?? '' } : undefined,
+  });
+  const page = await context.newPage();
+  const requests: string[] = [];
+  page.on('response', (r) =>
+    requests.push(`${r.request().method()} ${new URL(r.url()).pathname} → ${r.status()}`));
+  // Mutating requests, recorded when ISSUED, to the app's own origins only — never telemetry.
+  const apiOrigins = new Set([new URL(cfg.baseURL).origin, ...(cfg.apiOrigins ?? [])]);
+  const mutations: string[] = [];
+  page.on('request', (q) => {
+    const u = new URL(q.url());
+    if (/^(POST|PUT|PATCH|DELETE)$/.test(q.method()) && apiOrigins.has(u.origin))
+      mutations.push(`${q.method()} ${u.pathname}`);
+  });
+  const find = (l: any): any => {
+    const root = l.within ? find(l.within) : page;
+    if (l.role) return root.getByRole(l.role, { name: rx(l.name), exact: l.exact ?? true });
+    if (l.label) return root.getByLabel(rx(l.label));
+    if (l.placeholder) return root.getByPlaceholder(rx(l.placeholder));
+    if (l.text) return root.getByText(rx(l.text));
+    if (l.testid) return root.getByTestId(l.testid);
+    throw new Error(`unsupported locator ${JSON.stringify(l)}`);
+  };
+  const steps: any[] = [];
+  let fatal: string | null = null;
+  try { await page.goto(cfg.start); } catch (e) { fatal = String(e).slice(0, 300); }
+  for (const s of fatal ? [] : cfg.steps ?? []) {
+    try {
+      if (s.action === 'goto') { await page.goto(s.value); steps.push({ ok: true }); continue; }
+      const t = find(s.locator);
+      const n = await t.count();
+      if (n !== 1) throw new Error(`locator matched ${n} elements — name the instance`);
+      if (s.dry) { steps.push({ ok: true, dry: true }); continue; } // resolve only — never act
+      const before = mutations.length;
+      if (s.action === 'click') await t.click({ timeout: 5000 });
+      else if (s.action === 'fill') await t.fill(s.value, { timeout: 5000 });
+      else if (s.action === 'press') await t.press(s.value, { timeout: 5000 });
+      else if (s.action === 'select') await t.selectOption(s.value, { timeout: 5000 });
+      else if (s.action === 'check') await t.check({ timeout: 5000 });
+      else if (s.action === 'hover') await t.hover({ timeout: 5000 });
+      else throw new Error(`unsupported action ${s.action}`);
+      await page.waitForLoadState('domcontentloaded');
+      // An explicit settle, not networkidle: networkidle returns at once on a page that already idled.
+      await page.waitForTimeout(cfg.settleMs ?? 1500);
+      // the mutating requests this step issued — the evidence that settles "was it a mutation?"
+      steps.push({ ok: true, fired: mutations.slice(before) });
+    } catch (e) { steps.push({ ok: false, error: String(e).slice(0, 300) }); break; }
+  }
+  await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+  const checks: any[] = [];
+  for (const c of cfg.checks ?? []) {
+    try {
+      const t = find(c);
+      const n = await t.count();
+      checks.push({ n, visible: n === 1 ? await t.isVisible() : null,
+        text: n === 1 ? (await t.innerText()).slice(0, 200) : null });
+    } catch (e) { checks.push({ error: String(e).slice(0, 200) }); }
+  }
+  const body = page.locator('body');
+  const aria = typeof body.ariaSnapshot === 'function' ? await body.ariaSnapshot() : await body.innerText();
+  if (cfg.shot) await page.screenshot({ path: cfg.shot, fullPage: true }).catch(() => {});
+  writeFileSync(join(DIR, 'probe-out.json'), JSON.stringify(
+    { url: page.url(), fatal, steps, checks, aria: aria.slice(0, 20000), requests: requests.slice(-100) }, null, 2));
+  await context.close();
+});
+```
+
+Each launch: delete `probe-out.json`, write `$AW_DIR/probe-in.json`, run the
+probe, read `probe-out.json`. Never read a file an earlier launch left: a
+launch that writes no `probe-out.json` (it crashed or timed out) is a probe
+error — keep the tail of its output for `diagnostics`, and it counts against
+the probe budget. A `fatal` value means `start` itself did not load.
+
+```bash
+# probe-in.json: { baseURL, storageState, bypassHeader, apiOrigins, settleMs, start,
+#                  steps: [{action, locator, value, dry}], checks: [locator, …], shot }
+# apiOrigins: the app's own API origins besides the preview's (it is always included) —
+#   the aw-target's adversarial.allowed_origins when set; never analytics or third-party hosts.
+# settleMs: wait after each action before reading `fired` (default 1500; raise it for a debounced control).
+# A locator is the single-braces form as JSON, optionally scoped:
+#   {"role": "button", "name": "Rename", "within": {"role": "banner"}}
+rm -f "$AW_DIR/probe-out.json"
+AW_PROBE_DIR="$AW_DIR" "$PLAYWRIGHT_BIN" test --reporter=line --workers=1 "$AW_DIR/probe.spec.ts"
+```
+
+Walk the spec's steps with it:
+
+1. Probe with `steps: []` to see the `start` page.
+2. For each step, choose the action and locator from the `aria` snapshot by the
+   ladder (try `hints` first), append it to `steps`, and probe again. A step
+   that comes back `ok: true` and changes the page as the step intends is done.
+   A `locator matched N elements` error means you must name the instance — add a
+   `name`, or scope it with `within`.
+3. A plain step that cannot be done as written gets at most 3 detour actions,
+   each one probe, recorded as a deviation. A `[must-follow]` step gets none: if
+   its target is not in the snapshot, the spec fails (unless contract § 6.4
+   applies).
+4. **Never replay a mutating step** (contract § 6.2 — save, submit, create,
+   delete, send, or a persisted toggle). Append it with `"dry": true`: the
+   probe checks that its locator matches one element and does not act. Then
+   run one **commit launch** — the same `steps` with `dry` removed from that
+   step, plus `checks` and `shot` (item 5) when it is the spec's last step.
+   Read that step's `fired` — the `POST`/`PUT`/`PATCH`/`DELETE` requests it
+   issued to `apiOrigins` within `settleMs`:
+   - **Empty, and the step only opened a dialog, menu, or popover** — it was
+     not the mutation (its confirm is). Mark it replayable and keep exploring
+     from `start` as in item 2; the next step is the one to dry-resolve.
+   - **Empty, and the step did more than open a dialog, menu, or popover** —
+     treat it as the mutation anyway: never replay it, continue as for a
+     non-empty `fired`, and put `fired: [] — treated as a mutation` in
+     `notes` (its request went to an origin `apiOrigins` does not list, or
+     landed after `settleMs`: add the origin, or raise `settleMs`).
+   - **Not empty** — the mutation happened, in that launch only. To explore
+     the steps after it, set `start` to the commit launch's `url` and `steps`
+     to only the actions resolved after the mutation, so no later launch
+     replays it. When the next step acts on UI the mutation left open — the
+     commit launch's `aria` shows it and the re-launched page does not — stop:
+     the remaining items are `unreachable: transient state lost` (contract
+     § 6.4), never a fail. The Chrome driver, which never restarts, can run
+     such a spec.
+   Keep every commit launch's `requests` for the network items.
+5. After the last step, probe once more with every candidate evidence locator in
+   `checks` and `shot` set to the auto-final capture path when `--auto-capture`
+   is on — when the last step was mutating, its commit launch is this probe.
+   Grade each `expected` item from `checks` (a `locator:` line needs
+   `n: 1` and the state the item claims), `requests` (a network item needs the
+   exact `METHOD /path → NNN`), or the `text` of a check (a `text:` line).
+
+**Probe budget:** at most **20 probe launches per spec**. Hitting it is
+`unreachable: explore budget exhausted`, exactly like the contract's 25-action
+budget — whichever runs out first.
+
+Delete `probe-in.json` and `probe-out.json` when the run ends; keep `routes/`.
+
+---
+
 ## Output Schema (MANDATORY — do not deviate)
 
 Your final message MUST be this exact YAML block and nothing else after it
@@ -463,6 +676,21 @@ specs:
       attempted healing: getByText('X') — found 0 elements
       last network response: POST /api/foo → 500 {"error":"db timeout"}
       console errors: TypeError: Cannot read property 'id' of undefined (app.js:142)
+  - id: Spec-2                   # an intent spec (Format: intent) adds the contract § 6.7 keys
+    title: <one-line from spec header>
+    result: pass
+    format: intent
+    route: explored | replayed | healed
+    changed: exercised | not-exercised
+    changed_evidence: 'locator: {role: "button", name: "Rename"} — clicked'
+    expected:
+      - id: E1
+        result: observed | not-observed | unreachable
+        evidence: 'locator: {role: "heading", name: "Q3 revenue"} — visible'
+    deviations:                  # omit when none
+      - step: 1
+        kind: adapted | added | skipped
+        note: dismissed the cookie banner before opening the dashboard
 captures:                       # omit the key when nothing was written
   - spec: Spec-1                 # (no CAPTURE step ran AND auto-capture is off)
     label: dashboard with new widget
@@ -497,6 +725,11 @@ notes: <optional one-paragraph context; omit if nothing notable>
   `CAPTURE` step or an auto-capture (`--auto-capture`); an auto-capture entry
   carries `auto: true`. A capture never appears as a spec result and never
   changes `verdict`.
+- An intent spec's `result` comes from the contract § 6.5 first-match table,
+  in its order, never from judgment: a must-follow deviation outside the
+  `unreachable` list, then a `not-observed` item, are `fail`; then an
+  `unreachable` cause is `skipped`; then `changed: not-exercised` is `fail`.
+  An `observed` item with no evidence line is `not-observed`.
 
 ---
 
@@ -510,6 +743,8 @@ After delivering the verdict, write lessons for any of the following:
 | Auth refresh triggered | Aw-Target name, command, whether it succeeded |
 | `inconclusive` verdict | Why specs were skipped and what would unblock them |
 | New failure pattern | The failing step shape that didn't appear in prior lessons |
+| Intent route healed | The route action that stopped replaying and the one that replaced it |
+| Intent locator needed a detour | The control the step named and the detour that reached it |
 
 ```
 # Dedup first, then write to the classified scope (universal → global; repo-bound → repo::).
