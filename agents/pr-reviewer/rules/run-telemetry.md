@@ -163,7 +163,7 @@ It follows the [OpenTelemetry GenAI conventions](https://opentelemetry.io/docs/s
 
 | Span | Attributes |
 | --- | --- |
-| `invoke_agent pr-reviewer` (root) | `gen_ai.operation.name=invoke_agent`, `gen_ai.agent.id=<run id>`, `gen_ai.conversation.name=pr-reviewer <owner>/<repo>#<n>` (only when the run is not joined to a harness session), `pr_review.opencode.parent_tool_call_id` (the OpenCode tool call that ran `begin`, when `OPENCODE_PARENT_TOOL_CALL_ID` is set), the outcome under `pr_review.*` |
+| `invoke_agent pr-reviewer` (root) | `gen_ai.operation.name=invoke_agent`, `gen_ai.agent.id=<run id>`, `gen_ai.conversation.name=pr-reviewer <owner>/<repo>#<n>` (only when the run is not joined to a harness session), `pr_review.opencode.parent_tool_call_id` (the OpenCode tool call that ran `begin`, when `OPENCODE_PARENT_TOOL_CALL_ID` is set), the outcome under `pr_review.*`, and the memory the review used and read ([§ The memory](#the-memory)) |
 | `pr_review.step <name>` | `pr_review.step.name`, `pr_review.step.kind` (`script` · `model` · `dispatch`), `pr_review.step.marked`; ERROR with `error.type=step_failed` when the step failed |
 | `pr_review.phase <name>` | child of a script step: `pr_review.step.name`, `pr_review.phase.name` |
 | `pr_review.worker <unit>` | `pr_review.worker.unit` |
@@ -171,6 +171,34 @@ It follows the [OpenTelemetry GenAI conventions](https://opentelemetry.io/docs/s
 
 Two histograms carry the durations across runs: `pr_review.step.duration` (by step and kind) and `pr_review.run.duration` (by tier, topology, and verdict).
 Neither carries a run id, a PR number, or a user as an attribute.
+
+### The memory
+
+The root span says which LoreKit memories the review used and read, and links each one back to LoreKit.
+`finalize.mjs` records them from `judgments.memory` as one `memory` ledger record; a finalize re-run replaces it.
+You supply the inputs only: copy `id`, `scope`, and `key` onto every `memory.relevance_rules[]` and `memory.lessons_used[]` entry — `id` from the `memory_list` / `memory_search` entry, since `memory_read` returns none, and `scope` from the call when the entry omits it — and list every body you fetched with `memory_read` in `memory.read[]` ([`posting.md`](./posting.md)).
+
+| Where | Attribute | Value |
+| --- | --- | --- |
+| root | `pr_review.memory.used` | memories that shaped the review — every `lessons_used[]` entry and every relevance rule that acted (an applied action, or a finding it suppressed), the same set Step 4c cites. The report's `Memories — … used` also lists idle rules, so the two counts can differ |
+| root | `pr_review.memory.read` | memories whose body the run fetched; omitted when `memory.read` is absent |
+| root | `pr_review.memory.used_ids` | the used memories' LoreKit ids, comma-separated — filter runs by one with `contains` |
+| root | `pr_review.memory.suppressed` | findings a relevance rule suppressed this run |
+| event `pr_review.memory.used` · `pr_review.memory.read` | `pr_review.memory.id`, `.scope`, `.key`, `.kind` (`rule` · `knowledge` · `hotspot` · `lesson`) | one event per memory; `used` when it shaped the review, `read` when it was only read — an idle relevance rule included |
+| event | `pr_review.memory.url` | `<LOREKIT_APP_URL>/lore?memoryId=<id>`, else `/lore?scope=…&lesson={scope,key}`; omitted when neither is known — never fabricated |
+| event | `pr_review.memory.action`, `.note`, `.fingerprint`, `.seen_count`, `.suppressed` | what it did: a rule's direction or applied action, a lesson's `used_as`, and the findings it suppressed |
+
+A memory named in more than one array is one event, matched by `id`, else by `key` in the same scope.
+At most 50 events are kept, used memories first.
+A run whose finalize never ran carries none of these, so "no memory attributes" means unknown and `pr_review.memory.used=0` means none was used.
+
+```text
+# correct: id, scope, and key from the list or search entry — the trace links it by id
+{ "id": "cb10f4e2-eaf1-48e1-933c-e633a23e2716", "scope": "repo::acme/widget", "key": "hotspot::src/api/client.ts", "used_as": "finder pointer (re-verified)" }
+
+# incorrect: the id dropped — the trace falls back to the scope + key link, and a key alone gets none
+{ "key": "hotspot::src/api/client.ts", "used_as": "finder pointer (re-verified)" }
+```
 
 ### The scope
 
